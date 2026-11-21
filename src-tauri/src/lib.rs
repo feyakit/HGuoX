@@ -3,6 +3,7 @@ mod api;
 mod apple_proxy;
 mod blog;
 mod cache;
+mod channel_page;
 mod env;
 #[cfg(target_os = "ios")]
 mod ios_layout;
