@@ -8,6 +8,7 @@ import { MediaCard, Masonry } from "../../shared/ui/cards";
 import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { Empty, Img } from "../../shared/ui/ui";
 import { useSearchResults } from "./useSearchResults";
+import { useRankSwipe } from "./useRankSwipe";
 import { useApiRefresh, useForegroundRefresh, useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { PullIndicator, usePullToRefresh } from "../../shared/lib/usePullToRefresh";
 import { SearchTags } from "./SearchTags";
@@ -340,9 +341,15 @@ export function RankView({ wide, active = true, refreshSignal = 0, onRefreshed }
   const heatLabel = (it: RankItem) => (it.metric_value > 0 ? `${it.metric_label || "热度"} ${fmt(it.metric_value)}` : "");
   const activeIdx = Math.max(0, RANK_TABS.findIndex(t => t.k === tab));
   const meta = RANK_TABS[activeIdx];
+  /* 上游 66e02b4：榜单三个 tab 左右滑切；点选照旧，切榜沿用现有加载/缓存逻辑。 */
+  const rankSwipe = useRankSwipe({
+    tabIndex: activeIdx,
+    tabCount: RANK_TABS.length,
+    onTabChange: index => { const next = RANK_TABS[index]; if (next) setTab(next.k); },
+  });
 
   return (
-    <div>
+    <div ref={rankSwipe.rootRef} {...rankSwipe.handlers} style={{ touchAction: "pan-y" }}>
       {/* 一体式极光玻璃轨道滑块（替代旧下划线/胶囊） */}
       <div className="flex items-center gap-2.5 pb-1">
         <SegmentedControl className="hg-seg-track flex-1" aria-label="榜单类型" activeIndex={activeIdx}>
