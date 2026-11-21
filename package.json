@@ -17,6 +17,7 @@
     "test:post-hot": "node scripts/test-post-detail-hot.mjs",
     "test:post-flicker": "node scripts/test-post-flicker.mjs",
     "test:favorites-return": "node scripts/test-favorites-return.mjs",
+    "test:tab-swipe": "node scripts/test-tab-swipe.mjs",
     "test:keyboard-sheet": "node scripts/test-keyboard-sheet.mjs",
     "test:safe-area": "node scripts/test-safe-area.mjs",
     "test:startup-back": "node scripts/test-startup-back.mjs",

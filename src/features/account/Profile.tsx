@@ -11,6 +11,7 @@ import { detailEpisodeCount, formatWatchProgress, unwatchedNewEpisodes } from ".
 import { IBack, IBoltF, ICheck, IChevR, IClock, IMenuFollow, IMenuHistory, IMenuLikes, IPlayF, ISettings, IStar } from "../../shared/ui/icons";
 import { useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { useLongPress } from "../../shared/lib/useLongPress";
+import { useTabSwipe } from "../../shared/lib/useTabSwipe";
 import { useAutoLoadMore } from "./useAutoLoadMore";
 
 function GuestCatAvatar() {
@@ -392,6 +393,14 @@ function HistoryContent({ onBack, wide: _wide }: { onBack: () => void; wide: boo
 
   const totalCount = history.length + postHistory.length;
 
+  /* 上游 29e273a：历史页「短剧 / 吃瓜」支持左右滑切；首尾不循环，纵向滚动不拦截。 */
+  const historySwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: historyScrollRef,
+    tabIndex: histTab === "video" ? 0 : 1,
+    tabCount: 2,
+    onTabChange: index => setHistTab(index === 0 ? "video" : "post"),
+  });
+
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
       <span className="hg-aura" aria-hidden="true" />
@@ -422,7 +431,8 @@ function HistoryContent({ onBack, wide: _wide }: { onBack: () => void; wide: boo
         </SegmentedControl>
       </div>
 
-      <div ref={historyScrollRef} className="flex-1 scroll-y hg-page-x relative z-10" style={{ paddingBottom: "calc(32px + var(--sab, 0px))" }}
+      <div ref={historyScrollRef} {...historySwipe} style={{ touchAction: "pan-y", paddingBottom: "calc(32px + var(--sab, 0px))" }}
+        className="flex-1 scroll-y hg-page-x relative z-10"
         aria-busy={histTab === "post" ? postLoading : loading}>
         {histTab === "post" ? (
           <>
@@ -642,6 +652,15 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const allFavIds = favTab === "post" ? postFavs : favs;
   const allSelected = allFavIds.length > 0 && allFavIds.every(id => selectedIds.includes(id));
   const selectAll = () => setSelectedIds([...allFavIds]);
+  /* 上游 29e273a：收藏页「短剧 / 吃瓜」左右滑切，切 tab 沿用原有的「清空选择」行为。
+     批量选择进行中关闭滑切：误滑一下就把选好的项丢了，代价比少一个手势大。 */
+  const favoriteSwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: favoriteScrollRef,
+    tabIndex: favTab === "video" ? 0 : 1,
+    tabCount: 2,
+    enabled: !selectionMode,
+    onTabChange: index => { setFavTab(index === 0 ? "video" : "post"); clearSelection(); },
+  });
   const confirmRemoveSelected = async () => {
     if (removalPending.current || !selectedIds.length) return;
     removalPending.current = true;
@@ -793,7 +812,8 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
         </div>
       )}
 
-      <div ref={favoriteScrollRef} className="flex-1 scroll-y hg-page-x relative z-10" style={{ paddingBottom: "calc(32px + var(--sab, 0px))" }}
+      <div ref={favoriteScrollRef} {...favoriteSwipe} style={{ touchAction: "pan-y", paddingBottom: "calc(32px + var(--sab, 0px))" }}
+        className="flex-1 scroll-y hg-page-x relative z-10"
         aria-busy={(favTab === "post" ? postLoading : loading) || syncingFavorites}>
         {favoriteSyncFailed ? (
           <Empty icon={<IStar size={24} />} title="收藏状态未知"
