@@ -637,6 +637,11 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const toggleSelected = (id: number) => setSelectedIds(cur => cur.includes(id) ? cur.filter(item => item !== id) : [...cur, id]);
   const beginSelection = (id: number) => setSelectedIds(cur => cur.includes(id) ? cur : [...cur, id]);
   const clearSelection = () => { setSelectedIds([]); setRemoveError(""); };
+  /* 上游 22399f8：全选覆盖当前 Tab 的全量记录（含尚未滚动加载的分页），移除时逐 id 处理，
+     不依赖卡片是否已上屏。 */
+  const allFavIds = favTab === "post" ? postFavs : favs;
+  const allSelected = allFavIds.length > 0 && allFavIds.every(id => selectedIds.includes(id));
+  const selectAll = () => setSelectedIds([...allFavIds]);
   const confirmRemoveSelected = async () => {
     if (removalPending.current || !selectedIds.length) return;
     removalPending.current = true;
@@ -781,7 +786,8 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
         <div role="region" aria-label="批量管理"
           className="shrink-0 hg-page-x pb-2 relative z-20 flex items-center gap-2 text-[13px]">
           <span className="font-semibold text-on">已选 {selectedIds.length} 项</span>
-          <Button className="ml-auto px-2 text-primary" onClick={clearSelection}>取消</Button>
+          <Button disabled={allSelected} className="ml-auto px-2 text-primary disabled:opacity-40" onClick={selectAll}>全选</Button>
+          <Button className="px-2 text-primary" onClick={clearSelection}>取消</Button>
           <Button variant="danger" className="rounded-(--r-ctl) px-3"
             onClick={() => { setRemoveError(""); setRemoveOpen(true); }}>取消收藏</Button>
         </div>
