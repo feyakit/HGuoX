@@ -2,12 +2,14 @@
  * 详情首屏加速（低风险包装层，不动数据层）：
  *
  * 1. **预取**：列表页拿到首屏卡片后，对前几张并发预取详情（并发 2，只取 JSON，失败静默）。
- * 2. **慢线路并行**：详情请求超过 3s 没回，就并行用一次现有自动选线（复用候选/自定义镜像），
- *    再发一次同样的详情请求，谁先成功用谁。**不改**用户保存的线路偏好（自动选线自己有偏好策略）。
+ * 2. **慢线路并行**：详情请求超过 3s 没回，就走 autoLine 的同一入口（`repickForSlowRequest`，
+ *    尊重「自动选线」开关与偏好线路）换一条更快线路，再发一次同样的详情请求，谁先成功用谁。
+ *    **不改**用户保存的线路偏好（判定在 linePolicy，不需要换线时不换）。
  *
  * 两件事都只包在 `api.video` 外面，Rust 侧与接口形状不变。
  */
 import { api, logLine } from "./api";
+import { repickForSlowRequest } from "../network/autoLine";
 import type { Detail } from "./types";
 
 const CACHE_TTL_MS = 5 * 60_000;
@@ -17,6 +19,8 @@ const DISK_MAX_ITEMS = 50;
 const DISK_MAX_BYTES = 1_000_000;
 const DISK_WRITE_DEBOUNCE_MS = 400;
 const SLOW_MS = 3_000;
+/** 换线最多等这么久：详情已经慢了，等探活不该把「快路」拖得更慢 */
+const REPICK_WAIT_MS = 1_200;
 const PREFETCH_LIMIT = 4;
 const PREFETCH_CONCURRENCY = 2;
 
@@ -122,10 +126,19 @@ async function slowLaneRace(id: number, first: Promise<Detail>): Promise<Detail>
   if (winner !== "slow" && winner.kind === "ok") return winner.data;
 
   /* 慢（或第一条已经失败）：让自动选线用现有候选换一条更快线路，再发一次。
-     两条并存，谁先成功算谁的；都失败时抛第一条的错误。 */
+     两条并存，谁先成功算谁的；都失败时抛第一条的错误。
+     审计 #9：换线不能再直接调 api.lineAuto（绕过开关/偏好、不派 hg:line-changed），
+     走 repickForSlowRequest —— 判定与健康检查同一套，不需要换线时它不会换。 */
   logLine(`[detail] ${id} 超过 ${SLOW_MS}ms 未返回，并行换线重试`);
-  void api.lineAuto().catch(() => {});
-  const second = api.video(id);
+  const repick = repickForSlowRequest("detail-slow");
+  const second = (async () => {
+    /* 最多等 REPICK_WAIT_MS：换线完成（或判定不用换）之后才发第二条，避免又打回同一条线。 */
+    await Promise.race([
+      repick.catch(() => false),
+      new Promise<void>((resolve) => window.setTimeout(resolve, REPICK_WAIT_MS)),
+    ]);
+    return api.video(id);
+  })();
   try {
     return await Promise.any([first, second]);
   } catch {

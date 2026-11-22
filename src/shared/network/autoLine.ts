@@ -158,6 +158,25 @@ export async function pickLine(reason: string, force = false, preferredDown = fa
   }
 }
 
+/**
+ * 「这次请求很慢」的换线入口（详情首屏的慢线路并行重试用，审计 #9）。
+ *
+ * 以前 detailFast 直接 `api.lineAuto()`：绕过了 `autoLine` 开关与偏好线路，也不派
+ * `hg:line-changed` —— 播放器与首页都不知道线路已经换了。这里改走 pickLine，
+ * 判定与健康检查完全同一套（尊重开关、偏好优先、不需要换就不换），
+ * 真的换过线时 pickLine 自己会派事件。
+ *
+ * 返回是否真的换了线路（调用方据此决定要不要真的再发一次请求）。
+ */
+export async function repickForSlowRequest(reason: string): Promise<boolean> {
+  if (!autoLineEnabled()) return false;
+  const before = currentBase || (await api.lineState().then((s) => s.base).catch(() => ""));
+  if (!before) return false;
+  await pickLine(reason, true);
+  const after = currentBase || (await api.lineState().then((s) => s.base).catch(() => ""));
+  return !!after && !sameBase(before, after);
+}
+
 async function tryMain(reason: string): Promise<void> {
   if (!autoLineEnabled() || picking) return;
   /* 有偏好线路时不允许自动回切主站：用户选的线只要通就不能被换走 */
