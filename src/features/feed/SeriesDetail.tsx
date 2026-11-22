@@ -3,6 +3,7 @@ import { api, cover, fmt } from "../../shared/api/api";
 import { cachedDetailStale, loadDetail } from "../../shared/api/detailFast";
 import { useStore } from "../../shared/model/store";
 import { detailEpisodeCount, resolveResumeTarget } from "../../shared/model/favoriteProgress";
+import { collectCountShown } from "../../shared/model/favCount";
 import { ambientStyle, useAccent } from "../../shared/ui/useAccent";
 import { Button } from "../../shared/ui/ios/controls";
 import { Img } from "../../shared/ui/ui";
@@ -19,6 +20,8 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
   const [related, setRelated] = useState<VideoCard[]>([]);
   const [err, setErr] = useState("");
   const [favDelta, setFavDelta] = useState(0);
+  /* 收藏数「高水位」：服务端计数一时没追上来时，不把刚变大的数字退回去（见 favCount.ts） */
+  const favShown = useRef(0);
   /* 慢线路兜底文案：3s 还没出详情就明说是线路慢，而不是让用户对着黑屏猜。 */
   const [slow, setSlow] = useState(false);
   /* 收藏数的乐观增量只对「还没有反映这次操作的服务端计数」有效。
@@ -59,6 +62,7 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
     const startedAt = Date.now();
     setErr("");
     setFavDelta(0);
+    favShown.current = 0;
     /* 首屏加速：预取命中时同步出内容（上面的 useState 初值），未命中走 loadDetail
        —— 超过 3s 会用一次自动选线并行换线重试，谁先回用谁。 */
     loadDetail(id)
@@ -134,6 +138,10 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
       });
   };
 
+  /* 收藏数展示值（审计 #7）：口径与取舍全在 shared/model/favCount.ts，单测 scripts/test-fav-count.mjs */
+  const collectShown = collectCountShown(detail?.counts?.collect ?? 0, favDelta, faved, favShown.current);
+  favShown.current = collectShown;
+
   return (
     <div className="ios-page hg-detail-page hg-canvas absolute inset-0 flex flex-col"
       data-ambient={accentScheme.source}
@@ -196,7 +204,7 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
               <p className="hg-detail-counts">
                 <span>点赞 {fmt(detail.counts?.like ?? 0)}</span>
                 <span>·</span>
-                <span>收藏 {fmt(Math.max(0, (detail.counts?.collect ?? 0) + favDelta))}</span>
+                <span>收藏 {fmt(collectShown)}</span>
                 <span>·</span>
                 <span>评论 {fmt(detail.counts?.comment ?? 0)}</span>
               </p>
