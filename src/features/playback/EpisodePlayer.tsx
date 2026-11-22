@@ -493,6 +493,51 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     window.setTimeout(() => restore(0), 450);
   }, [preferHevc, setPreferHevc, toast]);
 
+  /* 切线换源保留播放位置（审计 #3）：lineEpoch 一变，下面的取址 effect 就用新地址覆盖
+     playUrls[playKey]，<video> 换源即从 0 开始 —— 和「切画质」是同一个坑，所以走同一套恢复点：
+     ① 换线前记下 currentTime；② 新地址就绪后再 seek 回去；③ 旧线路预取到的其他集地址全部作废。
+     playKey 本来不含线路（改它会让地址表/续播/历史全部错位），所以位置补偿放在这里。 */
+  const lineResumeRef = useRef<{ key: string; t: number } | null>(null);
+  const lineWatch = useRef({ epoch: store.lineEpoch, playKey });
+  useLayoutEffect(() => {
+    const prev = lineWatch.current;
+    lineWatch.current = { epoch: store.lineEpoch, playKey };
+    /* 只认「同一条目、线路变了」：同时换剧/换集时上一次的位置没有意义 */
+    if (prev.epoch === store.lineEpoch || prev.playKey !== playKey) return;
+    /* 旧线路预取的地址（下一集等）不能再用：只留当前这一条，画面不黑等新地址回来替换。 */
+    setPlayUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
+    setHevcUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
+    setHevcFallback({});
+    if (!active) return;
+    const v = videoRef.current?.el();
+    const t = v && Number.isFinite(v.currentTime) ? v.currentTime : liveRef.current.t;
+    if (t > 1) lineResumeRef.current = { key: playKey, t };
+  }, [store.lineEpoch, playKey, active]);
+
+  /* 新线路的地址就绪后把位置 seek 回去（元数据没好就退到下一拍，最多约 2.4s） */
+  useEffect(() => {
+    const r = lineResumeRef.current;
+    if (!r) return undefined;
+    if (r.key !== playKey) { lineResumeRef.current = null; return undefined; }
+    if (!playUrl) return undefined;
+    let tries = 0;
+    let timer = 0;
+    const tick = () => {
+      const v = videoRef.current?.el();
+      if (!v || v.readyState < 1) {
+        if (tries++ < 12) timer = window.setTimeout(tick, 200) as unknown as number;
+        return;
+      }
+      lineResumeRef.current = null;
+      if (r.t > 1 && (!v.duration || r.t < v.duration - 3)) {
+        videoRef.current?.seek(r.t, "line-switch");
+        playbackClock.publish(r.t);
+      }
+    };
+    timer = window.setTimeout(tick, 120) as unknown as number;
+    return () => window.clearTimeout(timer);
+  }, [playUrl, playKey, playbackClock]);
+
   const openFullSeries = useCallback(() => {
     if (kind !== "video" || !curId) {
       logLine(`[full-series] 没有剧集 id（kind=${kind} curId=${String(curId)}），改为打开详情面板`);

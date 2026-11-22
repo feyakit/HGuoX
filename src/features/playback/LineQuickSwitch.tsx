@@ -13,6 +13,22 @@ import { domainFamily, readProbe } from "../../shared/network/lineProbeCache";
  * 不跳设置页、不暴露自定义地址与检测（那些留给「我的 · 网络与线路」）。
  * 入口由调用方自己决定渲不渲染（只有一条线路时不渲染）。
  */
+/**
+ * 线路判等（审计 #3）：同一行在线路数据里会出现 `https://x.cc` / `https://x.cc/` /
+ * 大小写不同的写法。按原始字符串比较时「当前这一行」认不出来 —— 点下去会重复
+ * lineSet + 重复派 hg:line-changed（播放器白换一次源）。这里按 host 小写 + 去尾斜杠比。
+ */
+const lineKey = (url: string) => {
+  const raw = (url || "").trim().replace(/\/+$/, "");
+  try {
+    const u = new URL(raw);
+    return `${u.host.toLowerCase()}${u.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return raw.toLowerCase();
+  }
+};
+const sameLine = (a: string, b: string) => !!a && !!b && lineKey(a) === lineKey(b);
+
 export default function LineQuickSwitch({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { toast } = useStore();
   const [base, setBase] = useState("");
@@ -37,7 +53,7 @@ export default function LineQuickSwitch({ open, onClose }: { open: boolean; onCl
 
   const pick = async (url: string) => {
     if (busy) return;
-    if (!url || url === base) { onClose(); return; }
+    if (!url || sameLine(url, base)) { onClose(); return; }
     setBusy(url);
     try {
       /* 手动选线 = 本次优先：取消在途的自动选线，但保持自动选线开着（见 docs/线路策略.md） */
@@ -141,7 +157,7 @@ export default function LineQuickSwitch({ open, onClose }: { open: boolean; onCl
                   </span>
                 </Button>
                 {open && list.map((item) => {
-                  const current = item.url === base;
+                  const current = sameLine(item.url, base);
                   const lat = latency(item.url);
                   return (
                     <Button key={item.url} card onClick={() => void pick(item.url)} disabled={!!busy}
