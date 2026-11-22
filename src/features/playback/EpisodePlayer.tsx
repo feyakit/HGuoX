@@ -1366,6 +1366,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (!cancelled && target != null && canSeek(dxScrub)) {
         const snapped = snapSeek(target, duration || liveRef.current.dur || 0);
         videoRef.current?.seek(snapped, "mobile_gesture");
+        /* 先发布目标时间再清预览（审计 #18）：底栏显示「预览 ?? 时钟」，
+           清 scrub 那一刻时钟还停在旧位置，0.25s 宽度过渡会先把条拉回去再跳过来。 */
+        playbackClock.publish(snapped);
         flashSeek(snapped - g.base, snapped);
       }
       setScrub(null);
