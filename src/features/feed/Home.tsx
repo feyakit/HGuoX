@@ -118,6 +118,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const seq = useRef(0);
   const shelvesAt = useRef(0);
   const topicsAt = useRef(0);
+  /* 货架 / 专题的请求代次：只让最新那一次写回（换线时旧响应不许盖新、不许刷新时间戳） */
+  const shelfSeq = useRef(0);
+  const topicSeq = useRef(0);
   const loadedKey = useRef("");
   const aliveRef = useRef(true);
   useEffect(() => { aliveRef.current = true; return () => { aliveRef.current = false; }; }, []);
@@ -183,12 +186,15 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
      每次进页/回前台超过 30s 就重拉（force 绕过缓存），不再是"一个线路只拉一次"。
      精选专题不在这里 —— 它在首屏出来之后再取（见下面那个 effect）。 */
   const loadShelves = useCallback(async (force: boolean) => {
+    /* 代次：换线 / 连点刷新时可能有两次拉取在飞，旧那次回来不许盖新的，也不许把
+       shelvesAt 写成「刚刚」——否则界面上是旧线路的货架，却被当成新鲜数据。 */
+    const my = ++shelfSeq.current;
     const [recRanks, hotRanks, origs] = await Promise.all([
       api.rank("recommend", force).then(r => (r?.items ?? []).filter(x => x && x.cover && x.video_id > 0).slice(0, 12)).catch(() => null),
       api.rank("hot", force).then(r => (r?.items ?? []).filter(x => x && x.cover && x.video_id > 0).slice(0, 10)).catch(() => null),
       api.originalVideos("all", 1, 10, "new", force).then(r => (r?.items ?? []).filter(x => x && x.cover && x.id > 0)).catch(() => null),
     ]);
-    if (!aliveRef.current) return;
+    if (!aliveRef.current || my !== shelfSeq.current) return;
     if (recRanks) setRecommendRanks(recRanks);
     if (hotRanks) setTopRanks(hotRanks);
     if (origs) setOriginals(origs);
@@ -198,16 +204,20 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   /* 精选专题：最底部的一个横滑货架，既不参与主推/热榜的错峰去重，也不参与"为你推荐"的过滤，
      所以晚到不会引起任何重排。放到首屏卡片出来之后再空闲时取，首屏少一个并发请求。 */
   const loadTopics = useCallback(async (force: boolean) => {
+    const my = ++topicSeq.current;
     try {
       const r = await api.topics(force);
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || my !== topicSeq.current) return;
       setTopics((r?.items ?? []).filter(x => x && x.cover).slice(0, 8));
       topicsAt.current = Date.now();
     } catch { /* 专题拉不到就不显示这一栏，不影响其他内容 */ }
   }, []);
 
-  /* 切线路：货架/专题的时间戳作废，下一次进页强制重拉 */
-  useEffect(() => { shelvesAt.current = 0; topicsAt.current = 0; }, [lineEpoch]);
+  /* 切线路：货架/专题的时间戳与在途请求全部作废，下一次进页强制重拉 */
+  useEffect(() => {
+    shelvesAt.current = 0; topicsAt.current = 0;
+    shelfSeq.current++; topicSeq.current++;
+  }, [lineEpoch]);
 
   useEffect(() => {
     if (!active || tab !== "all") return;

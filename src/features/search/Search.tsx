@@ -274,21 +274,35 @@ export function RankView({ wide, active = true, refreshSignal = 0, onRefreshed }
   const [states, setStates] = useState<Partial<Record<RankKind, RankState>>>({});
   const cache = useRef<Partial<Record<RankKind, RankState>>>({});
   const pending = useRef(new Set<RankKind>());
+  /* 每个榜单一个请求代次：换线 / 刷新会开新代次，旧代次的响应一律丢弃。
+     旧代码用 pending 直接 return —— 换线那一刻的新请求被丢掉，旧响应回来还把
+     loadedAt 写成「现在」，界面看着是新的、其实是旧线路的数据。 */
+  const seq = useRef<Partial<Record<RankKind, number>>>({});
   const alive = useRef(true);
   const signal = useRef(refreshSignal);
   const onRefreshedRef = useRef(onRefreshed);
   onRefreshedRef.current = onRefreshed;
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
-  useEffect(() => { cache.current = {}; }, [lineEpoch]);
+  useEffect(() => {
+    cache.current = {};
+    /* 换线路：把在途请求全部作废（旧响应不许写 loadedAt / 不许盖新榜） */
+    for (const kind of Object.keys(seq.current) as RankKind[]) seq.current[kind] = (seq.current[kind] ?? 0) + 1;
+    pending.current.clear();
+  }, [lineEpoch]);
 
   /* force=true：绕过 api 读缓存，用户点刷新 / 下拉时必须真的出网（旧代码刷新按钮也吃缓存） */
   const load = async (kind: RankKind, force = false) => {
-    if (pending.current.has(kind)) return;
+    /* 同代次里不重复发；forced（换线 / 用户刷新）必须能越过在途请求，否则新线路的数据永远等不到 */
+    if (pending.current.has(kind) && !force) return;
     pending.current.add(kind);
+    const my = (seq.current[kind] ?? 0) + 1;
+    seq.current[kind] = my;
+    const current = () => seq.current[kind] === my;
     const previous = cache.current[kind];
     const update = (state: RankState) => {
+      if (!current()) return;   /* 旧代次：不写缓存、不写 loadedAt、不碰界面 */
       cache.current[kind] = state;
-      if (alive.current) setStates(current => ({ ...current, [kind]: state }));
+      if (alive.current) setStates((states: Partial<Record<RankKind, RankState>>) => ({ ...states, [kind]: state }));
     };
     update({ items: previous?.items ?? [], loadedAt: previous?.loadedAt ?? 0, loading: true, error: "" });
     try {
@@ -300,7 +314,7 @@ export function RankView({ wide, active = true, refreshSignal = 0, onRefreshed }
         error: error instanceof Error ? error.message : "榜单加载失败，请重试",
       });
     } finally {
-      pending.current.delete(kind);
+      if (current()) pending.current.delete(kind);
     }
   };
 
