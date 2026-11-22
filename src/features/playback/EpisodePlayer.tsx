@@ -31,7 +31,9 @@ import {
 } from "./playerGestures";
 import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IGlobe, IHeart, IHeartF, IMore,
-  IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute, IRefresh } from "../../shared/ui/icons";
+  IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute } from "../../shared/ui/icons";
+import { EndCard } from "./EndCard";
+import { useEndPool } from "./useEndPool";
 import { ambientStyle } from "../../shared/ui/useAccent";
 import type { AccentScheme } from "../../shared/ui/accent";
 
@@ -237,9 +239,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const [fullscreen, setFullscreen] = useState(false);
   const [heartBurst, setHeartBurst] = useState(0);
   const [seriesEnded, setSeriesEnded] = useState(false);
-  /* 结束态：本剧看完 → 不自动滑进下一部，给「看完 + 推荐 3 部」让用户选 */
-  const [endRecs, setEndRecs] = useState<VideoCard[] | null>(null);
-  const [endBusy, setEndBusy] = useState(false);
   /* 播放页线路：就地小胶囊 + 面板，只有一条线路时不渲染入口 */
   const [lineOpen, setLineOpen] = useState(false);
   const [lineInfo, setLineInfo] = useState<{ label: string; multi: boolean }>({ label: "线路", multi: false });
@@ -279,9 +278,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 这次触摸是不是从舞台（视频区）起手的：只有这种才拦 touchmove */
   const stageTouch = useRef(false);
   const epSlideTimer = useRef<number | undefined>(undefined);
-  /* 结束态遮罩自己的纵向滑动手势（见 endcard 渲染处）：遮罩不是舞台层的子节点，
-     舞台上的 onPointerDown/Move/Up 收不到它，所以「上滑只关卡片」在这里单独实现。 */
-  const endSwipe = useRef<{ x: number; y: number } | null>(null);
   const gesture = useRef<{
     x: number; y: number; startY: number; t: number; timer: number | null;
     mode: "idle" | "hold" | "scrub" | "pan" | "enterSeries" | "edgeBack";
@@ -318,6 +314,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const pinchRef = useRef<{ d0: number; mx0: number; my0: number; s0: number; x0: number; y0: number } | null>(null);
 
   const curId = effectiveVideoIds[index];
+  /* 结束态：本剧看完 → 不自动滑进下一部，给「看完 + 推荐 3 部」让用户选。
+     推荐来自轮换池（related 全量 + feed 若干页，见 endPool.ts / useEndPool.ts）。 */
+  const end = useEndPool(curId);
+  const { recs: endRecs, busy: endBusy, hint: endHint } = end;
   const nextVideoId = effectiveVideoIds[index + 1];
   const relatedKey = `${store.lineEpoch}:${curId}`;
   const related = relatedByVideo[relatedKey] || [];
@@ -763,40 +763,16 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 无限流外壳要知道当前在哪一条：换条时回报一次（换剧/滑到尾部都在这里同步） */
   useEffect(() => { onActiveIndex?.(index); }, [index, onActiveIndex]);
 
-  /** 结束态：拉真实推荐（related 优先，其次 feed），过滤本剧，最多 3 部；不补假卡 */
+  /** 结束态：从推荐池里取一批（related 全量 + feed 若干页，一轮 3 部）。
+   *  上游 related 对同一个 id 返回固定列表，所以「换一批」**不重新问接口**，只在池子里往后移；
+   *  池子到底回到开头并给一句提示。池子不足 3 部就少显示，拿不到内容就如实空着（不补假卡）。 */
   const openEndCard = useCallback(async (regen = false) => {
     setSeriesEnded(true);
     showControls();
-    setEndBusy(true);
-    try {
-      const picked: VideoCard[] = [];
-      const seen = new Set<number>([curId]);
-      try {
-        const rel = await api.related(curId, regen);
-        for (const v of rel?.items ?? []) {
-          if (!v || !v.id || !v.cover || seen.has(v.id)) continue;
-          seen.add(v.id); picked.push(v);
-          if (picked.length >= 3) break;
-        }
-      } catch { /* related 失败不阻塞，下面用 feed 兜 */ }
-      if (picked.length < 3) {
-        try {
-          const feed = await api.feed(1, 24, undefined, regen);
-          for (const v of feed?.items ?? []) {
-            if (!v || !v.id || !v.cover || seen.has(v.id)) continue;
-            seen.add(v.id); picked.push(v);
-            if (picked.length >= 3) break;
-          }
-        } catch { /* ignore */ }
-      }
-      setEndRecs(picked.slice(0, 3));
-      logLine(`[endcard] 本剧看完 id=${curId} 推荐=${picked.slice(0, 3).map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
-    } catch {
-      setEndRecs([]);
-    } finally {
-      setEndBusy(false);
-    }
-  }, [curId, showControls]);
+    const rotation = await end.next(regen);
+    if (!rotation) return;
+    logLine(`[endcard] 本剧看完 id=${curId} 池子=${end.poolSize()} 游标=${rotation.cursor}${rotation.wrapped ? " (回到开头)" : ""} 推荐=${rotation.batch.map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
+  }, [curId, showControls, end]);
 
   const go = useCallback((delta: number) => {
     const el = boxRef.current;
@@ -817,31 +793,20 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /** 点推荐剧：在列表里就滚过去，不在就压一层新的播放页从第 1 集开始 */
   const openRecommended = useCallback((id: number) => {
     setSeriesEnded(false);
-    setEndRecs(null);
+    end.close();
     const at = effectiveVideoIds.indexOf(id);
     if (at >= 0) { go(at - index); return; }
     store.push({ kind: "feed", videoIds: [id], index: 0, title: "", startEp: 1 });
-  }, [effectiveVideoIds, index, go, store]);
+  }, [effectiveVideoIds, index, go, store, end]);
 
-  /* 结束态遮罩上的上下滑：语义与舞台上那条 seriesEnded 分支一致 —— **只关卡片、不切剧**。
-     不复用完整的指针手势机是有意的：遮罩里的「换一批 / 推荐卡 / 重新看第 1 集」都是按钮，
-     手势机里的单击兜底会顺手 toggle 播放，反而破坏按钮。所以这里只认纵向位移：
-     ≥48px 且明显竖于横才关卡片，点按（位移≈0）一律放行给按钮的 click。 */
-  const onEndCardDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    endSwipe.current = { x: e.clientX, y: e.clientY };
-  };
-  const onEndCardUp = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const start = endSwipe.current;
-    endSwipe.current = null;
-    if (!start) return;
-    const dy = e.clientY - start.y, dx = e.clientX - start.x;
-    if (Math.abs(dy) < 48 || Math.abs(dy) <= Math.abs(dx)) return;
-    logLine(`[endcard] swipe-close dy=${Math.round(dy)}`);
+  /* 结束态遮罩的上下滑（只关卡片、不切剧）已随卡片一起搬到 EndCard.tsx，
+     这里只提供关闭动作。 */
+  const closeEndCard = useCallback(() => {
     setSeriesEnded(false);
-    setEndRecs(null);
+    end.close();
     setEpPreview(null);
     showControls();
-  };
+  }, [end, showControls]);
 
 
   /* 「不感兴趣」（v3.0.6 #5）：刷剧流里点了必须立刻换片，不能只是弹个标签面板。
@@ -1403,7 +1368,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           /* 结束态下上下滑：只关掉结束态回到控件态，不切剧 */
           if (seriesEnded) {
             setSeriesEnded(false);
-            setEndRecs(null);
+            end.close();
             reboundSlide();
             setEpPreview(null);
             showControls();
@@ -2415,68 +2380,24 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       )}
 
       {/* 结束态（本剧看完）：不自动滑进下一部，给「看完 + 推荐 3 部」让用户选。
-          推荐全部来自真实接口（api_related 优先，其次 api_feed），过滤本剧，不足 3 部就少显示。 */}
+          推荐来自轮换池（related 全量 + feed 若干页，见 endPool.ts），「换一批」往后移 3 部。 */}
       {!isDesktop && !endless && seriesEnded && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center px-5" data-hg-control="endcard"
-          /* touch-action: none 必须显式给：遮罩不在舞台层里，没有继承舞台的 touchAction，
-             默认行为会把纵向滑动当成浏览器滚动 → 指针流被 pointercancel 掐断，
-             下面的 onPointerUp 根本收不到（真机上就是「上滑关不掉卡片」）。 */
-          style={{ touchAction: "none" }}
-          onPointerDown={onEndCardDown} onPointerUp={onEndCardUp} onPointerCancel={() => { endSwipe.current = null; }}>
-          <div className="hg-endcard w-full max-w-[340px] p-[18px] text-center">
-            <p className="flex items-center justify-center gap-2 text-[15px] font-bold text-white">
-              <span className="hg-endcard-bar" aria-hidden="true" />本剧已看完
-            </p>
-            <p className="mt-1 text-[13px] font-semibold text-white/85 clamp-1">{details[curId]?.title || meta.title}</p>
-            <p className="mt-0.5 text-[12px] text-white/45">共 {episodes.length || 1} 集</p>
-
-            {/* 推荐区：标题行右侧是「换一批」文字链（次行动不再占一整条按钮） */}
-            <div className="mt-4 flex items-center justify-between">
-              <span className="text-[12px] font-medium text-white/45">你可能还想看</span>
-              <Button onClick={() => void openEndCard(true)} disabled={endBusy}
-                className="hg-endcard-more flex items-center gap-1 pressable">
-                <IRefresh size={12} />换一批
-              </Button>
-            </div>
-
-            {endBusy ? (
-              <div className="mt-3 flex items-center justify-center py-5"><Loader label="正在找同类剧" /></div>
-            ) : (endRecs && endRecs.length > 0) ? (
-              /* 不足 3 部时左对齐换行，不留空位；卡片宽 = 1/3 - gap */
-              <div className="mt-2 flex flex-wrap items-start" style={{ gap: 8 }}>
-                {endRecs.slice(0, 3).map((v) => (
-                  <Button key={v.id} card aria-label={`看《${v.title}》`} onClick={() => openRecommended(v.id)}
-                    className="hg-reccard text-left min-w-0"
-                    style={{ width: "calc((100% - 16px) / 3)" }}>
-                    <span className="relative block w-full overflow-hidden rounded-lg" style={{ paddingTop: "133.3333%" }}>
-                      <span className="hg-reccard-fallback" aria-hidden="true">{(v.title || "").trim().slice(0, 1)}</span>
-                      <Img src={v.cover} alt="" />
-                    </span>
-                    <span className="mt-1 block text-[12px] leading-[1.35] text-white/90 clamp-2">{v.title}</span>
-                    <span className="block text-[11px] text-white/45">
-                      {(v.total_episodes || v.episode_count) ? `共 ${v.total_episodes || v.episode_count} 集` : ""}
-                    </span>
-                  </Button>
-                ))}
-              </div>
-            ) : (
-              <p className="mt-3 text-[12px] text-white/45">暂时没有更多同类剧</p>
-            )}
-
-            {/* 主行动单独一行：全宽 44 高、r12、品牌渐变 + 1px 白内描边。
-                「重新看第 1 集」必须真的回到第 1 集第 0 秒并起播：
-                单集剧 pickEp(1) 是空操作（playKey 不变 → 不重载），所以走 VideoSurface 的
-                rewind()（倒回 0 + 重新武装片尾兜底 + 起播），与进度条手动 seek 完全分开；
-                多集剧照旧换集重载，换源期间先用封面垫住上一集尾帧。 */}
-            <Button onClick={() => {
-              setSeriesEnded(false); setEndRecs(null); setEpPreview(null);
-              playbackClock.publish(0);
-              if (curEp === 1) videoRef.current?.rewind();
-              else { setHoldFrame(true); pickEp(1); }
-            }}
-              className="hg-endcard-main mt-4 w-full pressable">重新看第 1 集</Button>
-          </div>
-        </div>
+        <EndCard
+          title={details[curId]?.title || meta.title}
+          totalEpisodes={episodes.length || 1}
+          recs={endRecs}
+          busy={endBusy}
+          hint={endHint}
+          onRegen={() => void openEndCard(true)}
+          onOpen={openRecommended}
+          onReplay={() => {
+            setSeriesEnded(false); end.close(); setEpPreview(null);
+            playbackClock.publish(0);
+            if (curEp === 1) videoRef.current?.rewind();
+            else { setHoldFrame(true); pickEp(1); }
+          }}
+          onSwipeClose={closeEndCard}
+        />
       )}
 
       {/* 移动端倍速提示条：必须跟控件一起隐藏；只反映「长按中的临时倍速」，
