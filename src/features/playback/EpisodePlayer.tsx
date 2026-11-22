@@ -318,6 +318,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
      推荐来自轮换池（related 全量 + feed 若干页，见 endPool.ts / useEndPool.ts）。 */
   const end = useEndPool(curId);
   const { recs: endRecs, busy: endBusy, hint: endHint } = end;
+  /* 结束卡推荐的请求序号（审计 #10）：只接受最新一次响应，换剧前在途的旧响应直接丢掉。 */
+  const endSeq = useRef(0);
   const nextVideoId = effectiveVideoIds[index + 1];
   const relatedKey = `${store.lineEpoch}:${curId}`;
   const related = relatedByVideo[relatedKey] || [];
@@ -493,6 +495,51 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     window.setTimeout(() => restore(0), 450);
   }, [preferHevc, setPreferHevc, toast]);
 
+  /* 切线换源保留播放位置（审计 #3）：lineEpoch 一变，下面的取址 effect 就用新地址覆盖
+     playUrls[playKey]，<video> 换源即从 0 开始 —— 和「切画质」是同一个坑，所以走同一套恢复点：
+     ① 换线前记下 currentTime；② 新地址就绪后再 seek 回去；③ 旧线路预取到的其他集地址全部作废。
+     playKey 本来不含线路（改它会让地址表/续播/历史全部错位），所以位置补偿放在这里。 */
+  const lineResumeRef = useRef<{ key: string; t: number } | null>(null);
+  const lineWatch = useRef({ epoch: store.lineEpoch, playKey });
+  useLayoutEffect(() => {
+    const prev = lineWatch.current;
+    lineWatch.current = { epoch: store.lineEpoch, playKey };
+    /* 只认「同一条目、线路变了」：同时换剧/换集时上一次的位置没有意义 */
+    if (prev.epoch === store.lineEpoch || prev.playKey !== playKey) return;
+    /* 旧线路预取的地址（下一集等）不能再用：只留当前这一条，画面不黑等新地址回来替换。 */
+    setPlayUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
+    setHevcUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
+    setHevcFallback({});
+    if (!active) return;
+    const v = videoRef.current?.el();
+    const t = v && Number.isFinite(v.currentTime) ? v.currentTime : liveRef.current.t;
+    if (t > 1) lineResumeRef.current = { key: playKey, t };
+  }, [store.lineEpoch, playKey, active]);
+
+  /* 新线路的地址就绪后把位置 seek 回去（元数据没好就退到下一拍，最多约 2.4s） */
+  useEffect(() => {
+    const r = lineResumeRef.current;
+    if (!r) return undefined;
+    if (r.key !== playKey) { lineResumeRef.current = null; return undefined; }
+    if (!playUrl) return undefined;
+    let tries = 0;
+    let timer = 0;
+    const tick = () => {
+      const v = videoRef.current?.el();
+      if (!v || v.readyState < 1) {
+        if (tries++ < 12) timer = window.setTimeout(tick, 200) as unknown as number;
+        return;
+      }
+      lineResumeRef.current = null;
+      if (r.t > 1 && (!v.duration || r.t < v.duration - 3)) {
+        videoRef.current?.seek(r.t, "line-switch");
+        playbackClock.publish(r.t);
+      }
+    };
+    timer = window.setTimeout(tick, 120) as unknown as number;
+    return () => window.clearTimeout(timer);
+  }, [playUrl, playKey, playbackClock]);
+
   const openFullSeries = useCallback(() => {
     if (kind !== "video" || !curId) {
       logLine(`[full-series] 没有剧集 id（kind=${kind} curId=${String(curId)}），改为打开详情面板`);
@@ -520,6 +567,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   }, [kind, curId, curEp, duration, addHistory, store, setClean, setFs, setPanel, showControls, isDesktop]);
   useEffect(() => {
     setSeriesEnded(false);
+    /* 换剧/换集：结束卡推荐一并清掉，池游标随剧重置（useEndPool 按 curId 重建池）；
+       序号 +1 让换剧前发出的那一次推荐响应作废，不能把旧剧的卡盖回来。 */
+    endSeq.current += 1;
+    end.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playKey]);
   useEffect(() => {
     window.clearTimeout(epSlideTimer.current);
@@ -767,10 +819,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
    *  上游 related 对同一个 id 返回固定列表，所以「换一批」**不重新问接口**，只在池子里往后移；
    *  池子到底回到开头并给一句提示。池子不足 3 部就少显示，拿不到内容就如实空着（不补假卡）。 */
   const openEndCard = useCallback(async (regen = false) => {
+    const seq = ++endSeq.current;
     setSeriesEnded(true);
     showControls();
     const rotation = await end.next(regen);
-    if (!rotation) return;
+    /* 等池子的时候换了剧/换了集：这份推荐已经不属于这一屏，直接丢（否则卡片会盖回来）。 */
+    if (!rotation || seq !== endSeq.current) return;
     logLine(`[endcard] 本剧看完 id=${curId} 池子=${end.poolSize()} 游标=${rotation.cursor}${rotation.wrapped ? " (回到开头)" : ""} 推荐=${rotation.batch.map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
   }, [curId, showControls, end]);
 
@@ -1312,6 +1366,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (!cancelled && target != null && canSeek(dxScrub)) {
         const snapped = snapSeek(target, duration || liveRef.current.dur || 0);
         videoRef.current?.seek(snapped, "mobile_gesture");
+        /* 先发布目标时间再清预览（审计 #18）：底栏显示「预览 ?? 时钟」，
+           清 scrub 那一刻时钟还停在旧位置，0.25s 宽度过渡会先把条拉回去再跳过来。 */
+        playbackClock.publish(snapped);
         flashSeek(snapped - g.base, snapped);
       }
       setScrub(null);
@@ -1419,9 +1476,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       tapRef.current.lastAt = now;
       window.clearTimeout(tapRef.current.timer ?? undefined);
       if (hidden) {
-        /* 收起状态：立刻唤出，体感要跟手 */
-        tapRef.current.timer = null;
-        showControls();
+        /* 收起态的第一下也进双击判定窗口（审计 #17）：原来这里立刻 showControls()，
+           第二下正好落在刚冒出来的暂停/选集按钮上 —— 双击变成一次误触。
+           现在 280ms 内先不铺控件：第二下仍落在视频层上、走上面的双击分支，
+           没等到第二下才唤出控件。 */
+        tapRef.current.timer = window.setTimeout(() => {
+          tapRef.current = { lastAt: 0, timer: null };
+          showControls();
+        }, GESTURE.doubleTapMs) as unknown as number;
         return;
       }
       /* 可见状态：等过双击窗口再切换播放/暂停，避免双击被当成两次暂停 */
@@ -1608,7 +1670,20 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     keepAliveTimers.current = [];
   }, []);
 
-  const lockControls = () => { setPanel(null); setControlsLocked(true); };
+  const lockControls = () => {
+    setPanel(null);
+    /* 桌面专属（审计 #2）：全屏元素是 boxRef 的父节点，而锁罩挂在它**外面** ——
+       全屏时上锁，锁罩被全屏层整个盖住，用户就卡在「没有任何解锁入口」的全屏里。
+       试过的两条路里选改动小的这条：锁之前先退全屏（Fullscreen API），锁罩回到页面上。
+       移动端全屏是 .fs-immersive 的 CSS 层、锁罩在同一棵子树里，不受影响。 */
+    if (isDesktop) {
+      try {
+        const leaving = document.fullscreenElement ? document.exitFullscreen?.() : null;
+        if (leaving) void leaving.catch(() => {});
+      } catch { /* 浏览器不支持 Fullscreen API：本来就不在全屏 */ }
+    }
+    setControlsLocked(true);
+  };
 
   /* 长按倍速期间禁止原生滚动，否则上滑会被列表吃掉、锁不住倍速 */
   useEffect(() => {
