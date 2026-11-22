@@ -81,6 +81,10 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const busy = useRef(false);
+  /* 请求代次：只有当前代次的响应能写回列表。
+     吃瓜列表可以同时有「旧第 2 页」和「换线/换筛选后的第 1 页」在飞，旧代码靠 busy
+     挡住并发，force 刷新时免不了重叠 —— 回来的旧页会直接接在新列表后面。 */
+  const seq = useRef(0);
   const lastEpoch = useRef(lineEpoch);
   const lastAt = useRef(0);
   const sentinel = useRef<HTMLDivElement>(null);
@@ -93,6 +97,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
     if (busy.current && !force) return;
     const next = reset ? 1 : page + 1;
     if (!reset && next > pages) return;
+    /* reset 开新代次（换筛选/换线/下拉刷新），追加沿用当前代次 */
+    const my = reset ? ++seq.current : seq.current;
     busy.current = true;
     if (!silent) setLoading(true);
     if (!silent) setErr("");
@@ -112,6 +118,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
           ? await api.postCategory(fallbackRoute, next, 20, sort, force)
           : await api.posts(next, 20, sort, force);
       }
+      /* 旧代次的页不写回：换线/换筛选之后它属于上一批数据 */
+      if (my !== seq.current) return;
       setItems((prev) => {
         const base = reset ? [] : prev;
         /* 只按 id 去重：旧代码还按标题去重，站点上同题不同帖（或标题带空白差异）会被整条滤掉，
@@ -129,11 +137,15 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
       setErr("");
       lastAt.current = Date.now();
     } catch (e) {
-      if (!silent) setErr((e as Error).message || "吃瓜内容加载失败");
-      if (silent) throw e;
+      if (my === seq.current) {
+        if (!silent) setErr((e as Error).message || "吃瓜内容加载失败");
+        if (silent) throw e;
+      }
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (my === seq.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
   };
 
