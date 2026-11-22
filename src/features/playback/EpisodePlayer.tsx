@@ -33,6 +33,7 @@ import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IGlobe, IHeart, IHeartF, IMore,
   IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute } from "../../shared/ui/icons";
 import { EndCard } from "./EndCard";
+import { SeekHint } from "./SeekHint";
 import { useEndPool } from "./useEndPool";
 import { ambientStyle } from "../../shared/ui/useAccent";
 import type { AccentScheme } from "../../shared/ui/accent";
@@ -2367,27 +2368,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
               )}
 
 
-              {/* 双击 / 松手 seek 的瞬时提示（800ms 自动消失） */}
-              {!isDesktop && seekHint && (
-                <div
-                  className="absolute z-30 flex pointer-events-none"
-                  style={{
-                    top: "25%",
-                    transform: "translateY(-50%)",
-                    /* 左右各留 16px 安全边；右侧有快捷栏时再向内让 56px（栏宽 + 间距） */
-                    ...(seekHint.side === "left"
-                      ? { left: 16, width: "calc(33.333% - 32px)", justifyContent: "center" }
-                      : { right: actionRail.mounted && !fs ? 72 : 16, width: "calc(33.333% - 32px)", justifyContent: "center" }),
-                  }}
-                >
-                  <div className="hg-chip hg-ink px-3 py-2 rounded-full flex items-center gap-2 backdrop-blur-md elev-2 max-w-full">
-                    <span className="text-[15px] font-bold tabular-nums whitespace-nowrap">
-                      {seekHint.delta >= 0 ? "+" : "−"}{Math.abs(Math.round(seekHint.delta))}s
-                    </span>
-                    <span className="text-[12px] hg-ink-4 tabular-nums whitespace-nowrap">{fmtTime(seekHint.target)}</span>
-                  </div>
-                </div>
-              )}
+              {/* 双击 / 松手 seek 的瞬时提示（800ms 自动消失）。
+                  位置/样式在 SeekHint.tsx（v3.0.11 方案 A）：屏高 38%、左/右 1/4 区居中、黑胶囊。 */}
+              {!isDesktop && seekHint && <SeekHint delta={seekHint.delta} side={seekHint.side} />}
 
               {/* 上滑换集预览：拖过 12% 屏高就出，内容只用现有集数 */}
               {!isDesktop && epPreview && (
@@ -2484,7 +2467,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
             if (curEp === 1) videoRef.current?.rewind();
             else { setHoldFrame(true); pickEp(1); }
           }}
-          onSwipeClose={closeEndCard}
+          onClose={closeEndCard}
         />
       )}
 
