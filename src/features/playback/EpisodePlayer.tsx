@@ -335,10 +335,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const openTagMenu = (seed: string[] = []) => { setTagMenuSeed(seed); setPanel(null); setTagMenu(true); };
   const openTag = (tag: string) => { closePanels(); store.push({ kind: "tag", tag, name: tag }); };
   useEffect(() => { setTagMenu(false); }, [curId, store.lineEpoch, accountScope]);
-  /* 换账号：清掉上一位用户的详情快照（含 interaction.liked）。
-     否则点赞数会按「旧 detail.liked=true + 新 store.liked=false」算出 -1，
-     实测切账号瞬间 100→99（≈140ms）→100（审计 #5 的可见抖动）。 */
-  useEffect(() => { setDetails({}); }, [accountScope]);
+  /* 详情快照的账号归属：切账号后旧快照里的 interaction.liked 不能再参与计数，
+     否则会按「旧 liked=true + 新 store.liked=false」算出 -1（审计 #5 的 99 抖动）。
+     注意**不能**直接清空 details —— 清空会让计数短暂变成 0，比 -1 更难看。 */
+  const detailScope = useRef<string>("");
   useEffect(() => { if (blocked && mode === "home" && active) onBlocked?.(curId); }, [blocked, mode, active, curId, onBlocked]);
   useEffect(() => { if (!allowed) { setPanel(null); setTagMenu(false); } }, [allowed]);
   const curEp = epMap[curId] || 1;
@@ -923,7 +923,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           return;
         }
         if (kind === "post") setPosts(previous => ({ ...previous, [id]: value as Post }));
-        else setDetails(previous => ({ ...previous, [id]: value as Detail }));
+        else { detailScope.current = accountScope; setDetails(previous => ({ ...previous, [id]: value as Detail })); }
         setTagErrors(previous => { const next = { ...previous }; delete next[key]; return next; });
         setChecked(previous => ({ ...previous, [key]: true }));
       }).catch(error => {
@@ -1048,6 +1048,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         const nextDetail = detailsRef.current[nextId] || await requestDetail(nextId);
         if (!stillRelevant()) return;
         if (!detailsRef.current[nextId]) {
+          detailScope.current = accountScope;
           setDetails(previous => ({ ...previous, [nextId]: nextDetail }));
           setChecked(previous => ({ ...previous, [`${accountScope}:${store.lineEpoch}:${kind}:${nextId}`]: true }));
         }
@@ -1815,7 +1816,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const [likeBump, setLikeBump] = useState(0);
   const likeCount = useMemo(() => {
     const base = meta.like;
-    const loadedLiked = kind === "video" && detail?.interaction?.liked
+    /* 快照若属于上一个账号，它的 liked 只代表那位用户，不能拿来校正计数（审计 #5） */
+    const sameScope = detailScope.current === accountScope;
+    const loadedLiked = sameScope && kind === "video" && detail?.interaction?.liked
       && (detail.interaction.liked_ep === undefined || detail.interaction.liked_ep === curEp);
     return Math.max(0, base + likeDelta + Number(liked) - Number(!!loadedLiked));
   }, [meta.like, likeDelta, liked, kind, detail?.interaction, curEp]);
