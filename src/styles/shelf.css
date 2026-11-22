@@ -1145,10 +1145,12 @@
 .hg-home-page .hg-hero { margin: 10px auto 0; width: 100%; }
 .hg-home-page .hg-section { margin-top: 18px; }
 
-/* 轮播：原生横滑 + scroll-snap（报告 7）。Chrome 87 支持 scroll-snap-type，不用 JS 手势库 */
+/* 轮播：原生横滑 + scroll-snap（报告 7）。Chrome 87 支持 scroll-snap-type，不用 JS 手势库。
+   横向同样不声明 -webkit-overflow-scrolling：与 .scroll-y 同源（见 index.css 注释），
+   删掉后 iOS 13+ 行为不变（0 像素差异）。 */
 .hg-hero-track {
   display: flex; overflow-x: auto; overflow-y: hidden;
-  scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x mandatory;
   scrollbar-width: none; -ms-overflow-style: none;
   margin-top: 11.5px;
 }

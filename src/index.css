@@ -662,8 +662,12 @@ html.plat-android .hg-num { transform: translateY(1px); }
 /* 骨架 → 内容交叉淡入：只切一次，不闪两下 */
 @keyframes hg-crossfade-in { from { opacity: 0; } to { opacity: 1; } }
 .hg-crossfade { animation: hg-crossfade-in var(--dur-1) var(--ease-out); }
-/* 长列表滚动：iOS 惯性（老写法，新内核忽略也不报错） */
-.scroll-y { -webkit-overflow-scrolling: touch; }
+/* 长列表滚动：不声明 -webkit-overflow-scrolling（2026-11-22 iOS 闪屏定案）。
+   因果链：该属性把滚动容器交给 UIKit 的 UIScrollView 做「异步分块栅格化」；当同页还有
+   position: fixed 浮层（详情页底部互动条）与 backdrop-filter 兄弟节点（次级页顶栏）时，
+   WebKit 会在滚动中丢弃并重建滚动层的栅格块，表现为整页在明暗之间台阶式反复跳（丢块再补）。
+   iOS 13+ 的滚动容器本来就由 UIKit 统一接管，这行属冗余声明：删除后 393×852@dpr2.75
+   同构截图逐像素比对 0 差异。上游 HGhubX 全仓库 0 处使用该属性。 */
 
 /* ===== 底栏分段胶囊（倍速 | 上一集 | 下一集 / 倍速 | 选集 | 下集）=====
    原来是三个各自带底的方圆角小块，并排很碎；这里合并成一个整体分段胶囊。 */
