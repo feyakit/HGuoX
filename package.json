@@ -25,6 +25,7 @@
     "test:end-card-close": "node scripts/test-end-card-close.mjs",
     "test:player-modes": "node scripts/test-player-modes.mjs",
     "test:seek-hint": "node scripts/shoot-seek-hint.mjs",
+    "test:seek-symmetry": "node scripts/verify-seek-hint-symmetry.mjs",
     "test:rank-swipe": "node scripts/test-rank-swipe.mjs",
     "test:cards-badges": "node scripts/test-cards-badges.mjs",
     "test:keyboard-sheet": "node scripts/test-keyboard-sheet.mjs",

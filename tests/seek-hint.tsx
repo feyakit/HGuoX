@@ -42,13 +42,18 @@ function Before() {
   );
 }
 
+/** ?both=1：同一屏同时挂左右两个提示 —— 用来证明两侧同高、左右对称（一张图一条基线就能看出来） */
+const BOTH = q.get("both") === "1";
+
 function Root() {
   return (
     <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden", background: "#000" }}>
       <div style={{ position: "absolute", inset: 0, background: "url(/tests/assets/seekbg.jpg) center/cover no-repeat" }} />
       {V === "before"
         ? <Before />
-        : <SeekHint delta={SIDE === "left" ? -5 : 5} side={SIDE} />}
+        : BOTH
+          ? <><SeekHint delta={-5} side="left" /><SeekHint delta={5} side="right" /></>
+          : <SeekHint delta={SIDE === "left" ? -5 : 5} side={SIDE} />}
     </div>
   );
 }
