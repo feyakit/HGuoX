@@ -1341,7 +1341,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         }
       } else if (fs && !isDesktop) {
         /* 横屏竖滑分三区（用户定稿）：左 1/3 亮度、右 1/3 音量、中 1/3 切集/切作品。
-           竖屏**不走**这条分支 —— 竖屏上下滑仍是切集/切作品。 */
+           竖屏**不走**这条分支 —— 竖屏上下滑仍是切集/切作品。
+           注意：横屏舞台只有 ~360 CSS 高，episodeIntent 的 25% 门限 = 90px，
+           真机上用户一次竖滑通常只有 60–70px，于是「划了没反应」。中区的提交门槛
+           在这里按**像素**重算（见 onUp），不改竖屏的百分比口径。 */
         g.mode = "pan";
         const third = g.startFrac < 1 / 3 ? "left" : g.startFrac > 2 / 3 ? "right" : "mid";
         g.zoneKind = third;
@@ -1379,7 +1382,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       }
       setZoneHud({ kind: g.zoneKind === "left" ? "brightness" : "volume",
         value: g.zoneKind === "left" ? Math.min(1.6, Math.max(0.4, next)) : Math.min(1, Math.max(0, next)) });
-    } else if (g.mode === "pan" && !fs && !endless && swipeEp && episodes.length > 1 && zoom.s <= 1.05) {
+    } else if (g.mode === "pan" && (fs ? g.zoneKind === "mid" : true) && !endless && episodes.length > 1 && zoom.s <= 1.05) {
       const pdy = msy - g.startY;
       /* 速度辅助：短促一划也能切（普通上滑往往只有 20–30% 屏高） */
       const dt = Math.max(1, Date.now() - g.t);
@@ -1473,7 +1476,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       const [ux2, uy2] = [e.clientX, e.clientY];
       const dy = uy2 - g.startY;
       const dtUp = Math.max(1, Date.now() - g.t);
-      const intent = episodeIntent(dy, g.stageH, (dy / dtUp) * 1000);
+      let intent = episodeIntent(dy, g.stageH, (dy / dtUp) * 1000);
+      /* 横屏中区：舞台矮，25% 门限过于苛刻 —— 48px（≈ 短边的 13%）就算切，方向按位移符号。
+         竖屏仍用原来的百分比 + 速度双判据，不受影响。 */
+      if (fs) {
+        intent = { dir: dy <= 0 ? 1 : -1, commit: Math.abs(dy) >= 48 || intent.commit, preview: Math.abs(dy) >= 24 };
+      }
       if (intent.commit) {
         const dir = intent.dir;
         logLine(`[gesture] episode commit dir=${dir} dy=${Math.round(dy)} dt=${Date.now() - g.t}ms`);
@@ -1679,6 +1687,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (isDesktop || !fs) return undefined;
     return registerOverlayBack(() => { exitFs(); return true; });
   }, [isDesktop, fs, exitFs]);
+
+  /* 结束卡打开时接管系统返回：先关卡片、停在播放页；卡片关了之后返回才退播放器
+     （真机实测：卡片挡着时按返回直接回了详情页 —— 用户丢掉当前观看位置）。 */
+  useEffect(() => {
+    if (!seriesEnded) return undefined;
+    return registerOverlayBack(() => { closeEndCard(); return true; });
+  }, [seriesEnded, closeEndCard]);
 
   /* 系统方向一旦被改过就必须还回去，所以「退出播放器」和「切后台」这两条路径也照发一遍还原请求：
        · 组件卸载（返回上一页 / 换片）→ 还原竖屏；

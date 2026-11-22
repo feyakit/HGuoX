@@ -10,6 +10,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import EpisodePlayer from "../src/features/playback/EpisodePlayer";
+import { runBack } from "../src/shared/lib/back";
 import { AppProvider, useStore } from "../src/shared/model/store";
 import { ToastHost } from "../src/shared/ui/ui";
 import "../src/index.css";
@@ -56,7 +57,7 @@ const invoke = (cmd: string, args: Record<string, unknown> = {}) => {
   return Promise.resolve(null);
 };
 
-Object.assign(window, { __TAURI_INTERNALS__: { invoke }, playerModeFixture: { calls } });
+Object.assign(window, { __TAURI_INTERNALS__: { invoke }, playerModeFixture: { calls }, __runBack: runBack });
 
 /* ── 媒体打桩：无解码环境里 paused 恒 true，「单击暂停/播放」验不出来。
       只替换暂停态与 play/pause 计数，事件链与组件逻辑都走真的。 ── */

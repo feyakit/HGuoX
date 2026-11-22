@@ -203,6 +203,26 @@ try {
     const moved = epAfter.calls > epBefore || /第\s*2\s*集/.test(epAfter.label || "");
     assert.ok(moved, `api_play ${epBefore} → ${epAfter.calls}，label=${epAfter.label}`);
   });
+
+/* ═══ 结束卡：系统返回先关卡片，不退出播放页 ═══ */
+await boot({ eps: 1 });
+await page.waitForTimeout(400);
+await page.evaluate(() => { document.querySelector("video").dispatchEvent(new Event("ended")); });
+await page.waitForTimeout(900);
+const cardOpen = await page.evaluate(() => !!document.querySelector(".hg-endcard"));
+await page.evaluate(() => { window.__cardBack = window.__runBack(); });
+await page.waitForTimeout(300);
+const afterBack = await page.evaluate(() => ({
+  card: !!document.querySelector(".hg-endcard"),
+  player: !!document.querySelector(".player-root"),
+  popped: (window.__back || 0),
+}));
+await step("结束卡打开时按系统返回：先关卡片，播放页还在", async () => {
+  assert.ok(cardOpen, "结束卡没打开");
+  assert.equal(afterBack.card, false, "卡片还在");
+  assert.ok(afterBack.player, "播放页被退掉了");
+  assert.equal(afterBack.popped, 0, `onBack 被调用 ${afterBack.popped} 次（不该退播放器）`);
+});
 } finally {
   report.errors = errors;
   report.summary = `${report.passed.length} passed / ${report.failed.length} failed`;
