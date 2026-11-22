@@ -125,12 +125,27 @@ export const clearApiReadCache = () => {
   READ_CACHE.clear();
   INFLIGHT.clear();
 };
+/** 账号变了（登录 / 退出 / 换账号）时由 store 派发；全库只在这里监听。 */
+export const ACCOUNT_CHANGED_EVENT = "hg:account-changed";
+/* 读缓存的作用域：线路 + 账号。
+ *  - 键里带上作用域，换线 / 换账号之后旧缓存自然打不中（只清 Map 不够：清完那一刻
+ *    还在途的旧请求回来会把上一位用户的数据重新写进去）；
+ *  - 同时保留「换线 / 换账号 → 整体清」的语义，避免不同作用域的历史条目堆在 Map 里。 */
+let lineScope = 0;
+let accountScope = "guest";
+/** `guest` 或 `origin:id`（与 accountData 的桶键一致）。换值即清缓存。 */
+export const setApiAccountScope = (scope: string) => {
+  const next = scope || "guest";
+  if (next === accountScope) return;
+  accountScope = next;
+  clearApiReadCache();
+};
 if (typeof window !== "undefined") {
-  window.addEventListener("hg:line-changed", clearApiReadCache);
-  window.addEventListener("hg:account-changed", clearApiReadCache);
+  window.addEventListener("hg:line-changed", () => { lineScope++; clearApiReadCache(); });
+  window.addEventListener(ACCOUNT_CHANGED_EVENT, clearApiReadCache);
 }
 const cacheKey = (cmd: string, args?: Record<string, unknown>) =>
-  `${cmd}:${args ? JSON.stringify(args) : ""}`;
+  `L${lineScope}|@${accountScope}|${cmd}:${args ? JSON.stringify(args) : ""}`;
 /** 页面订阅 `hg:api-data` 时要自己算同一个 key，所以把它导出去（别各写一份）。 */
 export const apiCacheKey = (cmd: string, args?: Record<string, unknown>) => cacheKey(cmd, args);
 

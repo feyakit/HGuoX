@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../api/api";
+import { ACCOUNT_CHANGED_EVENT, api, setApiAccountScope } from "../api/api";
 import type { AccountHistoryItem, AccountIdentity, AccountInteractions, User } from "../api/types";
 import type { WatchProgress } from "./store";
 import { migrateLegacyKey } from "../storage/legacyKeys";
@@ -262,7 +262,17 @@ export function useAccountData(initialGuest: GuestData, saveGuest: (data: GuestD
     window.clearTimeout(flushTimer.current); flushTimer.current = undefined;
     window.clearTimeout(syncTimer.current);
     s.generation++; mutation.current++; historyMutation.current++;
+    const switched = s.key !== key;
     s.user = next; s.origin = nextOrigin; s.key = key;
+    /* 账号作用域变了（登录 / 退出 / 换账号）：读缓存按账号隔离 + 通知全库。
+       旧代码只有 api.ts 在监听 hg:account-changed，却没人派发 —— 换账号后仍命中
+       上一位用户的读缓存（点赞/收藏数会多 1）。这里成为唯一派发点。 */
+    if (switched) {
+      setApiAccountScope(key);
+      try {
+        window.dispatchEvent(new CustomEvent(ACCOUNT_CHANGED_EVENT, { detail: { userId: next ? next.id : null, origin: nextOrigin } }));
+      } catch { /* 广播失败不影响账号切换本身 */ }
+    }
     s.data = next ? accounts.current[key] || applyInteractions(empty(), next.interactions) : guest.current;
     s.sync = { busy: false, error: "", lastSynced: 0, favoritesKnown: false };
     sentHistory.current.clear(); pending.current.clear(); needsResync.current = false; storageError.current = "";
