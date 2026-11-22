@@ -240,13 +240,26 @@ pub fn check_addresses_with_mode(addrs: &[SocketAddr], strict: bool) -> Result<(
 /// Clash/Stash `fdfe:dcba:9876::/48`、Surge `fd00:6152::/32`）。这些地址不可直达，
 /// 但整组拒绝会让请求在发出前失败。丢掉不可放行的地址、保留 fake-IP IPv4，
 /// 连接器拿到的列表仍然不含私网。白名单本身不放宽：整组都不可放行时仍拒绝。
+/// TUN 代理合成的 IPv6 FakeIP（ULA 段 fc00::/7，典型是 mihomo 的 fdfe:dcba:9876::/48）
+/// 不是可直连地址：把它固定给连接器只会连不上。`allowed_ip` 出于「HTTP 代理下 FakeIP 可放行」
+/// 会认它，但**固定连接地址时必须滤掉**——与上游 70d5120 的行为一致。
+fn is_synthesized_v6_fakeip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            is_fake_ip(ip) && (s[0] & 0xfe00) == 0xfc00
+        }
+        IpAddr::V4(_) => false,
+    }
+}
+
 fn pinable_addresses(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String> {
     if addrs.is_empty() {
         return Err("目标没有可用的 DNS 地址".into());
     }
     let kept: Vec<SocketAddr> = addrs
         .into_iter()
-        .filter(|addr| allowed_ip(addr.ip()))
+        .filter(|addr| allowed_ip(addr.ip()) && !is_synthesized_v6_fakeip(addr.ip()))
         .collect();
     if kept.is_empty() {
         return Err(denied_target());

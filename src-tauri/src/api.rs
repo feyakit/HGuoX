@@ -468,29 +468,47 @@ pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-/// 切换移动端屏幕方向：iOS 走 objc；Android 目前是 no-op（JNI 系统转屏待重做，走 CSS 伪横屏）。
+/// 切换移动端屏幕方向：iOS 走 objc；Android 走 Kotlin 插件（orientation.rs）。
 ///
 /// 3.0.5 之前 Android 分支是空实现，点「横屏全屏」只走 `.fs-landscape` 的 CSS 旋转（伪横屏），
 /// 系统仍是竖屏。现在两端都真转；前端 `EpisodePlayer` 在退全屏 / 退出播放器 / 切后台
 /// 三条路径都会回调 `landscape: false`，不会把用户锁在横屏里。
 /// gen/android 是 gitignore 的生成目录（每次 `tauri android init` 重建），所以实现放在 Rust，
 /// 不放在那里改 Kotlin。
+///
+/// 审计 #8：失败**必须回到前端**。原来两端拿到失败都只 `eprintln` 再 `Ok(())`，
+/// 前端只在 invoke reject 时提示 —— 于是「点了全屏没转」永远是静默的。
+/// 现在失败一律 `Err(原因)`，`requestOrientation.onFail` 会弹一条 playback-hint（UI 不动）。
 #[tauri::command]
 pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {
-        let _ = app.run_on_main_thread(move || {
-            request_ios_orientation(landscape);
-        });
+        /* run_on_main_thread 的闭包没有返回值，用 channel 把结果带回来才算真的知道成没成。 */
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(request_ios_orientation(landscape));
+        })
+        .map_err(|error| format!("转屏请求没能派发到主线程：{error}"))?;
+        match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+            Ok(Ok(())) => eprintln!("[orientation] iOS 已下发几何更新(landscape={landscape})"),
+            Ok(Err(reason)) => {
+                eprintln!("[orientation] iOS 下发失败：{reason}");
+                return Err(reason);
+            }
+            Err(_) => return Err("系统转屏无响应（主线程 1.5s 未回应）".to_string()),
+        }
     }
     #[cfg(target_os = "android")]
     {
         /* 安卓：走 Kotlin 插件（orientation.rs），Rust 里**不再有任何裸 JNI** ——
            上一版那条 JNI 路径没清 Java 异常，点全屏直接 SIGABRT 把进程带走。
-           这里拿到 Err 就只打日志，画面继续靠 CSS 伪横屏（.fs-landscape）。 */
+           插件 reject / 未注册时返回 Err 给前端（审计 #8），画面停在竖屏沉浸全屏。 */
         match crate::orientation::request(&app, landscape).await {
             Ok(()) => eprintln!("[orientation] 已下发 Kotlin setOrientation(landscape={landscape})"),
-            Err(error) => eprintln!("[orientation] 下发失败，降级 CSS 伪横屏：{error}"),
+            Err(error) => {
+                eprintln!("[orientation] 下发失败：{error}");
+                return Err(format!("系统未允许转屏：{error}"));
+            }
         }
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -521,7 +539,7 @@ pub fn set_text_interaction(app: tauri::AppHandle, enabled: bool) -> Result<(), 
 }
 
 #[cfg(target_os = "ios")]
-fn request_ios_orientation(landscape: bool) {
+fn request_ios_orientation(landscape: bool) -> Result<(), String> {
     /* iOS 16+ 的正确转屏姿势：拿前台活跃的 UIWindowScene，调
        -[UIWindowScene requestGeometryUpdateWithPreferences:errorHandler:]。
        参数用 +[UIWindowSceneGeometryPreferencesIOS preferencesWithInterfaceOrientations:]。
@@ -531,8 +549,8 @@ fn request_ios_orientation(landscape: bool) {
          · 那条路在 iOS 16+ 会抛 NSInternalInconsistencyException
            （"Supported orientations has gone out of sync..."）；
          · Rust 侧接不住 ObjC 异常，异常会直接把进程带走（和安卓 SIGABRT 同类事故）。
-       旧系统拿不到 UIWindowSceneGeometryPreferencesIOS 时直接返回，前端继续用
-       `.fs-landscape` 的 CSS 伪横屏 —— 宁可画面靠 CSS 转，也不能崩。
+       旧系统拿不到 UIWindowSceneGeometryPreferencesIOS 时返回 Err（前端弹一条
+       playback-hint 并停在竖屏沉浸全屏）—— 宁可转不过去，也不能崩。
 
        另外：Info.plist 的 UISupportedInterfaceOrientations 必须包含横屏，
        否则系统会拒绝几何更新（控制台报 "Supported orientations has gone out of sync"）。
@@ -565,33 +583,33 @@ fn request_ios_orientation(landscape: bool) {
 
         let prefs_cls = objc_getClass(b"UIWindowSceneGeometryPreferencesIOS\0".as_ptr() as *const c_char);
         let app_cls = objc_getClass(b"UIApplication\0".as_ptr() as *const c_char);
-        /* iOS < 16 没有这个类：直接放弃，交给 CSS 伪横屏（不调会抛异常的旧 API） */
+        /* iOS < 16 没有这个类：直接返回 Err（不调会抛异常的旧 API） */
         if prefs_cls.is_null() || app_cls.is_null() {
-            return;
+            return Err("系统没有 UIWindowSceneGeometryPreferencesIOS（iOS 16 以下不支持几何更新）".to_string());
         }
 
         let sel_prefs = sel_registerName(b"preferencesWithInterfaceOrientations:\0".as_ptr() as *const c_char);
         let responds = sel_registerName(b"respondsToSelector:\0".as_ptr() as *const c_char);
         if !msg1_bool(prefs_cls, responds, sel_prefs) {
-            return;
+            return Err("系统不响应 preferencesWithInterfaceOrientations:".to_string());
         }
         let mask = if landscape { MASK_LANDSCAPE } else { MASK_PORTRAIT };
         let prefs = msg1_usize(prefs_cls, sel_prefs, mask);
         if prefs.is_null() {
-            return;
+            return Err("几何偏好对象创建失败".to_string());
         }
 
         let app = msg0(app_cls, sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char));
         if app.is_null() {
-            return;
+            return Err("取不到 UIApplication".to_string());
         }
         let scenes_set = msg0(app, sel_registerName(b"connectedScenes\0".as_ptr() as *const c_char));
         if scenes_set.is_null() {
-            return;
+            return Err("取不到 connectedScenes".to_string());
         }
         let arr = msg0(scenes_set, sel_registerName(b"allObjects\0".as_ptr() as *const c_char));
         if arr.is_null() {
-            return;
+            return Err("取不到场景列表".to_string());
         }
 
         let sel_count = sel_registerName(b"count\0".as_ptr() as *const c_char);
@@ -617,11 +635,12 @@ fn request_ios_orientation(landscape: bool) {
             }
         }
         if target.is_null() {
-            return;
+            return Err("没有可请求几何更新的前台场景".to_string());
         }
-        /* errorHandler 传 NULL：失败只会在系统日志里留一行，不会抛异常、不会崩，
-           前端继续走 .fs-landscape 的 CSS 伪横屏。 */
+        /* errorHandler 传 NULL：这里只代表「请求已交给系统」，真正被系统拒绝只会在
+           系统日志里留一行，不会抛异常、不会崩（前端仍是竖屏沉浸全屏，可再次点全屏重试）。 */
         msg2_void(target, sel_req, prefs, std::ptr::null_mut());
+        Ok(())
     }
 }
 

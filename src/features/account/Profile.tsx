@@ -871,8 +871,11 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
                       onLongPress={() => beginSelection(c.id)}
                       onOpen={() => {
                         if (selectionMode) { toggleSelected(c.id); return; }
-                        /* 点开就认账：把基线抬到最新，徽标随即消失（不然会一直挂着） */
-                        if (unwatched > 0 && latestCount > 0 && (progress?.ep ?? 0) < (favEpCounts[c.id] ?? latestCount)) {
+                        /* 点开就认账：把基线抬到最新，徽标随即消失（不然会一直挂着）。
+                           以前这里还要求「progress.ep < 基线」才认账 —— 而徽标恰恰会在
+                           progress.ep === 基线（追上了旧基线、但剧又更了）时还挂着，
+                           于是点了没反应。认账条件直接对齐徽标本身：有未看新集就抬基线。 */
+                        if (unwatched > 0 && latestCount > 0) {
                           ackFavoriteEpisodes(c.id, latestCount);
                         }
                         push({ kind: "series", id: c.id });

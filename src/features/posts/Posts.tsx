@@ -81,6 +81,10 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const busy = useRef(false);
+  /* 请求代次：只有当前代次的响应能写回列表。
+     吃瓜列表可以同时有「旧第 2 页」和「换线/换筛选后的第 1 页」在飞，旧代码靠 busy
+     挡住并发，force 刷新时免不了重叠 —— 回来的旧页会直接接在新列表后面。 */
+  const seq = useRef(0);
   const lastEpoch = useRef(lineEpoch);
   const lastAt = useRef(0);
   const sentinel = useRef<HTMLDivElement>(null);
@@ -93,6 +97,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
     if (busy.current && !force) return;
     const next = reset ? 1 : page + 1;
     if (!reset && next > pages) return;
+    /* reset 开新代次（换筛选/换线/下拉刷新），追加沿用当前代次 */
+    const my = reset ? ++seq.current : seq.current;
     busy.current = true;
     if (!silent) setLoading(true);
     if (!silent) setErr("");
@@ -112,6 +118,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
           ? await api.postCategory(fallbackRoute, next, 20, sort, force)
           : await api.posts(next, 20, sort, force);
       }
+      /* 旧代次的页不写回：换线/换筛选之后它属于上一批数据 */
+      if (my !== seq.current) return;
       setItems((prev) => {
         const base = reset ? [] : prev;
         /* 只按 id 去重：旧代码还按标题去重，站点上同题不同帖（或标题带空白差异）会被整条滤掉，
@@ -129,29 +137,44 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
       setErr("");
       lastAt.current = Date.now();
     } catch (e) {
-      if (!silent) setErr((e as Error).message || "吃瓜内容加载失败");
-      if (silent) throw e;
+      if (my === seq.current) {
+        if (!silent) setErr((e as Error).message || "吃瓜内容加载失败");
+        if (silent) throw e;
+      }
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (my === seq.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
   };
 
-  /* 换排序、分类或切换线路：清空列表重新拉。
-     必须 force：旧代码这里吃 60s 读缓存，切到「最热」看到的还是「最新」那批（要求 D）。 */
+  /* 换排序 / 换分类：用户主动换筛选，清空重拉（这一屏的卡片本来就该换成另一批）。 */
   useEffect(() => {
-    if (lastEpoch.current !== lineEpoch) {
-      lastEpoch.current = lineEpoch;
-      postExtra.clear();
-      setExtra({});
-    }
     setItems([]);
+    /* 点赞增量是「相对旧列表服务端计数」的差，换一批数据就没意义了（否则越滚越多 ±1） */
+    setLikeDelta({});
     setPage(0);
     setPages(1);
     scrollRef.current?.scrollTo(0, 0);
     void loadMore(true, { force: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort, cate, lineEpoch]);
+  }, [sort, cate]);
+
+  /* 线路 / 代理事件（hg:line-changed → lineEpoch）：只静默换数据，不清列表、不回到顶部。
+     旧写法把 lineEpoch 并进上面那个 effect，先 setItems([]) 再拉：已渲染的卡片会被整批卸载重建
+     （报告 B11——事件后 2.5s 打标记的卡片 contains=false），详情页已是这个口径（上游 issue #165）。
+     loadMore(reset) 是**一次** setItems，React 按 id 复用节点，所以静默刷新后已渲染卡片不重建。 */
+  useEffect(() => {
+    if (lastEpoch.current === lineEpoch) return;
+    lastEpoch.current = lineEpoch;
+    postExtra.clear();
+    setExtra({});
+    /* 换线后服务端计数整批换新，旧的本地增量必须撤销（失败回滚那条只管单次点击） */
+    setLikeDelta({});
+    void loadMore(true, { force: true, silent: true }).catch(() => { /* 静默失败：保留旧列表 */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineEpoch]);
 
   /* 返回再进 / 切回吃瓜 tab：5s 内复用现成列表，超过就静默重拉（不闪骨架，失败保留旧列表） */
   const firstRun = useRef(true);

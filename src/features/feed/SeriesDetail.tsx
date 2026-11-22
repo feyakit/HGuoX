@@ -21,6 +21,15 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
   const [favDelta, setFavDelta] = useState(0);
   /* 慢线路兜底文案：3s 还没出详情就明说是线路慢，而不是让用户对着黑屏猜。 */
   const [slow, setSlow] = useState(false);
+  /* 收藏数的乐观增量只对「还没有反映这次操作的服务端计数」有效。
+     静默刷新（进页 SWR / 回前台 / 60s 一次）拿到的计数已经包含本次收藏，再叠加就多 1。
+     记录「收藏请求落定」的时刻：之后**发起**的详情请求，回来就把增量清零。 */
+  const favSettledAt = useRef(0);
+  const applyDetail = (res: Detail | null, requestedAt: number) => {
+    if (!res) return;
+    if (requestedAt >= favSettledAt.current) setFavDelta(0);
+    setDetail(res);
+  };
   const seq = useRef(0);
   const accentScheme = useAccent(id, detail?.cover ? cover(detail.cover, 900) : undefined);
 
@@ -46,17 +55,19 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
 
   useEffect(() => {
     const my = ++seq.current;
+    /* 这次（这组）请求是什么时候发起的：用来判断回来的计数是否已经包含收藏操作 */
+    const startedAt = Date.now();
     setErr("");
     setFavDelta(0);
     /* 首屏加速：预取命中时同步出内容（上面的 useState 初值），未命中走 loadDetail
        —— 超过 3s 会用一次自动选线并行换线重试，谁先回用谁。 */
     loadDetail(id)
-      .then(res => { if (my === seq.current) setDetail(res); })
+      .then(res => { if (my === seq.current) applyDetail(res, startedAt); })
       .catch(e => { if (my === seq.current) setErr((e as Error)?.message || "加载失败"); });
     /* 进页 SWR：缓存先上屏，同时补一次真实请求（force 绕过 5min 读缓存 + 磁盘缓存），
        回来就静默换新，失败不打扰。 */
     api.video(id, true)
-      .then(res => { if (my === seq.current && res) setDetail(res); })
+      .then(res => { if (my === seq.current && res) applyDetail(res, startedAt); })
       .catch(() => { /* 静默 */ });
     api.related(id)
       .then(res => { if (my === seq.current) setRelated((res?.items ?? []).filter(v => v && v.cover)); })
@@ -70,8 +81,9 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
   useEffect(() => {
     let alive = true;
     const refresh = () => {
+      const requestedAt = Date.now();
       api.video(id, true)
-        .then(res => { if (alive && res) setDetail(res); })
+        .then(res => { if (alive && res) applyDetail(res, requestedAt); })
         .catch(() => { /* 静默 */ });
     };
     const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
@@ -112,9 +124,11 @@ export default function SeriesDetail({ id, onBack }: { id: number; onBack: () =>
     if (favBusy) return;
     const next = !faved;
     setFavDelta(d => d + (next ? 1 : -1));
+    const settle = () => { favSettledAt.current = Date.now(); };
     void setCollected("video", id, next, detailEpisodeCount(detail))
-      .then(() => toast(next ? "已加入收藏" : "已取消收藏", next ? "star" : "info"))
+      .then(() => { settle(); toast(next ? "已加入收藏" : "已取消收藏", next ? "star" : "info"); })
       .catch(e => {
+        settle();
         setFavDelta(d => d + (next ? -1 : 1));
         toast((e as Error)?.message || "收藏操作失败", "info");
       });

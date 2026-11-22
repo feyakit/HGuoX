@@ -50,6 +50,10 @@ const CHANNEL_SORTS = [
   { value: "random", label: "精选推荐" },
 ] as const;
 
+/* 片库左右滑切要避让的容器：排序 chip 行自己有横滚，横滑货架/轮播/磁贴分别是各自的锚点，
+   起手落在里面就把手势还回去（B17）。 */
+const SWIPE_IGNORE = "input, textarea, select, [role=dialog], [data-tab-swipe-ignore], .hg-inline-sorts, .hg-bento-grid, [data-hscroll], .hg-rail, .hg-spotlight, .hg-hero";
+
 const ORIGINAL_CATES = [
   { value: "all", label: "全部原创" },
   { value: "ai-duanju", label: "短剧" },
@@ -101,11 +105,26 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
   const [err, setErr] = useState("");
   const loadingRef = useRef(false);
   const seq = useRef(0);
+  /* 第 1 页当前这批 id：后台刷新时只替换这一段，已加载的第 2 页及以后原样保留 */
+  const page1Ids = useRef<Set<number>>(new Set());
   const loadedKey = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const isCollectionView = view === "topics" || view === "tags";
   const subKey = view === "" ? allSort : view === "original" ? origCate : chanSort;
+  /* 当前屏幕上那排子 tab（全部/最新上线 · 最近更新/当前热播/精选推荐 · 全部原创/短剧/漫剧），
+     点击与横滑共用同一套取值，避免两处口径漂移。 */
+  const sortTabs: readonly { key?: string; value?: string }[] =
+    view === "original" ? ORIGINAL_CATES : view === "ai-duanju" || view === "ai-manju" ? CHANNEL_SORTS : ALL_SORTS;
+  const tabValue = (tab: { key?: string; value?: string }) => (tab.value ?? tab.key) as string;
+  const sortIndex = Math.max(0, sortTabs.findIndex(tab => tabValue(tab) === subKey));
+  const selectSort = (index: number) => {
+    const next = sortTabs[index];
+    if (!next) return;
+    if (view === "original") setOrigCate(tabValue(next) as (typeof ORIGINAL_CATES)[number]["value"]);
+    else if (view === "ai-duanju" || view === "ai-manju") setChanSort(tabValue(next) as (typeof CHANNEL_SORTS)[number]["value"]);
+    else setAllSort(tabValue(next) as (typeof ALL_SORTS)[number]["key"]);
+  };
 
   const load = useCallback(async (p: number, opts?: { force?: boolean; silent?: boolean }) => {
     const force = opts?.force === true;
@@ -125,6 +144,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
       const rows = (res?.items ?? []).filter(v => v && v.cover);
       const pages = Math.max(1, res?.pagination?.pages || 1);
       setItems(prev => p === 1 ? rows : [...prev, ...rows.filter(r => !prev.some(x => x.id === r.id))]);
+      if (p === 1) page1Ids.current = new Set(rows.map(r => r.id));
       if (p === 1) prefetchDetails(rows.slice(0, 4).map(v => v.id));
       setPage(p);
       setDone(!rows.length || p >= pages);
@@ -187,7 +207,18 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
         : { cate: view, page: 1, size: 24, sort: chanSort },
     res => {
       const rows = (res?.items ?? []).filter(v => v && v.cover);
-      if (rows.length) setItems(rows);
+      if (!rows.length) return;
+      /* 后台刷新只覆盖第 1 页范围：旧代码 setItems(rows) 会把已加载的第 2 页及以后整段抹掉
+         （page/done 又没跟着改，于是列表变短、还停在「已加载 N 页」上）。
+         这里按「当前第 1 页的 id」把旧的第一页换掉，后面的页原样接上。 */
+      const first = page1Ids.current;
+      const incoming = new Set(rows.map(v => v.id));
+      setItems((prev: VideoCard[]) => {
+        if (!prev.length || !first.size) return rows;
+        const rest = prev.filter((v: VideoCard) => !first.has(v.id) && !incoming.has(v.id));
+        return [...rows, ...rest];
+      });
+      page1Ids.current = incoming;
     },
   );
 
@@ -208,6 +239,17 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
   const toggleTile = (target: CategoryView) => {
     setView(current => (current === target ? "" : target));
   };
+
+  /* 片库（分类主页）左右滑切子 tab。分类页原来只在频道子页挂了钩子，片库本身横滑没反应（B17）；
+     避让见 SWIPE_IGNORE —— 排序 chip 行自己会横滚，磁贴/货架是各自的锚点，起手落在里面就放行。 */
+  const tabSwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: scrollRef,
+    tabIndex: sortIndex,
+    tabCount: sortTabs.length,
+    onTabChange: selectSort,
+    ignoreSelector: SWIPE_IGNORE,
+    enabled: !isCollectionView,
+  });
 
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
@@ -232,8 +274,8 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
         </Button>
       </header>
 
-      <div ref={scrollRef} className="flex-1 scroll-y hg-page-x relative z-10"
-        style={{ paddingBottom: "calc(110px + var(--sab, 0px))" }}
+      <div ref={scrollRef} {...tabSwipe} className="flex-1 scroll-y hg-page-x relative z-10"
+        style={{ paddingBottom: "calc(110px + var(--sab, 0px))", touchAction: "pan-y" }}
         onScroll={(e) => {
           if (isCollectionView || loading || done || err) return;
           const el = e.currentTarget;
@@ -354,7 +396,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
 
 /* ================= 频道详情页（次级栈页：统一极光顶栏 + 玻璃轨道滑块） ================= */
 export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: string; onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const { preferences } = useContentPreferences();
   const filtering = !preferences.paused && (preferences.blockedTags.length > 0 || preferences.hideUntagged);
   const [searching, setSearching] = useState(false);
@@ -436,6 +478,17 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     return () => { requestSeq.current++; busy.current = false; };
     /* eslint-disable-next-line */
   }, [cate]);
+
+  /* 换线：同一频道、同一筛选重拉第 1 页（loadMore(true) 推进 requestSeq，在途的旧页作废），
+     否则换线后旧的旧列表会接上新的第 2 页。 */
+  const lineRef = useRef(lineEpoch);
+  useEffect(() => {
+    if (lineRef.current === lineEpoch) return;
+    lineRef.current = lineEpoch;
+    setErr(null);
+    void loadMore(true, serverSort, originalCate);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineEpoch]);
 
   const filterPending = displayedFilter !== filterKey(serverSort, originalCate);
   const replacing = refreshing || filterPending;

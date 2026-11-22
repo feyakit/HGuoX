@@ -20,12 +20,3 @@ export function getHoldZone(x: number, y: number, width: number, height: number)
   if (x >= left && x <= left + size && y >= top && y <= top + size) return "menu";
   return x / w - y / h >= 0 ? "fast" : "slow";
 }
-
-/**
- * 伪横屏：整块舞台被 CSS `rotate(90deg)` 转过时，屏幕坐标要换算回舞台自身坐标，
- * 否则「上滑切集」「横拖定位」「双击判定」全部按没转的方向走（旧版踩过：转屏后点哪都不对）。
- * 只做旋转、不做平移，所以增量（dx/dy）同样适用。
- */
-export function stageXY(rotated: boolean, x: number, y: number): [number, number] {
-  return rotated ? [y, -x] : [x, y];
-}
