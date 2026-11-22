@@ -152,6 +152,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
   /* 换排序 / 换分类：用户主动换筛选，清空重拉（这一屏的卡片本来就该换成另一批）。 */
   useEffect(() => {
     setItems([]);
+    /* 点赞增量是「相对旧列表服务端计数」的差，换一批数据就没意义了（否则越滚越多 ±1） */
+    setLikeDelta({});
     setPage(0);
     setPages(1);
     scrollRef.current?.scrollTo(0, 0);
@@ -168,6 +170,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
     lastEpoch.current = lineEpoch;
     postExtra.clear();
     setExtra({});
+    /* 换线后服务端计数整批换新，旧的本地增量必须撤销（失败回滚那条只管单次点击） */
+    setLikeDelta({});
     void loadMore(true, { force: true, silent: true }).catch(() => { /* 静默失败：保留旧列表 */ });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lineEpoch]);
