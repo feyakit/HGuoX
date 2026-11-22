@@ -646,7 +646,7 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
-    get_with_dns(raw, timeout, accept, referer, false).await
+    get_with_dns(raw, timeout, accept, referer, false, None).await
 }
 
 /// 同 [`get`]，但强制走加密 DoH 解析。
@@ -658,7 +658,7 @@ pub async fn get_public_dns(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
-    get_with_dns(raw, timeout, accept, referer, true).await
+    get_with_dns(raw, timeout, accept, referer, true, None).await
 }
 
 async fn get_with_dns(
@@ -667,6 +667,7 @@ async fn get_with_dns(
     accept: Option<&str>,
     referer: Option<&str>,
     public_dns: bool,
+    range: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
@@ -684,6 +685,10 @@ async fn get_with_dns(
             }
             if let Some(value) = referer {
                 request = request.header("Referer", value);
+            }
+            if let Some(value) = range {
+                // 分片透传：只要客户端的这一段，别让客户端库擅自解压后再算偏移。
+                request = request.header("Range", value).header("Accept-Encoding", "identity");
             }
             let response = request.send().await.map_err(|e| err_text(&e))?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
@@ -1580,6 +1585,27 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 /// m3u8 里的相对地址必须以最终地址为基准拼：上游 CDN 常常 302 到子目录，
 /// 用请求前的地址当基准会让所有分片 / key 路径错位（黑屏或 404）。
 pub async fn fetch_bytes_with_url(url: &str) -> Result<(String, Option<String>, Vec<u8>), String> {
+    let raw = fetch_bytes_impl(url, None).await?;
+    Ok((raw.final_url, raw.ctype, raw.bytes))
+}
+
+/// 带单段 `Range` 的字节请求。206（上游给了片段）与 416（起点越过末尾）都按成功返回，
+/// 由媒体层决定是原样转给 WebView，还是整段回退再本地切片。
+pub async fn fetch_bytes_range(url: &str, range: &str) -> Result<RawBytes, String> {
+    fetch_bytes_impl(url, Some(range)).await
+}
+
+/// 一次原始请求的结果。[`RawBytes::status`] 是上游状态码：200 = 不认 Range，
+/// 206 = 认了并只返回请求的那一段，媒体层据此选择路径。
+pub struct RawBytes {
+    pub final_url: String,
+    pub status: u16,
+    pub ctype: Option<String>,
+    pub content_range: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+async fn fetch_bytes_impl(url: &str, range: Option<&str>) -> Result<RawBytes, String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
@@ -1606,10 +1632,12 @@ pub async fn fetch_bytes_with_url(url: &str) -> Result<(String, Option<String>, 
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get_with_dns(&url, Duration::from_secs(20), None, Some(&referer), using_public_dns).await?;
+                let resp = get_with_dns(&url, Duration::from_secs(20), None, Some(&referer), using_public_dns, range).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
-                if !resp.status().is_success() {
+                let code = resp.status().as_u16();
+                // 带 Range 时 416 是「起点越过末尾」，要如实转给播放器；其它非 2xx 仍算失败。
+                if !resp.status().is_success() && !(code == 416 && range.is_some()) {
                     return Err(format!("HTTP {}", resp.status()));
                 }
                 // 重定向后的地址必须在 resp 被消费前取出来：m3u8 相对路径以它为准。
@@ -1619,8 +1647,26 @@ pub async fn fetch_bytes_with_url(url: &str) -> Result<(String, Option<String>, 
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let content_range = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if code == 416 {
+                    // 416 没有 body；Content-Range 是播放器重新定位的唯一依据。
+                    return Ok(RawBytes { final_url, status: code, ctype, content_range, bytes: Vec::new() });
+                }
+                // 206 若被中间层压过，解压后的字节与 Content-Range 已经对不上，不能当片段用。
+                let compressed = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
+                if compressed && code == 206 {
+                    return Err("上游对分片 Range 响应做了压缩".to_string());
+                }
                 let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
-                Ok((final_url, ctype, bytes))
+                Ok(RawBytes { final_url, status: code, ctype, content_range, bytes })
             }.await;
             if using_public_dns {
                 if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
@@ -1637,7 +1683,7 @@ pub async fn fetch_bytes_with_url(url: &str) -> Result<(String, Option<String>, 
                     crate::playback_log::record("network.dns_fallback", json!({"resource": resource, "attempt": attempt, "public_dns": !using_public_dns, "error_kind": crate::playback_log::error_kind(error)}));
                 }
             }
-            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "public_dns": using_public_dns, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, _, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
+            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "public_dns": using_public_dns, "status": status, "range": range, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|raw| raw.bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
             result
         }
     })

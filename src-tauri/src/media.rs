@@ -9,7 +9,7 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, Weak};
 use tauri::http::{Response, StatusCode};
@@ -54,6 +54,9 @@ type SegmentLoad = tokio::sync::OnceCell<SegmentResult>;
 // Share the in-progress download, but never across a proxy/security generation.
 static SEG_LOADING: Lazy<Mutex<HashMap<String, Weak<SegmentLoad>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// 上游不认 Range 的主机名：只记一次，避免每个分片都刷一行日志。
+/// 有上限，防止长播放大批不同 CDN 主机把这张表撑大。
+static SEG_RANGE_IGNORED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SegmentScope {
@@ -532,16 +535,7 @@ async fn download_segment(url: &str, scope: SegmentScope) -> SegmentResult {
         return Ok((Some(ctype), hit));
     }
     let (ctype, bytes) = fetch_bytes(url).await?;
-    let mime = ctype.clone().unwrap_or_else(|| {
-        let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-        if p.ends_with(".ts") {
-            "video/mp2t".to_string()
-        } else if p.ends_with(".m4s") || p.ends_with(".mp4") {
-            "video/mp4".to_string()
-        } else {
-            "application/octet-stream".to_string()
-        }
-    });
+    let mime = segment_mime(url, ctype);
     let len = bytes.len();
     let arc = Arc::new(bytes);
     store_segment_for_scope(
@@ -553,6 +547,224 @@ async fn download_segment(url: &str, scope: SegmentScope) -> SegmentResult {
         len,
     );
     Ok((Some(mime), arc))
+}
+
+/// `/seg` 也承载子清单和 AES Key。清单必须整段取：上游对 m3u8 同样认 Range，
+/// 只拿回前几百字节交给播放器就是黑屏。只有分片 / Key 值得透传 Range。
+fn is_media_segment_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    !path.ends_with(".m3u8") && !path.ends_with(".m3u")
+}
+
+fn looks_like_playlist(ctype: Option<&str>, bytes: &[u8]) -> bool {
+    ctype.is_some_and(|t| t.to_ascii_lowercase().contains("mpegurl"))
+        || bytes.starts_with(b"#EXTM3U")
+        || bytes.starts_with(b"\xef\xbb\xbf#EXTM3U")
+}
+
+fn segment_mime(url: &str, ctype: Option<String>) -> String {
+    ctype.unwrap_or_else(|| {
+        let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+        if p.ends_with(".ts") {
+            "video/mp2t".to_string()
+        } else if p.ends_with(".m4s") || p.ends_with(".mp4") {
+            "video/mp4".to_string()
+        } else {
+            "application/octet-stream".to_string()
+        }
+    })
+}
+
+fn header_value(raw: &str) -> Option<tauri::http::HeaderValue> {
+    tauri::http::HeaderValue::from_str(raw).ok()
+}
+
+/// 解析上游 `Content-Range: bytes first-last/total`（`total` 为 `*` 时返回 `None`）。
+fn content_range_span(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (span, total) = rest.split_once('/')?;
+    let (first, last) = span.split_once('-')?;
+    let first: u64 = first.trim().parse().ok()?;
+    let last: u64 = last.trim().parse().ok()?;
+    let total = if total.trim() == "*" {
+        None
+    } else {
+        Some(total.trim().parse::<u64>().ok()?)
+    };
+    Some((first, last, total))
+}
+
+/// 上游不认 Range 时按主机只记一次：`eprintln` 给现场看，播放诊断日志给事后查。
+fn note_range_ignored(url: &str) {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let first = {
+        let mut hosts = SEG_RANGE_IGNORED.lock().unwrap();
+        hosts.len() < 64 && hosts.insert(host.clone())
+    };
+    if first {
+        eprintln!("[media] upstream ignores Range for {host}: falling back to full segment download");
+        crate::playback_log::record("proxy.range_ignored", serde_json::json!({"host": host}));
+    }
+}
+
+/// 客户端 `Range` 头的归类结果。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SegmentRange {
+    /// 单个 `bytes=start-` / `bytes=start-end`：可以原样转给上游。
+    Forward { start: u64, end: Option<u64> },
+    /// 合法但不在透传白名单里（后缀范围 `bytes=-N`、没有 Range）：走整段 + 本地切片。
+    Local,
+    /// 语法非法（多段、单位不对、数字不合法）：不回上游，直接 416。
+    Invalid,
+}
+
+fn parse_segment_range(range: Option<&str>) -> SegmentRange {
+    let Some(value) = range else { return SegmentRange::Local };
+    let Some((unit, spec)) = value.trim().split_once('=') else {
+        return SegmentRange::Invalid;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return SegmentRange::Invalid;
+    }
+    // 多段范围要 multipart 响应，播放器从没要过；绝不拼进上游请求。
+    if spec.contains(',') {
+        return SegmentRange::Invalid;
+    }
+    let Some((first, last)) = spec.split_once('-') else {
+        return SegmentRange::Invalid;
+    };
+    let number = |s: &str| -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            None
+        } else {
+            s.parse().ok()
+        }
+    };
+    if first.is_empty() {
+        // `bytes=-N` 要按总长算起点，而总长此刻未知：退回本地切片（那里已有完整实现）。
+        return if number(last).is_some() {
+            SegmentRange::Local
+        } else {
+            SegmentRange::Invalid
+        };
+    }
+    let Some(start) = number(first) else {
+        return SegmentRange::Invalid;
+    };
+    if last.is_empty() {
+        return SegmentRange::Forward { start, end: None };
+    }
+    let Some(end) = number(last) else {
+        return SegmentRange::Invalid;
+    };
+    if end < start {
+        return SegmentRange::Invalid;
+    }
+    SegmentRange::Forward { start, end: Some(end) }
+}
+
+enum RangeFetch {
+    /// 上游认了 Range：body 就是请求的那一段。
+    Partial {
+        ctype: Option<String>,
+        content_range: String,
+        bytes: Vec<u8>,
+    },
+    /// 拿不到可信片段（缓存命中 / 上游不认 Range / 目标是播放列表）：整段交给老路径。
+    Whole {
+        ctype: Option<String>,
+        bytes: Arc<Vec<u8>>,
+    },
+    /// 上游 416：起点越过末尾，把总长如实告诉播放器。
+    Unsatisfiable { content_range: Option<String> },
+}
+
+/// 超过 `SEG_CACHE_MAX_BYTES` 的分片进不了整段缓存，以前每次 Range 都要重下整段。
+/// 这里把客户端的单段 Range 直接转给上游：206 就原样交回 WebView，200 才退回整段切片。
+async fn load_segment_range(url: &str, start: u64, end: Option<u64>) -> Result<RangeFetch, String> {
+    let scope = segment_scope();
+    // ≤4MiB 的整段缓存已经工作良好：命中就本地切片，一个请求都不发。
+    if let Some((ctype, hit)) = cached_segment(scope, url) {
+        return Ok(RangeFetch::Whole { ctype: Some(ctype), bytes: hit });
+    }
+    if !is_media_segment_url(url) {
+        let (ctype, bytes) = download_segment(url, scope).await?;
+        return Ok(RangeFetch::Whole { ctype, bytes });
+    }
+    let requested = match end {
+        Some(end) => format!("bytes={start}-{end}"),
+        None => format!("bytes={start}-"),
+    };
+    let got = crate::net::fetch_bytes_range(url, &requested).await?;
+    match got.status {
+        // 上游给了片段：Content-Range 可信就原样转给播放器，不再下整段。
+        206 => {
+            let Some(content_range) = got.content_range else {
+                let (ctype, bytes) = download_segment(url, scope).await?;
+                return Ok(RangeFetch::Whole { ctype, bytes });
+            };
+            // 头部值不可回写，或范围从 0 开始且内容是清单（上游对 m3u8 也认 Range）：整段取回。
+            if header_value(&content_range).is_none()
+                || (start == 0 && looks_like_playlist(got.ctype.as_deref(), &got.bytes))
+            {
+                let (ctype, bytes) = download_segment(url, scope).await?;
+                return Ok(RangeFetch::Whole { ctype, bytes });
+            }
+            // 上游对 `bytes=0-` 会直接回整个对象：这时按整段落缓存，
+            // 后续再 seek 同一片仍能命中 ≤4MiB 缓存，不因为走了 Range 就丢缓存。
+            if let Some((first, last, Some(total))) = content_range_span(&content_range) {
+                if first == 0
+                    && last.saturating_add(1) == total
+                    && got.bytes.len() as u64 == total
+                {
+                    let mime = segment_mime(url, got.ctype);
+                    let bytes = Arc::new(got.bytes);
+                    store_segment_for_scope(
+                        scope,
+                        segment_scope(),
+                        url,
+                        mime.clone(),
+                        bytes.clone(),
+                        bytes.len(),
+                    );
+                    return Ok(RangeFetch::Whole {
+                        ctype: Some(mime),
+                        bytes,
+                    });
+                }
+            }
+            Ok(RangeFetch::Partial {
+                ctype: got.ctype,
+                content_range,
+                bytes: got.bytes,
+            })
+        }
+        // 上游不认 Range：整段已经到手，落缓存（≤4MiB）后按老路径切片。
+        200 => {
+            note_range_ignored(url);
+            let mime = segment_mime(url, got.ctype);
+            let bytes = Arc::new(got.bytes);
+            store_segment_for_scope(
+                scope,
+                segment_scope(),
+                url,
+                mime.clone(),
+                bytes.clone(),
+                bytes.len(),
+            );
+            Ok(RangeFetch::Whole {
+                ctype: Some(mime),
+                bytes,
+            })
+        }
+        416 => Ok(RangeFetch::Unsatisfiable {
+            content_range: got.content_range,
+        }),
+        status => Err(format!("HTTP {status}")),
+    }
 }
 
 /// 清空封面 / 播放列表 / Key / 分片内存缓存
@@ -666,9 +878,7 @@ fn segment_response(
     bytes: Vec<u8>,
     origin: &str,
 ) -> Response<Vec<u8>> {
-    let playlist = ctype.is_some_and(|t| t.to_ascii_lowercase().contains("mpegurl"))
-        || bytes.starts_with(b"#EXTM3U")
-        || bytes.starts_with(b"\xef\xbb\xbf#EXTM3U");
+    let playlist = looks_like_playlist(ctype, &bytes);
     if playlist {
         return match std::str::from_utf8(&bytes) {
             Ok(text) => respond(
@@ -691,6 +901,60 @@ fn segment_response(
         bytes,
         PROXIED_MEDIA_CACHE_CONTROL,
     )
+}
+
+/// 上游认了 Range：状态码与 `Content-Range` 照抄，body 已经是那一段，不再二次切片。
+fn partial_response(ctype: &str, content_range: &str, bytes: Vec<u8>) -> Response<Vec<u8>> {
+    let mut response = respond(206, ctype, bytes, PROXIED_MEDIA_CACHE_CONTROL);
+    if let Some(value) = header_value(content_range) {
+        response.headers_mut().insert("Content-Range", value);
+    }
+    response
+        .headers_mut()
+        .insert("Accept-Ranges", tauri::http::HeaderValue::from_static("bytes"));
+    response
+}
+
+/// 非法 Range 头 / 上游 416：空 body 的 416，知道总长时补上 `bytes */N`。
+fn unsatisfiable_response(content_range: Option<&str>) -> Response<Vec<u8>> {
+    let mut response = respond(416, "text/plain", Vec::new(), "no-store");
+    response
+        .headers_mut()
+        .insert("Accept-Ranges", tauri::http::HeaderValue::from_static("bytes"));
+    if let Some(value) = content_range.and_then(header_value) {
+        response.headers_mut().insert("Content-Range", value);
+    }
+    response
+}
+
+/// `/seg` 的分流：能透传就透传，透传不了才退回整段 + 本地切片。
+async fn segment_handler(target: &str, origin: &str, range: Option<&str>) -> Response<Vec<u8>> {
+    let forwarded = match parse_segment_range(range) {
+        SegmentRange::Forward { start, end } => Some((start, end)),
+        SegmentRange::Local => None,
+        // 非法头：不拼进上游请求，直接 416。
+        SegmentRange::Invalid => return unsatisfiable_response(None),
+    };
+    let fetched = match forwarded {
+        Some((start, end)) => load_segment_range(target, start, end).await,
+        None => load_segment(target)
+            .await
+            .map(|(ctype, bytes)| RangeFetch::Whole { ctype, bytes }),
+    };
+    match fetched {
+        Ok(RangeFetch::Whole { ctype, bytes }) => {
+            segment_response(target, ctype.as_deref(), bytes.as_ref().clone(), origin)
+        }
+        Ok(RangeFetch::Partial {
+            ctype,
+            content_range,
+            bytes,
+        }) => partial_response(&segment_mime(target, ctype), &content_range, bytes),
+        Ok(RangeFetch::Unsatisfiable { content_range }) => {
+            unsatisfiable_response(content_range.as_deref())
+        }
+        Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+    }
 }
 
 /// 统一入口：`<LOCAL_ORIGIN>/img?u=` / `hls?u=` / `seg?u=`
@@ -750,10 +1014,7 @@ pub async fn handle(path: &str, query: &str, origin: &str, range: Option<&str>) 
             ),
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
-        "/seg" => match load_segment(&target).await {
-            Ok((ctype, bytes)) => segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin),
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
-        },
+        "/seg" => segment_handler(&target, origin, range).await,
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
     };
     let response = apply_byte_range(response, range);
@@ -998,6 +1259,91 @@ mod tests {
     }
 
     #[test]
+    fn segment_range_only_forwards_single_bounded_ranges() {
+        assert_eq!(
+            parse_segment_range(Some("bytes=0-1")),
+            SegmentRange::Forward { start: 0, end: Some(1) }
+        );
+        assert_eq!(
+            parse_segment_range(Some("bytes=8388608-")),
+            SegmentRange::Forward { start: 8388608, end: None }
+        );
+        assert_eq!(
+            parse_segment_range(Some("Bytes=5-9")),
+            SegmentRange::Forward { start: 5, end: Some(9) }
+        );
+        // 后缀范围合法但总长未知：仍走本地切片，不退化成 416。
+        assert_eq!(parse_segment_range(Some("bytes=-4")), SegmentRange::Local);
+        assert_eq!(parse_segment_range(None), SegmentRange::Local);
+        for bad in [
+            "bytes=0-1,5-6",
+            "bytes=bad",
+            "bytes=3-1",
+            "items=0-1",
+            "bytes=1",
+            "bytes=-x",
+            "",
+            "bytes=--1",
+        ] {
+            assert_eq!(parse_segment_range(Some(bad)), SegmentRange::Invalid, "{bad}");
+        }
+    }
+
+    #[test]
+    fn upstream_206_is_passed_through_without_reslicing() {
+        let response = partial_response("video/mp2t", "bytes 4194304-4194399/4230944", vec![7u8; 96]);
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["Content-Range"], "bytes 4194304-4194399/4230944");
+        assert_eq!(response.headers()["Content-Length"], "96");
+        assert_eq!(response.headers()["Accept-Ranges"], "bytes");
+        // 统一出口的 apply_byte_range 不会把已经切好的片段再切一次。
+        let response = apply_byte_range(response, Some("bytes=4194304-4194399"));
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.body().len(), 96);
+        assert_eq!(response.headers()["Content-Range"], "bytes 4194304-4194399/4230944");
+    }
+
+    #[test]
+    fn invalid_ranges_are_rejected_before_upstream() {
+        let response = unsatisfiable_response(None);
+        assert_eq!(response.status(), 416);
+        assert!(response.body().is_empty());
+        assert!(!response.headers().contains_key("Content-Range"));
+        assert_eq!(response.headers()["Accept-Ranges"], "bytes");
+        let unsatisfiable = unsatisfiable_response(Some("bytes */4230944"));
+        assert_eq!(unsatisfiable.status(), 416);
+        assert_eq!(unsatisfiable.headers()["Content-Range"], "bytes */4230944");
+    }
+
+    #[test]
+    fn content_range_spans_are_parsed_for_whole_object_detection() {
+        assert_eq!(
+            content_range_span("bytes 0-4194303/4230944"),
+            Some((0, 4194303, Some(4230944)))
+        );
+        assert_eq!(
+            content_range_span("bytes 100-199/4230944"),
+            Some((100, 199, Some(4230944)))
+        );
+        assert_eq!(content_range_span("bytes 0-99/*"), Some((0, 99, None)));
+        assert_eq!(content_range_span("bytes */4230944"), None);
+        assert_eq!(content_range_span("nonsense"), None);
+    }
+
+    #[test]
+    fn segment_urls_mark_playlists_as_whole_only() {
+        assert!(!is_media_segment_url("https://cdn.example/a/list.m3u8?auth_key=1"));
+        assert!(!is_media_segment_url("https://cdn.example/a/LIST.M3U8"));
+        assert!(is_media_segment_url("https://cdn.example/videos5/abc/abc2.ts?auth_key=1"));
+        assert!(looks_like_playlist(None, b"#EXTM3U\n"));
+        assert!(looks_like_playlist(
+            Some("application/vnd.apple.mpegurl"),
+            b"\xef\xbb\xbf#EXTM3U"
+        ));
+        assert!(!looks_like_playlist(Some("binary/octet-stream"), &[0x47, 0x40]));
+    }
+
+    #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
         let line = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-11-07T00:00:00Z\",DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\",X-ASSET-URI=\"https://evil.example/ad\",X-ASSET-LIST=\"https://evil.example/list.json\"\n";
         let out = rewrite_playlist("https://cdn.example/master.m3u8", line, LOCAL_ORIGIN);
@@ -1138,6 +1484,22 @@ mod tests {
         println!("segment status={} len={}", seg.status(), seg.body().len());
         assert_eq!(seg.status(), 200);
         assert!(seg.body().len() > 1000);
+        // Range 透传：上游回 206 就原样转出，回 200 就退回整段本地切片；两条路都只能给 1024 字节。
+        let ranged = handle(
+            "/seg",
+            &format!("u={seg_q}"),
+            LOCAL_ORIGIN,
+            Some("bytes=0-1023"),
+        )
+        .await;
+        println!(
+            "ranged status={} len={} content-range={:?}",
+            ranged.status(),
+            ranged.body().len(),
+            ranged.headers().get("Content-Range")
+        );
+        assert_eq!(ranged.status(), 206);
+        assert_eq!(ranged.body().len(), 1024);
     }
 
     /// 离线回归：不再依赖带 auth_key 时效的真实上游地址（旧地址已过期，会 403）。
