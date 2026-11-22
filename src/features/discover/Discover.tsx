@@ -94,9 +94,10 @@ export function TopicsSection({ wide }: { wide: boolean }) {
 }
 
 export function TopicsPage({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const [searching, setSearching] = useState(false);
-  const { data, loading, err, load } = useDiscoveryData("topics", api.topics);
+  /* 目录也必须跟着换线重拉：key 里带 lineEpoch，换线即视为另一个数据集 */
+  const { data, loading, err, load } = useDiscoveryData(`topics:${lineEpoch}`, api.topics);
   const items = data?.items ?? [];
 
   return (
@@ -181,7 +182,7 @@ function titleWithBreak(title: string) {
 }
 
 export function TopicPage({ slug, name, onBack, wide }: { slug: string; name: string; onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const [searching, setSearching] = useState(false);
   const [introExpanded, setIntroExpanded] = useState(false);
   const introId = useId();
@@ -239,7 +240,8 @@ export function TopicPage({ slug, name, onBack, wide }: { slug: string; name: st
     } finally {
       if (token === sequence.current) busy.current = false;
     }
-  }, [slug]);
+    /* 线路也是一份数据源：换线必须重拉专题第 1 页（旧代码只按 slug 依赖，换了线还是上一批） */
+  }, [slug, lineEpoch]);
 
   const loadMore = () => {
     const current = stateRef.current;
@@ -400,9 +402,9 @@ export function TagsSection({ wide }: { wide: boolean }) {
 }
 
 export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const [searching, setSearching] = useState(false);
-  const { data, loading, err, load } = useDiscoveryData("tags", api.tags);
+  const { data, loading, err, load } = useDiscoveryData(`tags:${lineEpoch}`, api.tags);
   const groups = data?.categories ?? [];
 
   return (
@@ -457,7 +459,7 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
 
 /* ================= 标签详情页（#标签铭牌 + 短剧/吃瓜一体玻璃滑块） ================= */
 export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string; onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const { preferences, storageError, isTagBlocked, blockTags, unblockTag } = useContentPreferences();
   const filtering = !preferences.paused && (preferences.blockedTags.length > 0 || preferences.hideUntagged);
   const tagBlocked = isTagBlocked(name);
@@ -528,7 +530,8 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
         if (kind === "video") setVideoLoading(false); else setPostLoading(false);
       }
     }
-  }, [tag, name]);
+    /* 换线要重拉：标签下的短剧/吃瓜同样是线路数据（旧代码只按 tag/name 依赖） */
+  }, [tag, name, lineEpoch]);
   useEffect(() => {
     sequence.current.video++; sequence.current.post++;
     busy.current.video = false; busy.current.post = false;

@@ -382,7 +382,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
 
 /* ================= 频道详情页（次级栈页：统一极光顶栏 + 玻璃轨道滑块） ================= */
 export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: string; onBack: () => void; wide: boolean }) {
-  const { push } = useStore();
+  const { push, lineEpoch } = useStore();
   const { preferences } = useContentPreferences();
   const filtering = !preferences.paused && (preferences.blockedTags.length > 0 || preferences.hideUntagged);
   const [searching, setSearching] = useState(false);
@@ -464,6 +464,17 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     return () => { requestSeq.current++; busy.current = false; };
     /* eslint-disable-next-line */
   }, [cate]);
+
+  /* 换线：同一频道、同一筛选重拉第 1 页（loadMore(true) 推进 requestSeq，在途的旧页作废），
+     否则换线后旧的旧列表会接上新的第 2 页。 */
+  const lineRef = useRef(lineEpoch);
+  useEffect(() => {
+    if (lineRef.current === lineEpoch) return;
+    lineRef.current = lineEpoch;
+    setErr(null);
+    void loadMore(true, serverSort, originalCate);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineEpoch]);
 
   const filterPending = displayedFilter !== filterKey(serverSort, originalCate);
   const replacing = refreshing || filterPending;
