@@ -41,7 +41,9 @@ export function useAutoLoadMore({ hasMore, busy = false, count, resetKey, onMore
     }, { root: scroller, rootMargin: "300px 0px" });
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [supported, hasMore, busy, count]);
+    /* resetKey 必须进依赖：换列表（收藏/历史、短剧/吃瓜）时若条数、hasMore、busy 都没变，
+       effect 不会重跑，上面那句「作废触发记录」就永远执行不到，新列表的第一批被旧列表挡住。 */
+  }, [supported, hasMore, busy, count, resetKey]);
 
   return { scrollerRef, sentinelRef, supported };
 }
