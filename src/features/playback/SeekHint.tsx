@@ -24,11 +24,17 @@ export function SeekHint({ delta, side }: { delta: number; side: "left" | "right
         left: right ? "75%" : "0%",
         width: "25%",
         transform: "translateY(-50%)",
-        justifyContent: "center",
+        /* 到边距夹逼：<=16px 就贴 16（原「1/4 区居中」在 86 宽气泡上只剩 1.88px，贴死了）。
+           规则 left/right = max(16, 四分之一区居中值)；当前宽度按居中算只有 1.88，所以取 16。
+           气泡比 1/4 区减去 16 后还宽，这里显式不收缩（flexShrink:0）让它向画面中心溢出，
+           宁可越过 1/4 区边界，也不压字号、不裁字。 */
+        justifyContent: right ? "flex-end" : "flex-start",
+        paddingLeft: right ? 0 : 16,
+        paddingRight: right ? 16 : 0,
         pointerEvents: "none",
       }}
     >
-      <div className="hg-seekhint">
+      <div className="hg-seekhint" style={{ flexShrink: 0 }}>
         <span className={right ? "hg-seekhint-arrow" : "hg-seekhint-arrow hg-seekhint-flip"} aria-hidden="true">
           <IChevR size={13} />
         </span>

@@ -88,10 +88,15 @@ try {
       }
       assert.ok(Math.abs(m.left.width - m.right.width) < 0.05, `width ${m.left.width} vs ${m.right.width}`);
     });
-    await step(`${label}: 各自落在 1/4 区中心`, async () => {
-      const q = m.inner[0] / 4;
-      assert.ok(Math.abs(m.left.centerX - q / 2) < 0.6, `左中心 ${m.left.centerX}，期望 ${q / 2}`);
-      assert.ok(Math.abs(m.right.centerX - (m.inner[0] - q / 2)) < 0.6, `右中心 ${m.right.centerX}，期望 ${m.inner[0] - q / 2}`);
+    await step(`${label}: 到边距 ≥16，且两侧互为镜像`, async () => {
+      assert.ok(m.left.gapToLeftEdge >= 16 - 0.01, `左到左缘 ${m.left.gapToLeftEdge}`);
+      assert.ok(m.right.gapToRightEdge >= 16 - 0.01, `右到右缘 ${m.right.gapToRightEdge}`);
+      assert.ok(Math.abs(m.left.centerX + m.right.centerX - m.inner[0]) < 0.5,
+        `镜像：${m.left.centerX} + ${m.right.centerX} vs ${m.inner[0]}`);
+    });
+    await step(`${label}: 不越过画面中心（两个气泡不会撞到一起）`, async () => {
+      assert.ok(m.left.right < m.inner[0] / 2, `左气泡右缘 ${m.left.right} ≥ 屏心 ${m.inner[0] / 2}`);
+      assert.ok(m.right.left > m.inner[0] / 2, `右气泡左缘 ${m.right.left} ≤ 屏心 ${m.inner[0] / 2}`);
     });
     await step(`${label}: 到各自边缘的距离相等`, async () => {
       assert.ok(Math.abs(m.left.gapToLeftEdge - m.right.gapToRightEdge) < 0.5,
