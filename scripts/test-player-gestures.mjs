@@ -23,7 +23,7 @@ try {
   const {
     GESTURE, lockAxis, seekSecondsPer100px, seekDeltaSeconds, canSeek, snapSeek,
     doubleTapSeek, doubleTapAction, tapZone, relativeSeek, isEdgeBackStart, isDoubleTap, rotationLocked, episodeIntent, judgeGesture,
-    tapVerdict, episodeDrag, autohideDelayMs, PLAYER_TIMING, EPISODE_EASE, episodePageProgress,
+    tapVerdict, episodeDrag, PLAYER_TIMING, EPISODE_EASE, episodePageProgress,
   } = G;
 
   console.log("[常量]");
@@ -190,11 +190,10 @@ try {
     assert.equal(episodeIntent(300, 800).dir, -1);
   });
 
-  check("控件收起时长：竖屏 3s / 全屏 1.2s", () => {
+  check("控件收起时长：全屏与竖屏统一 3s（全屏专属 1.2s 已删）", () => {
     assert.equal(PLAYER_TIMING.autohideMs, 3000);
-    assert.equal(PLAYER_TIMING.autohideFullscreenMs, 1200);
-    assert.equal(autohideDelayMs(false), 3000);
-    assert.equal(autohideDelayMs(true), 1200);
+    assert.equal("autohideFullscreenMs" in PLAYER_TIMING, false);
+    assert.equal("autohideDelayMs" in G, false);
   });
 
   console.log("[旋转冷却]");

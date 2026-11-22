@@ -5,9 +5,8 @@
  * 边缘返回 / 双击窗口 / 换集门槛 / 旋转冷却」这些纯算术拿出来单测
  * （见 scripts/test-player-gestures.mjs），组件里只负责把输入喂进来、把动作画出来。
  *
- * 坐标约定：所有函数吃掉的都是**舞台坐标**（已经过 stageXY 换算），
- * 竖屏 / 伪横屏（rotated）/ 真横屏（vpLandscape）三条路径共用同一套换算，
- * 任何地方都不许再自己除一次宽高。
+ * 坐标约定：所有函数吃掉的都是**舞台坐标**。全屏只走系统真转屏（伪横屏的 CSS 旋转舞台已删），
+ * 所以舞台坐标恒等于屏幕坐标，组件里任何地方都不许再自己按宽高做换算。
  */
 
 export const GESTURE = {
@@ -250,10 +249,11 @@ export function judgeGesture(input: {
 }
 
 /**
- * 控件自动收起的时长（ms）：全屏（含伪横屏/沉浸）下只给 1.2s —— 进全屏后画面应当立刻干净，
- * 不要等常规的 3s。任何交互都会重新起算（组件里 showControls/armAutoHide 都走这个函数）。
+ * 控件自动收起的时长（ms）。**全屏与竖屏统一 3s**：原来全屏单独给 1.2s，
+ * 结果同一个「轻点唤出」在两种状态下手感不一样，真机上表现为「刚点出来就没了」。
+ * 任何交互都会重新起算（组件里 showControls/armAutoHide 都读这个常量）。
  */
-export const PLAYER_TIMING = { autohideMs: 3000, autohideFullscreenMs: 1200 } as const;
+export const PLAYER_TIMING = { autohideMs: 3000 } as const;
 
 /** 翻页吸附曲线：先快后缓的减速感（对标抖音/红果的上下翻页） */
 export const EPISODE_EASE = "cubic-bezier(.16,1,.3,1)";
@@ -267,6 +267,3 @@ export function episodePageProgress(dy: number, stageHeight: number): number {
   return Math.min(1, Math.abs(dy) / stageHeight);
 }
 
-export function autohideDelayMs(fullscreen: boolean): number {
-  return fullscreen ? PLAYER_TIMING.autohideFullscreenMs : PLAYER_TIMING.autohideMs;
-}

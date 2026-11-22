@@ -497,21 +497,6 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
   overflow: hidden;
 }
 
-/* —— 移动端沉浸全屏（系统仍竖屏时的 CSS 90° 旋转兜底） —— */
-.fs-landscape {
-  position: fixed;
-  top: 50%; left: 50%; right: auto; bottom: auto;
-  /* 伪横屏是「把竖屏视口转 90° 用」：宽=视口高，高=视口宽，必须成对交换，
-     否则系统真转横后会出现「宽按竖屏算」的半月形黑边（真机 46% 宽度那次）。 */
-  width: var(--vp-h, 100vh); height: var(--vp-w, 100vw);
-  width: var(--vp-h, 100dvh); height: var(--vp-w, 100dvw);
-  transform: translate(-50%, -50%) rotate(90deg);
-  transform-origin: center center;
-  z-index: 45;
-  background: #000;
-  overflow: hidden;
-}
-
 .desktop-dock-panel {
   position: absolute; top: 0; right: 0; bottom: 0; width: 0; z-index: 40;
   background: var(--p-s1); overflow: hidden;
@@ -782,9 +767,7 @@ html[data-fx="low"] .hg-scrim-dither { display: none; }
 
 /* 全屏横屏：压光矮一档，但同样延伸到屏幕最底（含安全区） */
 .hg-player-ui.fs-immersive .hg-scrim-bottom { height: max(22vh, 160px); }
-.hg-player-ui.fs-landscape .hg-scrim-bottom { height: max(22vh, 160px); }
 .hg-player-ui.fs-immersive .hg-scrim-top { height: max(16vh, 120px); }
-.hg-player-ui.fs-landscape .hg-scrim-top { height: max(16vh, 120px); }
 
 /* 全浮：中央播放键与右栏图标去底，只留图标 + drop-shadow（热区仍 44） */
 .hg-player-center-btn { background: none !important; border: 0 !important; box-shadow: none !important; }

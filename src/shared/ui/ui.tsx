@@ -1,6 +1,5 @@
 import { Button, Image, Surface } from "./ios/controls";
 import React, { useState } from "react";
-import { createPortal } from "react-dom";
 import { cover, logLine, platform } from "../api/api";
 export { Sheet, Modal } from "./ios/overlays";
 import { useStore } from "../model/store";
@@ -60,12 +59,8 @@ export function Empty({ icon, title, sub, action, onAction }: {
 /* ——— Toast ——— */
 export function ToastHost() {
   const { toasts } = useStore();
-  /* 伪横屏舞台（.fs-landscape，CSS rotate(90deg)）自带一套旋转坐标系：提示如果留在页面根节点，
-     bottom 会落到物理屏幕侧边。有旋转舞台时用 portal 挂进去，bottom:96px 就是「横屏画面底部」
-     （上游 PR #200）。 */
-  const rotatedHost = typeof document === "undefined" ? null : document.querySelector(".player-root.fs-landscape");
   const content = (
-    <div role="status" aria-live="polite" aria-atomic="true" className="ios-toast-host absolute inset-x-0 z-[300] flex flex-col items-center gap-2 pointer-events-none px-6" style={{ bottom: rotatedHost ? "96px" : "calc(var(--sab, 0px) + 96px)" }}>
+    <div role="status" aria-live="polite" aria-atomic="true" className="ios-toast-host absolute inset-x-0 z-[300] flex flex-col items-center gap-2 pointer-events-none px-6" style={{ bottom: "calc(var(--sab, 0px) + 96px)" }}>
       {toasts.map((t) =>
         t.line ? (
           <div
@@ -116,7 +111,7 @@ export function ToastHost() {
       )}
     </div>
   );
-  return rotatedHost ? createPortal(content, rotatedHost) : content;
+  return content;
 }
 
 /* ——— 图片（骨架 + 渐显，自动走本地解密协议） ——— */

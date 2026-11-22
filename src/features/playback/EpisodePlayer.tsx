@@ -21,11 +21,11 @@ import VideoDetailsPanel from "../feed/VideoDetailsPanel";
 import { PanelSwipeArea } from "../feed/PanelSwipeArea";
 import { PreferenceStorageNotice } from "../../shared/ui/PreferenceStorageNotice";
 import LineQuickSwitch from "./LineQuickSwitch";
-import { getHoldZone, stageXY, HOLD_DELAY_MS, type HoldZone } from "../feed/mobileHold";
+import { getHoldZone, HOLD_DELAY_MS, type HoldZone } from "../feed/mobileHold";
 import { playEnter, playExit, originFromPoint } from "./fsTransition";
 import { useFadeMount } from "../../shared/lib/useFadeMount";
 import {
-  GESTURE, PLAYER_TIMING, EPISODE_EASE, autohideDelayMs, canSeek, doubleTapAction, episodeDrag, episodeIntent,
+  GESTURE, PLAYER_TIMING, EPISODE_EASE, canSeek, doubleTapAction, episodeDrag, episodeIntent,
   episodePageProgress, isDoubleTap, isEdgeBackStart,
   lockAxis, relativeSeek, rotationLocked, seekDeltaSeconds, snapSeek, tapVerdict, type Axis,
 } from "./playerGestures";
@@ -41,26 +41,30 @@ const PLAYER_SCHEME: AccentScheme = {
   accent: "#7C5CFF", second: "#3B82F6", deep: "#000000", tag: "#26263A", source: "fallback", luma: 0,
 };
 
-/* 系统方向请求的唯一出口。
-   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation），
-   失败只会 Err + 打日志，画面退回 .fs-landscape 的 CSS 伪横屏 —— 不会再崩进程；
+/* 系统方向请求的**唯一出口**（进全屏转横屏、退全屏回竖屏都走它）。
+   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation）；
    iOS：调 objc 锁方向。
+   失败**不再退回 CSS 伪横屏**（那条路已整条删除）：只记日志 + 交给调用方弹一条 playback-hint，
+   画面停在竖屏沉浸全屏 —— 宁可黑边多一点，也不要「转了 90° 但坐标没转」的半横屏。
    调用一律带日志，真机用「播放诊断」/logcat 分流「JS 没发」还是「发了没成」。 */
-function requestOrientation(landscape: boolean) {
+function requestOrientation(landscape: boolean, onFail?: (error: unknown) => void) {
+  const fail = (error: unknown) => {
+    logLine(`[orientation] set_orientation(landscape=${landscape}) 失败：${String(error)}`);
+    try { onFail?.(error); } catch { /* ignore */ }
+  };
   try {
     void invoke("set_orientation", { landscape })
       .then(() => logLine(`[orientation] set_orientation(landscape=${landscape}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : ""}`))
-      .catch((error) => logLine(`[orientation] set_orientation(landscape=${landscape}) 失败：${String(error)}`));
-  } catch { /* ignore */ }
+      .catch(fail);
+  } catch (error) { fail(error); }
 }
 
 /* 单击判定窗口：首次轻点先等这么久再落「暂停/继续」，
    这样双击（净屏）不会先闪一下暂停。人眼对这个量级不敏感，真机上等的是「有没有反应」。 */
 const TAP_DELAY_MS = 180;
-/* 移动端控件自动隐藏：显示后这么久没操作才收起来；暂停中、面板打开时不收 */
-/* 控件自动收起时长统一走 playerGestures 里的 autohideDelayMs（可单测）：竖屏 3s / 全屏 1.2s */
-const MOBILE_AUTOHIDE_MS = PLAYER_TIMING.autohideMs;
-const FS_AUTOHIDE_MS = PLAYER_TIMING.autohideFullscreenMs;
+/* 移动端控件自动隐藏：显示后这么久没操作才收起来；暂停中、面板打开时不收。
+   **全屏与竖屏统一 3s**（原来全屏单独 1.2s，见 PLAYER_TIMING 的注释）。 */
+const AUTOHIDE_MS = PLAYER_TIMING.autohideMs;
 
 export type EpisodePlayerProps = {
   videoIds: number[];
@@ -231,8 +235,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (paused) { setIdle(false); window.clearTimeout(idleTimer.current); }
   }, [paused]);
   const [fullscreen, setFullscreen] = useState(false);
-  /* 用户点「全屏/横屏」时要的是横过来看；系统真转了（vpLandscape）就不再用 CSS 兜底 */
-  const [fsLandscape, setFsLandscape] = useState(false);
   const [heartBurst, setHeartBurst] = useState(0);
   const [seriesEnded, setSeriesEnded] = useState(false);
   /* 结束态：本剧看完 → 不自动滑进下一部，给「看完 + 推荐 3 部」让用户选 */
@@ -301,9 +303,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const seekHintTimer = useRef<number | undefined>(undefined);
   /* 上滑换集预览（拖过 60% 屏高才出）：只显示现有集数，不造数据 */
   const [epPreview, setEpPreview] = useState<{ dir: 1 | -1; label: string } | null>(null);
-  /* 方向切换后的冷却时间戳（orientationchange / rotated 变化后 300ms 内禁手势） */
+  /* 方向切换后的冷却时间戳（系统真转屏 / 物理旋转后 300ms 内禁手势） */
   const rotatedAtRef = useRef(0);
-  /* 系统是否真的转成了横屏（iOS 原生旋转后为 true） */
+  /* 视口是不是横的（只用于「画面该 cover 还是 contain」与物理横置自动进出全屏，
+     **不再参与「要不要转屏」的决策** —— fs 一旦为真就直接请求系统横屏） */
   const [vpLandscape, setVpLandscape] = useState(
     () => typeof window !== "undefined" && window.innerWidth > window.innerHeight,
   );
@@ -362,21 +365,20 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
 
   /* —— 控件显隐（报告：进播放器控件没出来、轻点唤不回）——
      clean 是 store 里的状态，可能留着上一轮的 true；所以进播放器/切集时强制显示。
-     显示后 MOBILE_AUTOHIDE_MS 无操作才自动收起；暂停中、面板打开时不收。 */
+     显示后 AUTOHIDE_MS（3s，全屏与竖屏一致）无操作才自动收起；暂停中、面板打开时不收。 */
   const uiRef = useRef<{ paused: boolean; panel: string | null; fs: boolean }>({ paused: false, panel: null, fs: false });
   uiRef.current = { paused, panel: panel as string | null, fs };
   const hideTimer = useRef<number | undefined>(undefined);
   const armAutoHide = useCallback(() => {
     window.clearTimeout(hideTimer.current);
     if (isDesktop) return;
-    /* 全屏（含伪横屏/沉浸）给 1.2s：进全屏后控件应当立刻让画面，不要等 3s 的常规计时；
-       竖屏普通播放页仍 3s。任何交互都会重新计时（showControls / armAutoHide 都走这里）。 */
-    const delay = autohideDelayMs(uiRef.current.fs);
+    /* 全屏与竖屏都是 3s（唯一一处时长来源）。任何交互都会重新计时
+       （showControls / armAutoHide 都走这里）。 */
     hideTimer.current = window.setTimeout(() => {
       if (uiRef.current.paused || uiRef.current.panel) return;
       /* 全屏层用 idle 收控件，普通播放页用 clean 收 */
       if (uiRef.current.fs) setIdle(true); else setClean(true);
-    }, delay) as unknown as number;
+    }, AUTOHIDE_MS) as unknown as number;
   }, [isDesktop, setClean]);
   const showControls = useCallback(() => {
     window.clearTimeout(idleTimer.current);
@@ -501,9 +503,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       用户看到的就是「点了没反应」。 */
     setPanel(null);
     setFs(false);
-    setFsLandscape(false);
     setClean(false);
     showControls();
+    /* 退出全屏的另一条路径（不是 exitFs）：必须同样把系统方向还回竖屏，
+       否则剧集详情页会横着出现。 */
+    if (!isDesktop) requestOrientation(false);
     logLine(`[full-series] 打开剧集详情 id=${curId} 第${curEp}集`);
     const v = videoRef.current?.el();
     const curT = v && Number.isFinite(v.currentTime) ? v.currentTime : liveRef.current.t;
@@ -513,7 +517,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
        「点了直接回首页」（v3.0.6 #6）。改成剧集详情后，返回时刷剧流还在原位。 */
     store.push({ kind: "series", id: curId });
     /* 刷剧流那一页不会被卸载（App 保留整条栈），所以返回时 index / 播放位置都还在原位。 */
-  }, [kind, curId, curEp, duration, addHistory, store, setClean, setFs, setFsLandscape, setPanel, showControls]);
+  }, [kind, curId, curEp, duration, addHistory, store, setClean, setFs, setPanel, showControls, isDesktop]);
   useEffect(() => {
     setSeriesEnded(false);
   }, [playKey]);
@@ -649,18 +653,17 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
 
   /* 倍速：中心小方块打开偏好，两侧长按 2.0x。 */
   const effRate = holdSpeed ? 2 : rate;
-  /* 伪横屏：系统不给转（安卓 WebView 的 orientation.lock 需要 Fullscreen API，通常拿不到）时，
-     整块舞台用 CSS 旋转 90°，用户把手机横过来就看到「横屏播放器」。系统真转了就不用兜底。 */
-  const rotated = !isDesktop && fs && fsLandscape && !vpLandscape;
-  /* 方向变化（伪横屏 rotated / 真横屏 vpLandscape）→ 记录时间戳，300ms 内禁一切手势，
-     避免旋转动画期间手指还按在屏幕上被误判成 seek / 换集。 */
-  useEffect(() => { rotatedAtRef.current = Date.now(); }, [rotated, vpLandscape]);
+  /* 全屏只剩一条路：请求系统真转屏（.fs-immersive 铺满视口）。
+     **伪横屏整条删除**：原来还有一套 `rotate(90deg)` 的 CSS 舞台（rotated / .fs-landscape），
+     两套并存时 viewport 仍是竖的（AVD 上 innerWidth 412×915）→ 手势/按钮按两套坐标各算一次。
+     这里只留旋转冷却：视口横竖翻转后 300ms 内禁一切手势，
+     避免系统旋转动画期间手指还按在屏幕上被误判成 seek / 换集。 */
+  useEffect(() => { rotatedAtRef.current = Date.now(); }, [vpLandscape]);
 
   /* 控件层显隐动画（淡出 120ms 后才卸载） */
   /* scrub 期间即使处于净屏/收起态也要把底栏挂出来，否则删掉中央浮层后横拖没有反馈 */
   const cinemaBar = useFadeMount(!isDesktop && !fs && (scrubbing || !clean));
   const actionRail = useFadeMount(!fs && !clean && !isDesktop);
-  const landscapeVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w > videoSize.h;
   const portraitVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w <= videoSize.h;
   /* 横屏全屏切集时新一段还没有解码帧、横屏舞台尚未旋转；旧逻辑会立刻按竖屏锚点弹一次，
      等舞台旋转后 ToastHost 又弹一次，看着像弹了两遍（上游 PR #191）。全屏下先把集数提示
@@ -1114,7 +1117,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       setFullscreen(activeFs);
       if (!isDesktop && !activeFs && uiRef.current.fs) {
         setFs(false);
-        setFsLandscape(false);
         showControls();
       }
     };
@@ -1173,21 +1175,19 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     stageTouch.current = true;
     const el = e.currentTarget;
     const rect = el.getBoundingClientRect();
-    /* 伪横屏下整块舞台转 90°：手势判定要用舞台自身坐标，屏幕横向变成舞台纵向 */
-    const width = (rotated ? rect.height : el.clientWidth) || 1;
-    const stageH = (rotated ? rect.width : el.clientHeight) || 1;
-    /* 三条路径（竖屏 / 伪横屏 rotated / 真横屏 vpLandscape）统一走 stageXY，
-       组件里任何地方都不再自己按宽高做换算。 */
-    const [sx, sy] = stageXY(rotated, e.clientX, e.clientY);
-    // 按视觉矩形求真正的正方形；CSS 旋转全屏时也与蒙板标记重合。
+    /* 舞台坐标 = 屏幕坐标（不再有 CSS 旋转舞台，横屏是系统真转出来的） */
+    const width = el.clientWidth || 1;
+    const stageH = el.clientHeight || 1;
+    const sx = e.clientX;
+    const sy = e.clientY;
+    // 按视觉矩形求真正的正方形（长按菜单热区）
     const zone = getHoldZone(e.clientX - rect.left, e.clientY - rect.top, rect.width, rect.height);
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     armAutoHide();
     /* 左缘返回：只在**非全屏的竖屏播放页**启用。
-       - 伪横屏（rotated）是旋转过的舞台，"左缘"在屏幕上不是左边；
-       - 真横屏全屏（vpLandscape）与全屏（fs）里左缘右滑必须留给 seek，
-         否则从左侧起手想快退会直接退出全屏。 */
-    const edgeStart = !rotated && !fs && !vpLandscape && isEdgeBackStart(e.clientX - rect.left);
+       全屏（fs）与物理横屏（vpLandscape）里左缘右滑必须留给 seek，
+       否则从左侧起手想快退会直接退出全屏。 */
+    const edgeStart = !fs && !vpLandscape && isEdgeBackStart(e.clientX - rect.left);
     /* 残留缩放会把竖滑换集直接关掉（zoom.s > 1.05 的门槛）：非捏合态下起手先归位 */
     if (!zoom.g && zoom.s > 1.05) setZoom({ s: 1, x: 0, y: 0, g: false });
     const g = {
@@ -1234,7 +1234,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     const g = gesture.current;
     if (!g || isDesktop) return;
-    const [msx, msy] = stageXY(rotated, e.clientX, e.clientY);
+    const msx = e.clientX;
+    const msy = e.clientY;
     const dx = msx - g.x;
     const dy = msy - g.y;
 
@@ -1324,7 +1325,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     if (g.mode === "enterSeries") {
       setEpSlide({ y: 0, animate: true });
-      const [ux, uy] = e ? stageXY(rotated, e.clientX, e.clientY) : [g.x, g.startY];
+      const [ux, uy] = e ? [e.clientX, e.clientY] : [g.x, g.startY];
       const tdx = ux - g.x;
       const tdy = uy - g.startY;
       if (!cancelled && tdx < -80 && Math.abs(tdx) > Math.abs(tdy) * 2) {
@@ -1334,14 +1335,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     if (g.mode === "edgeBack") {
       /* 边缘返回：位移够才退，不够就当没发生（不产生任何跳转） */
-      const dxEdge = e ? stageXY(rotated, e.clientX, e.clientY)[0] - g.x : 0;
+      const dxEdge = e ? e.clientX - g.x : 0;
       if (!cancelled && dxEdge >= GESTURE.edgeBackCommit) store.pop();
       return;
     }
     if (g.mode === "scrub") {
       setEpSlide({ y: 0, animate: true });
       const target = scrubTarget.current;
-      const dxScrub = e ? stageXY(rotated, e.clientX, e.clientY)[0] - g.x : 0;
+      const dxScrub = e ? e.clientX - g.x : 0;
       /* 短滑 <20px 不 seek（只当误触）；够长就吸附到整 5 秒并给一次提示 */
       if (!cancelled && target != null && canSeek(dxScrub)) {
         const snapped = snapSeek(target, duration || liveRef.current.dur || 0);
@@ -1355,7 +1356,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     /* 上下划手势（全屏态屏蔽上下滑切集防误触） */
     if (!cancelled && !fs && e && g.mode === "pan") {
-      const [ux2, uy2] = stageXY(rotated, e.clientX, e.clientY);
+      const [ux2, uy2] = [e.clientX, e.clientY];
       const dy = uy2 - g.startY;
       const dtUp = Math.max(1, Date.now() - g.t);
       const intent = episodeIntent(dy, g.stageH, (dy / dtUp) * 1000);
@@ -1430,8 +1431,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     */
     /* 单击判定必须同时看位移和时长：以前只看「模式还是 idle」，于是在死区内滑 6–8px
        也被当成单击，一抖就把视频暂停了。6px ≤ 位移 < 10px 现在是无动作。 */
-    const tapDx = e ? stageXY(rotated, e.clientX, e.clientY)[0] - g.x : 0;
-    const tapDy = e ? stageXY(rotated, e.clientX, e.clientY)[1] - g.startY : 0;
+    const tapDx = e ? e.clientX - g.x : 0;
+    const tapDy = e ? e.clientY - g.startY : 0;
     if (!cancelled && g.mode === "idle" && tapVerdict(tapDx, tapDy, Date.now() - g.t) === "tap") {
       const now = Date.now();
       if (isDoubleTap(tapRef.current.lastAt, now)) {
@@ -1500,16 +1501,16 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
   }, []);
 
-  /* 进全屏/横屏（报告 17 撤回：这个入口不能删）。
-     走既有通路：fs 沉浸层 + rotated 舞台旋转兜底 + 系统方向请求。
-     系统方向由 Kotlin 插件真转（安卓）；转不过去时 .fs-landscape 的 CSS 旋转仍兜底
-     （注释见 index.css），所以两条路互不依赖。 */
-  const enterFs = useCallback((landscape = true) => {
+  /* 进全屏（报告 17 撤回：这个入口不能删）。
+     **只有一条路**：fs 沉浸层（.fs-immersive）+ 请求系统真转屏（安卓 Kotlin 插件 / iOS objc）。
+     CSS 旋转兜底已整条删除：插件失败时停在竖屏沉浸全屏并弹一条 playback-hint ——
+     至少还能看、还能退，不会出现「转了 90° 但 innerWidth 还是竖的」那种半横屏。 */
+  const enterFs = useCallback(() => {
     /* FLIP：切换前记下播放器当前几何，切换后用 WAAPI 从旧几何补间到满屏。
        会请求系统转屏时（移动端）只淡入 —— 旋转由系统做，再叠缩放会打架。 */
     const root = (boxRef.current?.closest(".hg-player-ui") as HTMLElement | null) ?? null;
     const fromRect = root ? root.getBoundingClientRect() : null;
-    const willRotate = !isDesktop && landscape;
+    const willRotate = !isDesktop;
     /* 先把当前可见项锁定下来，再收起滚动容器：否则进入全屏后 scrollTop 归零，
        还在 150ms 防抖里的 index 会被 resolveSwipe(0) 改回第一屏（「全屏后变成另一个视频」）。 */
     const el = boxRef.current;
@@ -1521,7 +1522,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     setClean(false);
     setFs(true);
-    setFsLandscape(landscape);
     showControls();
     keepAlive();
     requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1529,15 +1529,19 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       playEnter(root, fromRect ? { left: fromRect.left, top: fromRect.top, width: fromRect.width, height: fromRect.height } : null, !willRotate);
     }));
     if (!isDesktop) {
-      /* 只做两件事：系统转屏（安卓 JNI setRequestedOrientation）+ CSS 舞台。
+      /* 只做一件事：系统转屏（安卓 Kotlin setRequestedOrientation / iOS objc）。
          这里**不能再调 requestFullscreen / orientation.lock** —— 安卓 WebView 收到全屏请求会走
          WebChromeClient.onShowCustomView 把 WebView 挪进全屏容器，等于重建一次视图：
-         真机实测点全屏时 CDP 连续 RemoteDisconnected，播放进度有丢失风险。
-         系统真转屏后 CSS 伪横屏会自动关掉（vpLandscape=true → rotated=false），不会叠两层 90°。 */
-      try { logLine(`[orientation] 全屏 → landscape=${landscape} 请求系统转屏`); } catch { /* ignore */ }
-      requestOrientation(landscape);
+         真机实测点全屏时 CDP 连续 RemoteDisconnected，播放进度有丢失风险。 */
+      try { logLine("[orientation] 全屏 → 请求系统横屏"); } catch { /* ignore */ }
+      requestOrientation(true, () => toast("系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）", "info", "playback-hint"));
+      /* 800ms 后量一次视口，真机取证用：真转成功的判据是 innerWidth > innerHeight。
+         只记日志不弹提示 —— 慢设备旋转可能超过 1s，误报比不报更烦。 */
+      window.setTimeout(() => {
+        try { logLine(`[orientation] 全屏后视口 ${window.innerWidth}x${window.innerHeight} landscape=${window.innerWidth > window.innerHeight}`); } catch { /* ignore */ }
+      }, 800);
     }
-  }, [isDesktop, keepAlive, resolveSwipe, effectiveVideoIds.length, setClean, setFs, showControls]);
+  }, [isDesktop, keepAlive, resolveSwipe, effectiveVideoIds.length, setClean, setFs, showControls, toast]);
 
   /* 退出全屏：再点一次回到竖屏（并解除系统方向锁/全屏） */
   const exitFs = useCallback(() => {
@@ -1546,7 +1550,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const wasFs = fs;
     setClean(false);
     setFs(false);
-    setFsLandscape(false);
     showControls();
     keepAlive();
     if (wasFs) requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1564,13 +1567,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     return registerOverlayBack(() => { exitFs(); return true; });
   }, [isDesktop, fs, exitFs]);
 
-  /* 系统方向（iOS 有效、安卓本轮 no-op）一旦被改过就必须还回去，
-     所以「退出播放器」和「切后台」这两条路径也照发一遍还原请求：
-       · 组件卸载（返回上一页 / 换片）→ 还原；
-       · 切后台（visibilitychange hidden）→ 还原，回来时若还在横屏全屏再转回去。
-     fs/fsLandscape 用 ref 取最新值，避免每次开关全屏都重挂监听（cleanup 里会误还原）。 */
-  const orientationRef = useRef({ fs: false, landscape: false });
-  orientationRef.current = { fs, landscape: fsLandscape };
+  /* 系统方向一旦被改过就必须还回去，所以「退出播放器」和「切后台」这两条路径也照发一遍还原请求：
+       · 组件卸载（返回上一页 / 换片）→ 还原竖屏；
+       · 切后台（visibilitychange hidden）→ 还原竖屏，回来时若还在全屏再转回横屏。
+     fs 用 ref 取最新值，避免每次开关全屏都重挂监听（cleanup 里会误还原）。 */
+  const orientationRef = useRef({ fs: false });
+  orientationRef.current = { fs };
   useEffect(() => {
     if (isDesktop) return undefined;
     const setOrientation = (landscape: boolean) => {
@@ -1578,7 +1580,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") setOrientation(false);
-      else if (orientationRef.current.fs && orientationRef.current.landscape) setOrientation(true);
+      else if (orientationRef.current.fs) setOrientation(true);
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
@@ -1587,14 +1589,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     };
   }, [isDesktop]);
 
-  /* 若用户在视频首帧宽高解析出来前已点进全屏，解析出横屏后自动补发横屏方向请求 */
-  useEffect(() => {
-    if (isDesktop || !fs || !landscapeVideo) return;
-    requestOrientation(true);
-  }, [isDesktop, fs, landscapeVideo]);
-
-  /* 系统真旋转了（iOS 原生请求成功后），CSS 就不再转 90°；
-     物理横置手机时自动进入全屏，竖回时自动退出全屏（对齐 LNPANDY 版）。 */
+  /* 物理横置手机时自动进入全屏，竖回时自动退出全屏（对齐 LNPANDY 版）。
+     只同步 fs 这**一个**状态：要不要转屏由 fs 单方面决定，不看设备上报。 */
   useEffect(() => {
     if (isDesktop) return undefined;
     const onViewportChange = () => {
@@ -1602,7 +1598,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       setVpLandscape((prev) => {
         if (prev !== isLand && active) {
           setFs(isLand);
-          setFsLandscape(isLand);
           keepAlive();
         }
         return isLand;
@@ -1661,13 +1656,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDesktop, effectiveVideoIds.length]);
 
-  /* —— 进度条拖动（旋转舞台下按 Y 轴换算） —— */
-  const barPctAt = (clientX: number, clientY: number) => {
+  /* —— 进度条拖动（舞台不旋转，进度条恒为水平方向） —— */
+  const barPctAt = (clientX: number, _clientY: number) => {
     const r = barRef.current?.getBoundingClientRect();
     if (!r) return null;
-    const span = rotated ? r.height : r.width;
+    const span = r.width;
     if (!span) return null;
-    const raw = rotated ? (clientY - r.top) / span : (clientX - r.left) / span;
+    const raw = (clientX - r.left) / span;
     return Math.max(0, Math.min(1, raw));
   };
   const barSeekTo = (clientX: number, clientY: number) => {
@@ -1824,7 +1819,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
 
   return (
     <div
-      className={`hg-player-ui hg-player-ambient ${rotated ? "fs-landscape" : (!isDesktop && fs ? "fs-immersive" : "absolute inset-0")} overflow-hidden bg-black player-root ${controlsLocked ? "is-locked" : ""} ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
+      className={`hg-player-ui hg-player-ambient ${!isDesktop && fs ? "fs-immersive" : "absolute inset-0"} overflow-hidden bg-black player-root ${controlsLocked ? "is-locked" : ""} ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
       /* 播放页固定纯黑：不挂取色（用户：只有播放页去取色）。"none" 只为样式兜底，不再有渐变层。 */
       data-ambient="none"
       data-player-mode={endless ? "feed" : "cinema"}
@@ -1922,8 +1917,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   diagnosticContext={{ active: active && !tagMenu && !showHoldGuide, view: mode, kind, video_id: curId, episode: curEp }}
                   volume={volume} rate={effRate}
                   measurementKey={measurementKey}
-                  /* 竖屏 9:16 片源在竖屏下铺满消黑边；横屏剧无论竖看还是横屏全屏一律 contain 不裁切 */
-                  fit={isDesktop ? "contain" : (portraitVideo && !rotated && !vpLandscape) ? "cover" : "contain"}
+                  /* 竖屏 9:16 片源只在**竖屏非全屏**时铺满消黑边；全屏（系统已横过来）一律 contain 不裁切 */
+                  fit={isDesktop ? "contain" : (portraitVideo && !fs && !vpLandscape) ? "cover" : "contain"}
                   /* 黑边里的观感交给微光效果（上游 PR #192 移植）：从当前画面采样色晕铺在黑边，
                      我们原来那套「封面虚化 hg-lb-blur」已删除，避免两套并存。 */
                   ambientGlow={ambientGlow} balanceVolume={!isDesktop && balanceVolume}
@@ -2058,7 +2053,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     <ICommentF size={26} className="hg-ink hg-ov-shadow" />
                     <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums">{fmt(meta.comment)}</span>
                   </Button>
-                  <Button type="button" onClick={() => enterFs(landscapeVideo)} className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable" aria-label={landscapeVideo ? "全屏横屏播放" : "全屏沉浸播放"}>
+                  <Button type="button" onClick={() => enterFs()} className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable" aria-label="全屏横屏播放">
                     <IExpand size={22} className="hg-ink hg-ov-shadow" />
                     <span className="text-[12px] hg-ink-2 hg-ov-shadow">全屏</span>
                   </Button>
@@ -2501,9 +2496,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         <div
           className="absolute inset-x-0 z-40 px-4"
           style={{
-            bottom: rotated ? 52 : "calc(var(--sab, 0px) + 52px)",
-            paddingLeft: rotated ? "calc(var(--sat, 0px) + 16px)" : undefined,
-            paddingRight: rotated ? "calc(var(--sab, 0px) + 16px)" : undefined,
+            bottom: "calc(var(--sab, 0px) + 52px)",
             height: 28,
           }}>
           <div ref={barRef} className="relative h-full" style={{ touchAction: "none" }}
@@ -2559,9 +2552,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           {/* 全屏顶部：返回退出全屏 + 剧名 + 集数 */}
           <div className="absolute inset-x-0 z-40 flex items-center gap-2.5 px-4"
             style={{
-              top: rotated ? 12 : "calc(var(--sat, 0px) + 6px)",
-              paddingLeft: rotated ? "calc(var(--sat, 0px) + 16px)" : undefined,
-              paddingRight: rotated ? "calc(var(--sab, 0px) + 108px)" : 108,
+              top: "calc(var(--sat, 0px) + 6px)",
+              paddingRight: 108,
             }}>
             <Button onClick={exitFs} aria-label="退出全屏"
               className="hg-chip-strong shrink-0 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1">
@@ -2579,9 +2571,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           {/* 全屏底栏：当前/总时长 + 缩放还原/倍速/选集/下集 */}
           <div className="absolute inset-x-0 z-40 flex items-center gap-2.5 px-4"
             style={{
-              bottom: rotated ? 12 : "calc(var(--sab, 0px) + 12px)",
-              paddingLeft: rotated ? "calc(var(--sat, 0px) + 16px)" : undefined,
-              paddingRight: rotated ? "calc(var(--sab, 0px) + 16px)" : undefined,
+              bottom: "calc(var(--sab, 0px) + 12px)",
             }}>
             <span className="shrink-0 text-[13px] font-semibold hg-ink-2 tabular-nums">
               <PlaybackTime clock={playbackClock} /> <span className="hg-ink-4 font-normal">/ {fmtTime(duration)}</span>
@@ -2690,11 +2680,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
             /* 竖向：竖屏吃顶部安全区（Android 49 → 55、iPhone 47 → 53）。状态栏在横屏/全屏会消失，
                env(safe-area-inset-top) 掉到 0（--sat 的下限 24）→ 这一块会自己上移 23px。
                用户要的是「位置不能变」，所以用 53px 兜底：竖屏仍是原值，横屏不再上移。 */
-            top: rotated ? 12 : "max(calc(var(--sat, 0px) + 6px), 53px)",
+            top: "max(calc(var(--sat, 0px) + 6px), 53px)",
             /* 横向只吃**左右**安全区（刘海 / 圆角）。以前竖屏写死 right-3、没有算 --sar，
-               iPhone 横过来（--sar: 48）按钮会压进圆角。伪横屏（rotated）里整块舞台被
-               rotate(90deg)，局部 right 对应的是**物理底边**，所以那里仍用 --sab。 */
-            right: rotated ? "calc(var(--sab, 0px) + 0.75rem)" : "calc(var(--sar, 0px) + 0.75rem)",
+               iPhone 横过来（--sar: 48）按钮会压进圆角。 */
+            right: "calc(var(--sar, 0px) + 0.75rem)",
           }}>
           {/* 两个格子固定：[左] = 静音 / 退出全屏，[右] = 锁。
               全屏把「退出全屏」放进左格子，锁就不会被挤走（进/退全屏坐标不变）。 */}
@@ -2708,6 +2697,21 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           <Button onClick={lockControls} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false}
             className={`hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1${clean ? " hidden" : ""}`}><ILockF size={17} /></Button>
         </div>
+      )}
+      {/* 控件收起（idle）时的「一步退出全屏」热区：48×48，与上面那个可见的退出钮同一个角，
+          但**不画任何东西**（透明无边框、无子元素）—— 收起态下用户点屏幕只想要回控件，
+          全屏想退却要「点一下唤出 → 再点退出」两步，这里补上直接可点的位置。
+          放在舞台之外，不参与视频区的手势判定。 */}
+      {!isDesktop && fs && idle && !controlsLocked && active && (
+        <button type="button" onClick={exitFs} aria-label="退出全屏" title="退出全屏"
+          style={{
+            position: "absolute",
+            top: "max(calc(var(--sat, 0px) + 6px), 53px)",
+            right: "calc(var(--sar, 0px) + 0.75rem)",
+            width: 48, height: 48,
+            padding: 0, border: 0, background: "transparent",
+            WebkitTapHighlightColor: "transparent", zIndex: 40,
+          }} />
       )}
       <TagBlockMenu open={active && tagMenu} tags={meta.tags} initialSelected={tagMenuSeed} onClose={() => setTagMenu(false)} />
       {/* 线路面板：播放页内就地弹，不跳设置页 */}
