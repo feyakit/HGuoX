@@ -105,6 +105,8 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
   const [err, setErr] = useState("");
   const loadingRef = useRef(false);
   const seq = useRef(0);
+  /* 第 1 页当前这批 id：后台刷新时只替换这一段，已加载的第 2 页及以后原样保留 */
+  const page1Ids = useRef<Set<number>>(new Set());
   const loadedKey = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -142,6 +144,7 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
       const rows = (res?.items ?? []).filter(v => v && v.cover);
       const pages = Math.max(1, res?.pagination?.pages || 1);
       setItems(prev => p === 1 ? rows : [...prev, ...rows.filter(r => !prev.some(x => x.id === r.id))]);
+      if (p === 1) page1Ids.current = new Set(rows.map(r => r.id));
       if (p === 1) prefetchDetails(rows.slice(0, 4).map(v => v.id));
       setPage(p);
       setDone(!rows.length || p >= pages);
@@ -204,7 +207,18 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
         : { cate: view, page: 1, size: 24, sort: chanSort },
     res => {
       const rows = (res?.items ?? []).filter(v => v && v.cover);
-      if (rows.length) setItems(rows);
+      if (!rows.length) return;
+      /* 后台刷新只覆盖第 1 页范围：旧代码 setItems(rows) 会把已加载的第 2 页及以后整段抹掉
+         （page/done 又没跟着改，于是列表变短、还停在「已加载 N 页」上）。
+         这里按「当前第 1 页的 id」把旧的第一页换掉，后面的页原样接上。 */
+      const first = page1Ids.current;
+      const incoming = new Set(rows.map(v => v.id));
+      setItems((prev: VideoCard[]) => {
+        if (!prev.length || !first.size) return rows;
+        const rest = prev.filter((v: VideoCard) => !first.has(v.id) && !incoming.has(v.id));
+        return [...rows, ...rest];
+      });
+      page1Ids.current = incoming;
     },
   );
 
