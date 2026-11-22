@@ -1670,7 +1670,20 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     keepAliveTimers.current = [];
   }, []);
 
-  const lockControls = () => { setPanel(null); setControlsLocked(true); };
+  const lockControls = () => {
+    setPanel(null);
+    /* 桌面专属（审计 #2）：全屏元素是 boxRef 的父节点，而锁罩挂在它**外面** ——
+       全屏时上锁，锁罩被全屏层整个盖住，用户就卡在「没有任何解锁入口」的全屏里。
+       试过的两条路里选改动小的这条：锁之前先退全屏（Fullscreen API），锁罩回到页面上。
+       移动端全屏是 .fs-immersive 的 CSS 层、锁罩在同一棵子树里，不受影响。 */
+    if (isDesktop) {
+      try {
+        const leaving = document.fullscreenElement ? document.exitFullscreen?.() : null;
+        if (leaving) void leaving.catch(() => {});
+      } catch { /* 浏览器不支持 Fullscreen API：本来就不在全屏 */ }
+    }
+    setControlsLocked(true);
+  };
 
   /* 长按倍速期间禁止原生滚动，否则上滑会被列表吃掉、锁不住倍速 */
   useEffect(() => {
