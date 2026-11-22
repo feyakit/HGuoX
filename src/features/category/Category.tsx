@@ -50,6 +50,10 @@ const CHANNEL_SORTS = [
   { value: "random", label: "精选推荐" },
 ] as const;
 
+/* 片库左右滑切要避让的容器：排序 chip 行自己有横滚，横滑货架/轮播/磁贴分别是各自的锚点，
+   起手落在里面就把手势还回去（B17）。 */
+const SWIPE_IGNORE = "input, textarea, select, [role=dialog], [data-tab-swipe-ignore], .hg-inline-sorts, .hg-bento-grid, [data-hscroll], .hg-rail, .hg-spotlight, .hg-hero";
+
 const ORIGINAL_CATES = [
   { value: "all", label: "全部原创" },
   { value: "ai-duanju", label: "短剧" },
@@ -106,6 +110,19 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
 
   const isCollectionView = view === "topics" || view === "tags";
   const subKey = view === "" ? allSort : view === "original" ? origCate : chanSort;
+  /* 当前屏幕上那排子 tab（全部/最新上线 · 最近更新/当前热播/精选推荐 · 全部原创/短剧/漫剧），
+     点击与横滑共用同一套取值，避免两处口径漂移。 */
+  const sortTabs: readonly { key?: string; value?: string }[] =
+    view === "original" ? ORIGINAL_CATES : view === "ai-duanju" || view === "ai-manju" ? CHANNEL_SORTS : ALL_SORTS;
+  const tabValue = (tab: { key?: string; value?: string }) => (tab.value ?? tab.key) as string;
+  const sortIndex = Math.max(0, sortTabs.findIndex(tab => tabValue(tab) === subKey));
+  const selectSort = (index: number) => {
+    const next = sortTabs[index];
+    if (!next) return;
+    if (view === "original") setOrigCate(tabValue(next) as (typeof ORIGINAL_CATES)[number]["value"]);
+    else if (view === "ai-duanju" || view === "ai-manju") setChanSort(tabValue(next) as (typeof CHANNEL_SORTS)[number]["value"]);
+    else setAllSort(tabValue(next) as (typeof ALL_SORTS)[number]["key"]);
+  };
 
   const load = useCallback(async (p: number, opts?: { force?: boolean; silent?: boolean }) => {
     const force = opts?.force === true;
@@ -209,6 +226,17 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
     setView(current => (current === target ? "" : target));
   };
 
+  /* 片库（分类主页）左右滑切子 tab。分类页原来只在频道子页挂了钩子，片库本身横滑没反应（B17）；
+     避让见 SWIPE_IGNORE —— 排序 chip 行自己会横滚，磁贴/货架是各自的锚点，起手落在里面就放行。 */
+  const tabSwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: scrollRef,
+    tabIndex: sortIndex,
+    tabCount: sortTabs.length,
+    onTabChange: selectSort,
+    ignoreSelector: SWIPE_IGNORE,
+    enabled: !isCollectionView,
+  });
+
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
       <span className="hg-aura" aria-hidden="true" />
@@ -232,8 +260,8 @@ export default function Category({ wide, active }: { wide: boolean; active: bool
         </Button>
       </header>
 
-      <div ref={scrollRef} className="flex-1 scroll-y hg-page-x relative z-10"
-        style={{ paddingBottom: "calc(110px + var(--sab, 0px))" }}
+      <div ref={scrollRef} {...tabSwipe} className="flex-1 scroll-y hg-page-x relative z-10"
+        style={{ paddingBottom: "calc(110px + var(--sab, 0px))", touchAction: "pan-y" }}
         onScroll={(e) => {
           if (isCollectionView || loading || done || err) return;
           const el = e.currentTarget;

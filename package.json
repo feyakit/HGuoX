@@ -18,6 +18,7 @@
     "test:post-flicker": "node scripts/test-post-flicker.mjs",
     "test:favorites-return": "node scripts/test-favorites-return.mjs",
     "test:tab-swipe": "node scripts/test-tab-swipe.mjs",
+    "test:cat-tabs": "node scripts/test-cat-tabs.mjs",
     "test:rank-swipe": "node scripts/test-rank-swipe.mjs",
     "test:cards-badges": "node scripts/test-cards-badges.mjs",
     "test:keyboard-sheet": "node scripts/test-keyboard-sheet.mjs",
