@@ -1807,9 +1807,12 @@
    `[data-fade]` 那条渐隐也保留，但换行生效后 scrollWidth==clientWidth，不会再触发。 */
 .hg-inline-sorts {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
-  min-width: 0; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none;
+  /* overflow 必须是 visible：排序胶囊的 44px 热区靠 ::after inset:-6px 0 外扩，
+     而 overflow-x:auto 会把 overflow-y 一并算成 auto，把上下各 6px 裁掉，
+     实测热区只剩约 32px 高。chip 本身换行显示，正常情况 scrollWidth==clientWidth，
+     不需要横向滚动；极端超宽 chip 会略溢出，可接受。 */
+  min-width: 0; overflow: visible;
 }
-.hg-inline-sorts::-webkit-scrollbar { display: none; }
 /* 放不下时（大字体 / 极窄屏）：右缘留 16px 安全边 + 渐隐，提示「右边还有 chip」，
    而不是把最后一个 chip 硬裁成「精选推…」。放得下时这条规则完全不生效。 */
 .hg-inline-sorts[data-fade] {
