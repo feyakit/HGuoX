@@ -18,6 +18,8 @@ export type VideoHandle = {
   pause: () => void;
   toggle: () => void;
   seek: (t: number, source?: string) => void;
+  /** 结束态“重新看第 1 集”：当前这条片源倒回 0 并立刻起播（与手动 seek 是两条路） */
+  rewind: () => void;
   trace: (event: string, data?: Record<string, unknown>) => void;
   rate: (r: number) => void;
   mute: (m: boolean) => void;
@@ -119,6 +121,20 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       try { v.currentTime = target; trace("seek.assigned", { target, source }); }
       catch (e) { trace("seek.rejected", { error_name: (e as Error).name }); throw e; }
       if (resume) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+    },
+    /* 结束态“重新看第 1 集”：把当前片源倒回 0 并起播。
+       与上面的 seek() 是两条路 —— seek 只动位置、是否续播看当前 paused；
+       这里无条件起播，并且**重新武装片尾兜底**（nearEndFiredRef 只在换源时复位，
+       同一集重播若不复位，iOS 上第二次到片尾就不会再补 ended，结束卡就再也出不来）。 */
+    rewind: () => {
+      const v = videoRef.current;
+      if (!v) return;
+      nearEndFiredRef.current = false;
+      requestSeek(0, "replay");
+      if (hlsRef.current) { try { hlsRef.current.startLoad(0); } catch { /* ignore */ } }
+      try { v.currentTime = 0; trace("replay.rewind"); }
+      catch (e) { trace("replay.rejected", { error_name: (e as Error).name }); }
+      activity.play("replay");
     },
     trace,
     rate: (r: number) => { const v = videoRef.current; if (v) v.playbackRate = r; },
