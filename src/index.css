@@ -695,6 +695,17 @@ html.plat-android .hg-num { transform: translateY(1px); }
   display: block; width: 3px; height: 14px; border-radius: 2px;
   background: linear-gradient(180deg, #7C5CFF, #5B6BFF);
 }
+/* 结束态右上角关闭：视觉 32、热区 44（::after 撑在按钮自己身上，不挡同层其它媒体元素）。
+   绝对定位在卡片内，卡片里既有元素的位置/尺寸一个都不动。 */
+.hg-endcard-x {
+  position: absolute; top: 8px; right: 8px;
+  width: 32px; height: 32px; padding: 0; border: 0; border-radius: 999px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255, 255, 255, .10); color: rgba(255, 255, 255, .88);
+  -webkit-tap-highlight-color: transparent; cursor: pointer;
+}
+.hg-endcard-x::after { content: ""; position: absolute; inset: -6px; border-radius: 999px; }
+.hg-endcard-x:active { background: rgba(255, 255, 255, .20); }
 .ios-button.hg-endcard-main.hg-endcard-main {
   height: 44px; min-height: 44px; border-radius: 12px; font-size: 13px; font-weight: 600;
   background: var(--btn-grad, linear-gradient(135deg, #7C5CFF, #5B6BFF));

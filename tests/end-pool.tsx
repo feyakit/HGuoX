@@ -81,7 +81,7 @@ function Inner() {
         onRegen={() => void end.next(true)}
         onOpen={(id) => { (window as unknown as { endOpened?: number[] }).endOpened = [...((window as unknown as { endOpened?: number[] }).endOpened ?? []), id]; }}
         onReplay={() => { (window as unknown as { endReplay?: number }).endReplay = ((window as unknown as { endReplay?: number }).endReplay ?? 0) + 1; }}
-        onSwipeClose={() => { (window as unknown as { endClosed?: number }).endClosed = ((window as unknown as { endClosed?: number }).endClosed ?? 0) + 1; }}
+        onClose={() => { (window as unknown as { endClosed?: number }).endClosed = ((window as unknown as { endClosed?: number }).endClosed ?? 0) + 1; }}
       />
     </div>
   );
