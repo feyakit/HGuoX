@@ -137,21 +137,28 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
     }
   };
 
-  /* 换排序、分类或切换线路：清空列表重新拉。
-     必须 force：旧代码这里吃 60s 读缓存，切到「最热」看到的还是「最新」那批（要求 D）。 */
+  /* 换排序 / 换分类：用户主动换筛选，清空重拉（这一屏的卡片本来就该换成另一批）。 */
   useEffect(() => {
-    if (lastEpoch.current !== lineEpoch) {
-      lastEpoch.current = lineEpoch;
-      postExtra.clear();
-      setExtra({});
-    }
     setItems([]);
     setPage(0);
     setPages(1);
     scrollRef.current?.scrollTo(0, 0);
     void loadMore(true, { force: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort, cate, lineEpoch]);
+  }, [sort, cate]);
+
+  /* 线路 / 代理事件（hg:line-changed → lineEpoch）：只静默换数据，不清列表、不回到顶部。
+     旧写法把 lineEpoch 并进上面那个 effect，先 setItems([]) 再拉：已渲染的卡片会被整批卸载重建
+     （报告 B11——事件后 2.5s 打标记的卡片 contains=false），详情页已是这个口径（上游 issue #165）。
+     loadMore(reset) 是**一次** setItems，React 按 id 复用节点，所以静默刷新后已渲染卡片不重建。 */
+  useEffect(() => {
+    if (lastEpoch.current === lineEpoch) return;
+    lastEpoch.current = lineEpoch;
+    postExtra.clear();
+    setExtra({});
+    void loadMore(true, { force: true, silent: true }).catch(() => { /* 静默失败：保留旧列表 */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineEpoch]);
 
   /* 返回再进 / 切回吃瓜 tab：5s 内复用现成列表，超过就静默重拉（不闪骨架，失败保留旧列表） */
   const firstRun = useRef(true);
