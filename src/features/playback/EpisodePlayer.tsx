@@ -1,6 +1,6 @@
 import { Button, Image, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, hostOf, isMobile, logLine, platform, playlist } from "../../shared/api/api";
 import type { Detail, Episode, PlayInfo, Post, VideoCard } from "../../shared/api/types";
@@ -277,6 +277,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 这次触摸是不是从舞台（视频区）起手的：只有这种才拦 touchmove */
   const stageTouch = useRef(false);
   const epSlideTimer = useRef<number | undefined>(undefined);
+  /* 结束态遮罩自己的纵向滑动手势（见 endcard 渲染处）：遮罩不是舞台层的子节点，
+     舞台上的 onPointerDown/Move/Up 收不到它，所以「上滑只关卡片」在这里单独实现。 */
+  const endSwipe = useRef<{ x: number; y: number } | null>(null);
   const gesture = useRef<{
     x: number; y: number; startY: number; t: number; timer: number | null;
     mode: "idle" | "hold" | "scrub" | "pan" | "enterSeries" | "edgeBack";
@@ -816,6 +819,26 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (at >= 0) { go(at - index); return; }
     store.push({ kind: "feed", videoIds: [id], index: 0, title: "", startEp: 1 });
   }, [effectiveVideoIds, index, go, store]);
+
+  /* 结束态遮罩上的上下滑：语义与舞台上那条 seriesEnded 分支一致 —— **只关卡片、不切剧**。
+     不复用完整的指针手势机是有意的：遮罩里的「换一批 / 推荐卡 / 重新看第 1 集」都是按钮，
+     手势机里的单击兜底会顺手 toggle 播放，反而破坏按钮。所以这里只认纵向位移：
+     ≥48px 且明显竖于横才关卡片，点按（位移≈0）一律放行给按钮的 click。 */
+  const onEndCardDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    endSwipe.current = { x: e.clientX, y: e.clientY };
+  };
+  const onEndCardUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const start = endSwipe.current;
+    endSwipe.current = null;
+    if (!start) return;
+    const dy = e.clientY - start.y, dx = e.clientX - start.x;
+    if (Math.abs(dy) < 48 || Math.abs(dy) <= Math.abs(dx)) return;
+    logLine(`[endcard] swipe-close dy=${Math.round(dy)}`);
+    setSeriesEnded(false);
+    setEndRecs(null);
+    setEpPreview(null);
+    showControls();
+  };
 
 
   /* 「不感兴趣」（v3.0.6 #5）：刷剧流里点了必须立刻换片，不能只是弹个标签面板。
@@ -2394,7 +2417,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       {/* 结束态（本剧看完）：不自动滑进下一部，给「看完 + 推荐 3 部」让用户选。
           推荐全部来自真实接口（api_related 优先，其次 api_feed），过滤本剧，不足 3 部就少显示。 */}
       {!isDesktop && !endless && seriesEnded && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center px-5" data-hg-control="endcard">
+        <div className="absolute inset-0 z-40 flex items-center justify-center px-5" data-hg-control="endcard"
+          /* touch-action: none 必须显式给：遮罩不在舞台层里，没有继承舞台的 touchAction，
+             默认行为会把纵向滑动当成浏览器滚动 → 指针流被 pointercancel 掐断，
+             下面的 onPointerUp 根本收不到（真机上就是「上滑关不掉卡片」）。 */
+          style={{ touchAction: "none" }}
+          onPointerDown={onEndCardDown} onPointerUp={onEndCardUp} onPointerCancel={() => { endSwipe.current = null; }}>
           <div className="hg-endcard w-full max-w-[340px] p-[18px] text-center">
             <p className="flex items-center justify-center gap-2 text-[15px] font-bold text-white">
               <span className="hg-endcard-bar" aria-hidden="true" />本剧已看完
@@ -2435,8 +2463,17 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
               <p className="mt-3 text-[12px] text-white/45">暂时没有更多同类剧</p>
             )}
 
-            {/* 主行动单独一行：全宽 44 高、r12、品牌渐变 + 1px 白内描边 */}
-            <Button onClick={() => { setSeriesEnded(false); setEndRecs(null); pickEp(1); }}
+            {/* 主行动单独一行：全宽 44 高、r12、品牌渐变 + 1px 白内描边。
+                「重新看第 1 集」必须真的回到第 1 集第 0 秒并起播：
+                单集剧 pickEp(1) 是空操作（playKey 不变 → 不重载），所以走 VideoSurface 的
+                rewind()（倒回 0 + 重新武装片尾兜底 + 起播），与进度条手动 seek 完全分开；
+                多集剧照旧换集重载，换源期间先用封面垫住上一集尾帧。 */}
+            <Button onClick={() => {
+              setSeriesEnded(false); setEndRecs(null); setEpPreview(null);
+              playbackClock.publish(0);
+              if (curEp === 1) videoRef.current?.rewind();
+              else { setHoldFrame(true); pickEp(1); }
+            }}
               className="hg-endcard-main mt-4 w-full pressable">重新看第 1 集</Button>
           </div>
         </div>
