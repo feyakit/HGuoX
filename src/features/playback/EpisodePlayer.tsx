@@ -321,6 +321,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const { recs: endRecs, busy: endBusy, hint: endHint } = end;
   /* 结束卡推荐的请求序号（审计 #10）：只接受最新一次响应，换剧前在途的旧响应直接丢掉。 */
   const endSeq = useRef(0);
+  /* 结束卡开卡的并发去重（审计 #8）：同一个 playKey 内共用同一次取批请求 */
+  const endInflight = useRef<{ key: string; p: Promise<void> } | null>(null);
   const nextVideoId = effectiveVideoIds[index + 1];
   const relatedKey = `${store.lineEpoch}:${curId}`;
   const related = relatedByVideo[relatedKey] || [];
@@ -830,14 +832,23 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
    *  上游 related 对同一个 id 返回固定列表，所以「换一批」**不重新问接口**，只在池子里往后移；
    *  池子到底回到开头并给一句提示。池子不足 3 部就少显示，拿不到内容就如实空着（不补假卡）。 */
   const openEndCard = useCallback(async (regen = false) => {
-    const seq = ++endSeq.current;
-    setSeriesEnded(true);
-    showControls();
-    const rotation = await end.next(regen);
-    /* 等池子的时候换了剧/换了集：这份推荐已经不属于这一屏，直接丢（否则卡片会盖回来）。 */
-    if (!rotation || seq !== endSeq.current) return;
-    logLine(`[endcard] 本剧看完 id=${curId} 池子=${end.poolSize()} 游标=${rotation.cursor}${rotation.wrapped ? " (回到开头)" : ""} 推荐=${rotation.batch.map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
-  }, [curId, showControls, end]);
+    /* 并发去重（审计 #8）：片尾那一刻 ended 回调与手势/计时器会各触发一次，
+       以前两次都会跑 end.next()，于是池子被建两遍（2× api_related），甚至卡片换批。
+       「换一批」(regen=true) 必须照旧能推进，所以只对非 regen 的调用合并；
+       同一 playKey 内共用同一次请求，换集/换剧后 key 变了自然重来。 */
+    if (!regen && endInflight.current?.key === playKey) return endInflight.current.p;
+    const run = (async () => {
+      const seq = ++endSeq.current;
+      setSeriesEnded(true);
+      showControls();
+      const rotation = await end.next(regen);
+      /* 等池子的时候换了剧/换了集：这份推荐已经不属于这一屏，直接丢（否则卡片会盖回来）。 */
+      if (!rotation || seq !== endSeq.current) return;
+      logLine(`[endcard] 本剧看完 id=${curId} 池子=${end.poolSize()} 游标=${rotation.cursor}${rotation.wrapped ? " (回到开头)" : ""} 推荐=${rotation.batch.map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
+    })();
+    endInflight.current = { key: playKey, p: run };
+    try { await run; } finally { if (endInflight.current?.p === run) endInflight.current = null; }
+  }, [curId, showControls, end, playKey]);
 
   const go = useCallback((delta: number) => {
     const el = boxRef.current;
@@ -1491,10 +1502,27 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         /* 收起态的第一下也进双击判定窗口（审计 #17）：原来这里立刻 showControls()，
            第二下正好落在刚冒出来的暂停/选集按钮上 —— 双击变成一次误触。
            现在 280ms 内先不铺控件：第二下仍落在视频层上、走上面的双击分支，
-           没等到第二下才唤出控件。 */
+           没等到第二下才唤出控件。
+           唤出之后再做一次命中测试（审计 #6）：如果这一下正好落在主操作控件（播放/暂停、
+           全屏、选集、锁…）上，就替用户补一次点击 —— 收起态下「点全屏钮要连点两下」以前
+           被读成「功能没反应」。位移/时长判定已经在上面把单击与双击、滑动分开了，
+           所以这里只对「一次干净的单击」生效，不会变成「一唤就播/就切」。 */
+        const root = (e?.currentTarget as HTMLElement | null)?.closest?.(".player-root") as HTMLElement | null;
+        const tx = e?.clientX ?? 0, ty = e?.clientY ?? 0;
         tapRef.current.timer = window.setTimeout(() => {
           tapRef.current = { lastAt: 0, timer: null };
           showControls();
+          if (!root) return;
+          /* 等一帧让控件真正挂上（showControls 是 setState），再按坐标找元素 */
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!mounted.current || controlsLocked) return;
+            const el = document.elementFromPoint(tx, ty) as HTMLElement | null;
+            const btn = el?.closest?.("button") as HTMLButtonElement | null;
+            if (!btn || !root.contains(btn) || btn.disabled) return;
+            /* 只认播放器自己那一层的主操作控件；结束卡、选集面板、评论区里的按钮不算 */
+            if (btn.closest('[data-hg-control="endcard"],[role="dialog"],[data-hg-overlay]')) return;
+            btn.click();
+          }));
         }, GESTURE.doubleTapMs) as unknown as number;
         return;
       }

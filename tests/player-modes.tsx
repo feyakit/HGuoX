@@ -18,14 +18,16 @@ const q = new URLSearchParams(location.search);
 const ENDLESS = q.get("endless") === "1";
 const START_FS = q.get("fs") === "1";
 const CUR_ID = 991;
+/* ?eps=N：详情里的集数（#8 验片尾要用单集，否则 onEnded 会先自动进第 2 集） */
+const EPS = Math.max(1, Number(new URLSearchParams(location.search).get("eps") || 5));
 
 const video = (id: number, title: string) => ({
-  id, title, cover: "", tags: [], score: 0, episode_count: 5, total_episodes: 5,
+  id, title, cover: "", tags: [], score: 0, episode_count: EPS, total_episodes: EPS,
   is_finished: 1, is_original: 0, is_hot: 0, like_count: 0, comment_count: 0, collect_count: 0, description: "",
 });
 const DETAIL = {
   ...video(CUR_ID, "验收剧集"),
-  episodes: [1, 2, 3, 4, 5].map((n) => ({ ep_num: n, title: `第${n}集`, duration: 90, status: 1 })),
+  episodes: Array.from({ length: EPS }, (_, i) => ({ ep_num: i + 1, title: `第${i + 1}集`, duration: 90, status: 1 })),
   author: { id: 1, name: "验收作者" },
   counts: { like: 0, collect: 0, comment: 0, hot: 0 },
 };
@@ -52,6 +54,8 @@ Object.assign(window, { __TAURI_INTERNALS__: { invoke }, playerModeFixture: { ca
 function FsDriver() {
   const store = useStore();
   React.useEffect(() => { if (START_FS) store.setFs(true); /* eslint-disable-next-line */ }, []);
+  /* 给验收脚本读全屏态（收起态点控件要验「唤出 + 一并执行」后会真的进退全屏） */
+  (window as unknown as { __fsNow: () => boolean }).__fsNow = () => store.fs;
   return null;
 }
 

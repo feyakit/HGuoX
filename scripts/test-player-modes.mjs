@@ -99,6 +99,70 @@ try {
     assert.ok(c["cinema-fullscreen"].segs.some((s) => /下一集|下集/.test(s)), `胶囊=${JSON.stringify(c["cinema-fullscreen"].segs)}`);
   });
 
+
+  /* ───────── 审计 #6：控件收起后第一下点击不再被吞 ───────── */
+  const hiddenTap = async (endless, fs) => {
+    await page.goto(`${origin}tests/player-modes.html?endless=${endless ? 1 : 0}&fs=${fs ? 1 : 0}`, { waitUntil: "networkidle" });
+    await page.waitForSelector(".player-root", { timeout: 10000 });
+    await page.waitForTimeout(500);
+    await page.touchscreen.tap(180, 300);             // 先唤出一次，量出「倍速」胶囊的真实坐标
+    await page.waitForTimeout(400);
+    const at = await page.evaluate(() => {
+      const seg = [...document.querySelectorAll(".player-root .hg-seg")].find(b => /倍速/.test(b.getAttribute("aria-label") || ""));
+      if (!seg) return null;
+      const r = seg.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (seg.textContent || "").trim() };
+    });
+    if (!at) return { error: "找不到倍速胶囊" };
+    /* 等控件自动收起（全屏 1.2s / 竖屏 3s，留足余量） */
+    await page.waitForTimeout(3600);
+    const hidden = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
+    await page.touchscreen.tap(at.x, at.y);            // 收起态，点在那个胶囊原来的位置
+    await page.waitForTimeout(700);
+    const after = await page.evaluate(() => ({
+      segs: [...document.querySelectorAll(".player-root .hg-seg")].map(b => (b.textContent || "").trim()),
+    }));
+    return { at, hiddenCount: hidden, after };
+  };
+
+  await step("审计 #6：收起态点「倍速」位置 → 唤出控件并一并执行（1x→1.25x）", async () => {
+    const r = await hiddenTap(false, false);
+    assert.ok(!r.error, r.error || "");
+    assert.equal(r.hiddenCount, 0, `收起后仍有 ${r.hiddenCount} 个胶囊`);
+    assert.ok(r.after.segs.some(s => /1\.25x/.test(s)), `点完胶囊=${JSON.stringify(r.after.segs)}`);
+  });
+
+  await step("审计 #6：收起态点画面空白处 → 只唤出，不改播放状态", async () => {
+    await page.goto(`${origin}tests/player-modes.html?endless=0&fs=0`, { waitUntil: "networkidle" });
+    await page.waitForSelector(".player-root");
+    await page.waitForTimeout(3600);
+    const before = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
+    await page.touchscreen.tap(180, 200);              // 画面上部空白（不是任何控件）
+    await page.waitForTimeout(500);
+    const after = await page.evaluate(() => [...document.querySelectorAll(".player-root .hg-seg")].map(b => (b.textContent || "").trim()));
+    assert.equal(before, 0, `收起前已有 ${before} 个胶囊`);
+    assert.ok(after.some(s => /1x/.test(s)), `唤出后胶囊=${JSON.stringify(after)}`);
+    assert.ok(!after.some(s => /1\.25x/.test(s)), `空白处点击误触发了倍速：${JSON.stringify(after)}`);
+  });
+
+  /* ───────── 审计 #8：片尾双触发只取一批推荐 ───────── */
+  await step("审计 #8 护栏：片尾 ended 连发两次 → 池子只建 1 次（旧版同值，本项无判别力，真机看 [endcard] 行数）", async () => {
+    await page.goto(`${origin}tests/player-modes.html?endless=0&fs=0&eps=1`, { waitUntil: "networkidle" });
+    await page.waitForSelector(".player-root");
+    await page.waitForFunction(() => !!document.querySelector("video"), null, { timeout: 8000 });
+    const before = await page.evaluate(() => window.playerModeFixture.calls.filter(c => c.cmd === "api_related").length);
+    await page.evaluate(() => {
+      /* 同一 tick 连发两次 = 片尾那一刻「ended 回调 + 手势/计时器」同时触发的形态。
+         分两次 setTimeout 反而测不出来：mock 接口在微任务里就返回了，第二次调用时池子已建好。 */
+      const v = document.querySelector("video");
+      v.dispatchEvent(new Event("ended"));
+      v.dispatchEvent(new Event("ended"));
+    });
+    await page.waitForTimeout(1200);
+    const after = await page.evaluate(() => window.playerModeFixture.calls.filter(c => c.cmd === "api_related").length);
+    assert.equal(after - before, 1, `api_related 增量 ${after - before} 次`);
+  });
+
   report.pageErrors = errors;
 } finally {
   report.summary = `${report.failed.length ? "FAILED" : "PASS"} · ${report.failed.length} failed`;
