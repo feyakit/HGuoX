@@ -335,6 +335,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const openTagMenu = (seed: string[] = []) => { setTagMenuSeed(seed); setPanel(null); setTagMenu(true); };
   const openTag = (tag: string) => { closePanels(); store.push({ kind: "tag", tag, name: tag }); };
   useEffect(() => { setTagMenu(false); }, [curId, store.lineEpoch, accountScope]);
+  /* 换账号：清掉上一位用户的详情快照（含 interaction.liked）。
+     否则点赞数会按「旧 detail.liked=true + 新 store.liked=false」算出 -1，
+     实测切账号瞬间 100→99（≈140ms）→100（审计 #5 的可见抖动）。 */
+  useEffect(() => { setDetails({}); }, [accountScope]);
   useEffect(() => { if (blocked && mode === "home" && active) onBlocked?.(curId); }, [blocked, mode, active, curId, onBlocked]);
   useEffect(() => { if (!allowed) { setPanel(null); setTagMenu(false); } }, [allowed]);
   const curEp = epMap[curId] || 1;
