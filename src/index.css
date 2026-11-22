@@ -677,8 +677,12 @@ html.plat-android .hg-num { transform: translateY(1px); }
   position: relative; display: inline-flex; align-items: center; gap: 14px; height: 28px;
   background: none; border: 0; box-shadow: none;
 }
-/* 热区 ≥44：容器外扩，不影响布局 */
-.hg-seg-pill::after { content: ""; position: absolute; left: -6px; right: -6px; top: 50%; height: 44px; transform: translateY(-50%); }
+/* 热区 ≥44：挂在每个分段按钮**自己身上**，不能挂在容器上。
+   容器上的 ::after 是定位元素（position:absolute），绘制在三个静态按钮之上，
+   命中测试全落到 .hg-seg-pill 这个 div 上 —— 按钮的 onClick 一次都收不到，
+   真机表现就是「倍速 / 上一集 / 下一集按了没反应」（3.0.8 起，两个平台一致）。 */
+.hg-seg { position: relative; }
+.hg-seg::after { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 44px; transform: translateY(-50%); }
 .hg-seg {
   flex: 1 1 0; min-width: 44px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
   padding: 0 4px; border: 0; border-radius: 8px; background: none; box-shadow: none;

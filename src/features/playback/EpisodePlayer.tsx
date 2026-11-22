@@ -1362,6 +1362,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (intent.commit) {
         const dir = intent.dir;
         logLine(`[gesture] episode commit dir=${dir} dy=${Math.round(dy)} dt=${Date.now() - g.t}ms`);
+        /* 提交即收掉「下一集 · 第N集 / 共 X 集」预览。
+           它和换集后的 toast「第 N 集 / X」是两条独立提示，同屏出现就是用户报的
+           「切集时两个下一集提示」；而下面每个分支都 return，以前没人清这条预览，
+           于是它一直挂在 z-30 上不消失（停在 y≈715，只有下一次拖动才会被覆盖）。 */
+        setEpPreview(null);
         const ep = epMap[curId] || 1;
         const total = episodes.length;
         const want = dir === 1 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
@@ -2685,10 +2690,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       )}
       </div>
       {!isDesktop && !controlsLocked && active && (!fs || !idle) && (
-        <div className={`absolute z-40 flex items-center gap-2 ${fs ? "" : "right-3"}`}
+        <div className={`absolute z-40 flex items-center gap-2`}
           style={{
             top: rotated ? 12 : "calc(var(--sat, 0px) + 6px)",
-            right: fs ? (rotated ? "calc(var(--sab, 0px) + 56px)" : 56) : undefined,
+            /* 横向只吃**左右**安全区（刘海 / 圆角）。以前竖屏写死 right-3、旋转分支用的是
+               --sab（那是**底部**安全区）→ iPhone 横过来后按钮既不避开 48px 的刘海，
+               又因为 --sab 34→21 自己横向挪 13px；实测把 --sar 设成 48px，x 一点不动。
+               竖屏仍用 0.75rem（= 原来的 right-3），Android 上位置一个像素都不变。 */
+            right: fs ? "calc(var(--sar, 0px) + 56px)" : "calc(var(--sar, 0px) + 0.75rem)",
           }}>
           {!fs && !clean && <Button onClick={() => setMuted(m => !m)} aria-label={muted ? "取消静音" : "静音"}
             className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1">
