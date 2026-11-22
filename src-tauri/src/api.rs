@@ -808,8 +808,8 @@ pub async fn api_feed(
 }
 
 /// 原创频道，返回分页视频卡（结构同 api_feed）。
-/// `cate="all"` 走 `/api/videos?is_original=1`；`ai-duanju`/`ai-manju` 走
-/// `/api/videos/category/{cate}?is_original=1`。
+/// 优先解析官网服务端渲染频道页，与网站排序保持一致；抓取/解析失败或非预设分类
+/// 自动回退下面的 JSON 接口，`Paged<VideoCard>` 契约不变。
 #[tauri::command]
 pub async fn api_original_videos(
     state: State<'_, Api>,
@@ -818,6 +818,9 @@ pub async fn api_original_videos(
     size: u32,
     sort: Option<String>,
 ) -> Result<Value, String> {
+    if let Ok(value) = crate::channel_page::fetch_original(&cate, page, size).await {
+        return Ok(value);
+    }
     let sort = match sort.as_deref() {
         Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
         _ => String::new(),
@@ -892,6 +895,11 @@ pub async fn api_category(
     size: u32,
     sort: Option<String>,
 ) -> Result<Value, String> {
+    if let Ok(value) =
+        crate::channel_page::fetch_category(&cate, page, size, sort.as_deref()).await
+    {
+        return Ok(value);
+    }
     let sort = match sort.as_deref() {
         Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
         _ => String::new(),

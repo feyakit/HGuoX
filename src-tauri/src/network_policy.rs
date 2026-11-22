@@ -204,11 +204,15 @@ pub fn parse_target_with_mode(raw: &str, strict: bool) -> Result<Url, String> {
     Ok(url)
 }
 
+fn denied_target() -> String {
+    "禁止访问普通内网、回环或保留地址（若域名解析被劫持或代理异常，可在「我的 → 设置」切换线路或关闭严格安全模式）".into()
+}
+
 fn check_ip(ip: IpAddr) -> Result<(), String> {
     if allowed_ip(ip) {
         Ok(())
     } else {
-        Err("禁止访问普通内网、回环或保留地址（若域名解析被劫持或代理异常，可在「我的 → 设置」切换线路或关闭严格安全模式）".into())
+        Err(denied_target())
     }
 }
 
@@ -230,13 +234,24 @@ pub fn check_addresses_with_mode(addrs: &[SocketAddr], strict: bool) -> Result<(
     Ok(())
 }
 
-/// 当双栈查询已被本地 TUN FakeIP 接管（例如 A 返回 198.18.0.x / 240.0.0.x，
-/// 而 AAAA 返回 Sing-box 的 fc00::/18 或未指定地址）时，剔除不放行的伴生记录，
-/// 使连接器仅固定到合法的 FakeIP / 公网地址；普通公私网混合重绑定仍原样保留以便后续整体拒绝。
-fn retain_allowed_when_fakeip(addrs: &mut Vec<SocketAddr>, strict: bool) {
-    if strict && addrs.iter().any(|addr| is_fake_ip(addr.ip())) {
-        addrs.retain(|addr| allowed_ip(addr.ip()));
+/// 严格模式下把系统解析结果收敛成可固定给连接器的地址。
+///
+/// TUN 代理的 fake-IP 会把 AAAA 也合成 ULA 假地址（sing-box `fc00::/18`、
+/// Clash/Stash `fdfe:dcba:9876::/48`、Surge `fd00:6152::/32`）。这些地址不可直达，
+/// 但整组拒绝会让请求在发出前失败。丢掉不可放行的地址、保留 fake-IP IPv4，
+/// 连接器拿到的列表仍然不含私网。白名单本身不放宽：整组都不可放行时仍拒绝。
+fn pinable_addresses(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String> {
+    if addrs.is_empty() {
+        return Err("目标没有可用的 DNS 地址".into());
     }
+    let kept: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|addr| allowed_ip(addr.ip()))
+        .collect();
+    if kept.is_empty() {
+        return Err(denied_target());
+    }
+    Ok(kept)
 }
 
 /// 与浏览器一致优先 IPv6：连接器以首个地址的协议族为首选，另一族在其失败后（Happy Eyeballs）兜底。
@@ -251,22 +266,24 @@ pub async fn resolve_target(url: &Url, strict: bool) -> Result<Vec<SocketAddr>, 
     let mut addrs = match url.host().ok_or("目标缺少主机名")? {
         Host::Ipv4(ip) => vec![SocketAddr::new(ip.into(), port)],
         Host::Ipv6(ip) => vec![SocketAddr::new(ip.into(), port)],
-        Host::Domain(host) => {
-            let mut resolved: Vec<SocketAddr> = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::net::lookup_host((host, port)),
-            )
-            .await
-            .map_err(|_| "DNS 解析超时")?
-            .map_err(|_| "DNS 解析失败")?
-            .collect();
-            retain_allowed_when_fakeip(&mut resolved, strict);
-            resolved
-        }
+        Host::Domain(host) => tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| "DNS 解析超时")?
+        .map_err(|_| "DNS 解析失败")?
+        .collect(),
     };
     sort_ipv6_first(&mut addrs);
     addrs.dedup();
-    check_addresses_with_mode(&addrs, strict)?;
+    // 系统解析结果收敛后再排序过滤；备用 DoH（media_dns.rs）仍走整组严格校验，不经过这里。
+    addrs = if strict {
+        pinable_addresses(addrs)?
+    } else {
+        check_addresses_with_mode(&addrs, false)?;
+        addrs
+    };
     Ok(addrs)
 }
 
@@ -353,7 +370,7 @@ mod tests {
 
     #[test]
     fn dualstack_fakeip_strips_unroutable_companion_aaaa() {
-        let mut tun_addrs: Vec<SocketAddr> = [
+        let tun_addrs: Vec<SocketAddr> = [
             "198.18.0.15:443",
             "[fc00::15]:443",
             "[fe80::1]:443",
@@ -361,20 +378,36 @@ mod tests {
         .iter()
         .map(|s| s.parse().unwrap())
         .collect();
-        retain_allowed_when_fakeip(&mut tun_addrs, true);
-        assert_eq!(tun_addrs, vec!["198.18.0.15:443".parse().unwrap()]);
-        assert!(check_addresses_with_mode(&tun_addrs, true).is_ok());
+        let kept = pinable_addresses(tun_addrs).unwrap();
+        assert_eq!(kept, vec!["198.18.0.15:443".parse().unwrap()]);
+        assert!(check_addresses_with_mode(&kept, true).is_ok());
 
-        let mut rebind_addrs: Vec<SocketAddr> = [
-            "1.1.1.1:443",
-            "192.168.1.1:443",
-        ]
-        .iter()
-        .map(|s| s.parse().unwrap())
-        .collect();
-        retain_allowed_when_fakeip(&mut rebind_addrs, true);
-        assert_eq!(rebind_addrs.len(), 2);
-        assert!(check_addresses_with_mode(&rebind_addrs, true).is_err());
+        // 公私网混合：丢私网伴生记录，只把公网地址固定给连接器。
+        let rebind_addrs: Vec<SocketAddr> = ["1.1.1.1:443", "192.168.1.1:443"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(
+            pinable_addresses(rebind_addrs).unwrap(),
+            vec!["1.1.1.1:443".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn fakeip_mixed_answers_keep_only_the_pinnable_addresses() {
+        let addrs: Vec<SocketAddr> = ["198.18.0.7:443", "[fdfe:dcba:9876::7]:443", "1.1.1.1:443"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(
+            pinable_addresses(addrs).unwrap(),
+            vec![
+                "198.18.0.7:443".parse::<SocketAddr>().unwrap(),
+                "1.1.1.1:443".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        assert!(pinable_addresses(vec!["[fc00::7]:443".parse().unwrap()]).is_err());
+        assert!(pinable_addresses(Vec::new()).is_err());
     }
 
     #[test]

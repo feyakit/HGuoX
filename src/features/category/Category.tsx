@@ -9,6 +9,7 @@ import { Masonry } from "../../shared/ui/cards";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
 import { InplaceSearch } from "../search/InplaceSearch";
 import { Empty, Img } from "../../shared/ui/ui";
+import { useTabSwipe } from "../../shared/lib/useTabSwipe";
 import { IBack, IClapper, IClose, IGrid, IRefresh, ISearch, ISparkF, IStarsF } from "../../shared/ui/icons";
 import { TagsSection, TopicsSection } from "../discover/Discover";
 import { FRESH_GAP_MS, useApiRefresh, useForegroundRefresh, useFreshness, useVisibilityRefresh } from "../../shared/lib/dataFreshness";
@@ -459,6 +460,23 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     ? Math.max(0, CHANNEL_ORIGINAL_CATES.findIndex(x => x.value === originalCate))
     : Math.max(0, CHANNEL_SORTS.findIndex(x => x.value === serverSort));
 
+  /* 上游 29e273a：频道筛选项左右滑切。短剧/漫剧走 CHANNEL_SORTS，原创走
+     CHANNEL_ORIGINAL_CATES；切换沿用按钮那条路径（回顶部 + 重新拉第一页）。 */
+  const channelSwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: scrollContainer,
+    tabIndex: sortIdx,
+    tabCount: cate === "original" ? CHANNEL_ORIGINAL_CATES.length : CHANNEL_SORTS.length,
+    onTabChange: index => {
+      if (cate === "original") {
+        const next = CHANNEL_ORIGINAL_CATES[index];
+        if (next) changeOriginalCate(next.value);
+      } else {
+        const next = CHANNEL_SORTS[index];
+        if (next) changeServerSort(next.value);
+      }
+    },
+  });
+
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
       <span className="hg-aura" aria-hidden="true" />
@@ -508,7 +526,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
         )}
       </div>
 
-      <div ref={scrollContainer} className="flex-1 scroll-y hg-page-x pt-2 pb-8 relative" aria-busy={loading} onScroll={checkScrollBottom}>
+      <div ref={scrollContainer} {...channelSwipe} style={{ touchAction: "pan-y" }} className="flex-1 scroll-y hg-page-x pt-2 pb-8 relative" aria-busy={loading} onScroll={checkScrollBottom}>
         {items.length > 0 && replacing && <p role="status" className="mb-3 text-[12px] text-mut">{loading ? "正在更新，暂时保留上次结果…" : "当前显示上次结果，请重试以更新筛选。"}</p>}
         {items.length > 0 && err && <div role="status" className="mb-3 flex flex-wrap items-center gap-2 text-[12px] text-mut"><span>{err}</span><Button className="px-3 text-primary" onClick={() => void loadMore(replacing)}>重试</Button></div>}
         {items.length ? (
