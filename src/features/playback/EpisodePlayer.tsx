@@ -2712,19 +2712,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       <TagBlockMenu open={active && tagMenu} tags={meta.tags} initialSelected={tagMenuSeed} onClose={() => setTagMenu(false)} />
       {/* 线路面板：播放页内就地弹，不跳设置页 */}
       {!isDesktop && <LineQuickSwitch open={active && lineOpen} onClose={() => setLineOpen(false)} />}
-      {/* 控件收起（clean）时的拦截层：这一层的存在保证"点哪里都只会唤出控件"，
-          不会穿透到下面的卡片/推荐位（真机点信息栏落到别的详情页就是这么发生的：
-          控件收起后那块位置已经不是信息栏，而是可点的内容）。 */}
-      {!isDesktop && clean && !controlsLocked && (
-        <div
-          aria-hidden="true"
-          data-hg-control="clean-catcher"
-          className="absolute inset-0"
-          style={{ zIndex: 25 }}
-          onPointerDown={(e) => { e.stopPropagation(); }}
-          onClick={(e) => { e.stopPropagation(); showControls(); }}
-        />
-      )}
+      {/* 控件收起（clean）时**不再铺拦截层**。
+          它当初是为了「点信息栏的坐标落到下层内容」加的，但代价是所有指针事件都被它吃掉：
+          控件收起态（看剧时的常态）长按 2x、双击 ±5s 全部失效 —— 真机日志里 pointerdown 的
+          target 是 DIV[clean-catcher]，舞台手势一次都收不到，380ms 的长按计时器都没机会生效。
+          舞台层自己已经处理了这三种语义（onUp：hidden → showControls；双击 → 三分 seek；
+          onDown 的 380ms → 2x），所以直接交给舞台，不再多一层。
+          验收（AVD，本提交前用 CSS 等价隐藏了该层）：clean 态长按出「2x 倍速中」、双击出
+          ±5s 气泡、单击只唤出控件（stacks/title 不变，没有点穿到别的页）。 */}
       {controlsLocked && <PlaybackLock active={active} hideUnlockUntilTapped={!isDesktop} onUnlock={() => { setControlsLocked(false); if (isDesktop) wake(); else showControls(); }} />}
     </div>
   );
