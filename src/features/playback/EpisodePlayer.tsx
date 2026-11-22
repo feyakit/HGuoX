@@ -318,6 +318,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
      推荐来自轮换池（related 全量 + feed 若干页，见 endPool.ts / useEndPool.ts）。 */
   const end = useEndPool(curId);
   const { recs: endRecs, busy: endBusy, hint: endHint } = end;
+  /* 结束卡推荐的请求序号（审计 #10）：只接受最新一次响应，换剧前在途的旧响应直接丢掉。 */
+  const endSeq = useRef(0);
   const nextVideoId = effectiveVideoIds[index + 1];
   const relatedKey = `${store.lineEpoch}:${curId}`;
   const related = relatedByVideo[relatedKey] || [];
@@ -565,6 +567,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   }, [kind, curId, curEp, duration, addHistory, store, setClean, setFs, setPanel, showControls, isDesktop]);
   useEffect(() => {
     setSeriesEnded(false);
+    /* 换剧/换集：结束卡推荐一并清掉，池游标随剧重置（useEndPool 按 curId 重建池）；
+       序号 +1 让换剧前发出的那一次推荐响应作废，不能把旧剧的卡盖回来。 */
+    endSeq.current += 1;
+    end.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playKey]);
   useEffect(() => {
     window.clearTimeout(epSlideTimer.current);
@@ -812,10 +819,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
    *  上游 related 对同一个 id 返回固定列表，所以「换一批」**不重新问接口**，只在池子里往后移；
    *  池子到底回到开头并给一句提示。池子不足 3 部就少显示，拿不到内容就如实空着（不补假卡）。 */
   const openEndCard = useCallback(async (regen = false) => {
+    const seq = ++endSeq.current;
     setSeriesEnded(true);
     showControls();
     const rotation = await end.next(regen);
-    if (!rotation) return;
+    /* 等池子的时候换了剧/换了集：这份推荐已经不属于这一屏，直接丢（否则卡片会盖回来）。 */
+    if (!rotation || seq !== endSeq.current) return;
     logLine(`[endcard] 本剧看完 id=${curId} 池子=${end.poolSize()} 游标=${rotation.cursor}${rotation.wrapped ? " (回到开头)" : ""} 推荐=${rotation.batch.map((v) => `${v.id}:${v.title}`).join(",") || "无"}`);
   }, [curId, showControls, end]);
 
