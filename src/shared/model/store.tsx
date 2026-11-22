@@ -184,7 +184,7 @@ type Store = {
   volume: number; setVolume: (v: number) => void;
   searchHist: string[]; addSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
-  toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"], tag?: string) => void;
+  toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"], tag?: string, ms?: number) => void;
   /** 线路切换计数：变了就让列表页重挂载，重新拉一遍数据 */
   lineEpoch: number;
   /** 当前封面取色（全站 accent 的唯一来源） */
@@ -299,9 +299,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, [strictSecurityReady]);
 
-  /* 带 tag 的提示共用同一个槽位：原地替换内容并重置 2200ms 计时，不堆叠、不重放入场动画
-     （上游 PR #200）。无 tag 的普通提示仍是「最多 3 张」的堆叠行为。 */
-  const toast = useCallback((msg: string, icon?: Toast["icon"], tag?: string) => {
+  /* 带 tag 的提示共用同一个槽位：原地替换内容并重置计时，不堆叠、不重放入场动画
+     （上游 PR #200）。无 tag 的普通提示仍是「最多 3 张」的堆叠行为。
+     `ms` 可选：个别提示（如「推荐已轮完一遍」）要求更快收掉，默认仍是 2200ms。 */
+  const toast = useCallback((msg: string, icon?: Toast["icon"], tag?: string, ms = 2200) => {
     const id = ++toastSeq.current;
     setToasts((t) => {
       if (tag) {
@@ -312,7 +313,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       return [...t.slice(-2), { id, msg, icon }];
     });
-    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2200);
+    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), ms);
   }, []);
   const acceptMerge = useCallback(async (onProgress?: (done: number, total: number) => void) => {
     const snap = accountRef.current.guestSnapshot();

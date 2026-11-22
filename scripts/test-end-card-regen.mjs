@@ -33,6 +33,10 @@ const hintText = () => page.evaluate(() => {
   const el = document.querySelector('.hg-endcard [role="status"]');
   return el ? (el.textContent || "").trim() : "";
 });
+const toastText = () => page.evaluate(() => {
+  const host = document.querySelector(".ios-toast-host");
+  return host ? (host.textContent || "").trim() : "";
+});
 const emptyText = () => page.evaluate(() => {
   const cards = document.querySelectorAll(".hg-reccard").length;
   if (cards) return "";
@@ -102,13 +106,36 @@ try {
     });
   }
 
-  await step("第 5 次「换一批」：池子到底回到开头，内容 = 第 1 批，并给出「已看完推荐池」提示", async () => {
+  await step("第 5 次「换一批」：池子到底回到开头，内容 = 第 1 批，卡片内有提示", async () => {
     await clickRegen();
     const now = await batch();
     assert.deepEqual(now, batches[0], `回到开头应是第 1 批：${JSON.stringify(now)} vs ${JSON.stringify(batches[0])}`);
-    assert.equal(await hintText(), "已看完推荐池，从头再看");
+    assert.equal(await hintText(), "推荐已轮完一遍，从头开始");
     report.batches = batches.map((b, i) => ({ batch: i + 1, items: b }));
     report.data = { ...(report.data || {}), wrapped: now };
+  });
+
+  await step("回卷时弹一条 toast（单槽 playback-hint），文案说明是第二轮", async () => {
+    /* 再转一圈回到池首，这一次量 toast 的出现与消失 */
+    for (let i = 0; i < 4; i += 1) await clickRegen();
+    await clickRegen();
+    const text = await toastText();
+    report.data = { ...(report.data || {}), toast: text };
+    assert.ok(text.includes("推荐已轮完一遍"), `toast=${JSON.stringify(text)}`);
+    assert.ok(text.includes("从头开始"), `toast=${JSON.stringify(text)}`);
+  });
+
+  await step("toast 在 2s 内自动消失（不留残影）", async () => {
+    const started = Date.now();
+    await page.waitForFunction(() => !(document.querySelector(".ios-toast-host")?.textContent || "").includes("推荐已轮完一遍"), null, { timeout: 2600 });
+    const ms = Date.now() - started;
+    report.data = { ...(report.data || {}), toastGoneMs: ms };
+    assert.ok(ms <= 2000, `toast 停留 ${ms}ms，超过 2s`);
+  });
+
+  await step("非回卷的「换一批」不弹这条 toast", async () => {
+    await clickRegen();
+    assert.equal((await toastText()).includes("推荐已轮完一遍"), false, `不该在非回卷时提示：${JSON.stringify(await toastText())}`);
   });
 
   await page.screenshot({ path: join(output, "end-card-wrapped.png") });
@@ -151,7 +178,7 @@ try {
   await step("池子只有 2 部：点一次「换一批」→ 回到开头并提示，之后仍只有 2 部", async () => {
     await clickRegen();
     assert.equal(await page.locator(".hg-reccard").count(), 2);
-    assert.equal(await hintText(), "已看完推荐池，从头再看");
+    assert.equal(await hintText(), "推荐已轮完一遍，从头开始");
   });
 
   assert.deepEqual(errors, [], `页面报错：${errors.join(" | ")}`);

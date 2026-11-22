@@ -65,26 +65,33 @@ const fixture = {
 
 Object.assign(window, { endPoolFixture: fixture, __TAURI_INTERNALS__: { invoke } });
 
-function Harness() {
+function Inner() {
   const end = useEndPool(CUR_ID);
   fixture.ready = true;
   /* 与播放页一致：打开结束态先取一批 */
   React.useEffect(() => { void end.next(); /* eslint-disable-next-line */ }, []);
   return (
+    <div style={{ position: "relative", width: "100%", height: "100%", background: "#101014" }}>
+      <EndCard
+        title="测试剧集"
+        totalEpisodes={24}
+        recs={end.recs}
+        busy={end.busy}
+        hint={end.hint}
+        onRegen={() => void end.next(true)}
+        onOpen={(id) => { (window as unknown as { endOpened?: number[] }).endOpened = [...((window as unknown as { endOpened?: number[] }).endOpened ?? []), id]; }}
+        onReplay={() => { (window as unknown as { endReplay?: number }).endReplay = ((window as unknown as { endReplay?: number }).endReplay ?? 0) + 1; }}
+        onSwipeClose={() => { (window as unknown as { endClosed?: number }).endClosed = ((window as unknown as { endClosed?: number }).endClosed ?? 0) + 1; }}
+      />
+    </div>
+  );
+}
+
+/* useEndPool 用 store 的 toast（单槽提示），所以必须挂在 AppProvider 里面 */
+function Harness() {
+  return (
     <AppProvider>
-      <div style={{ position: "relative", width: "100%", height: "100%", background: "#101014" }}>
-        <EndCard
-          title="测试剧集"
-          totalEpisodes={24}
-          recs={end.recs}
-          busy={end.busy}
-          hint={end.hint}
-          onRegen={() => void end.next(true)}
-          onOpen={(id) => { (window as unknown as { endOpened?: number[] }).endOpened = [...((window as unknown as { endOpened?: number[] }).endOpened ?? []), id]; }}
-          onReplay={() => { (window as unknown as { endReplay?: number }).endReplay = ((window as unknown as { endReplay?: number }).endReplay ?? 0) + 1; }}
-          onSwipeClose={() => { (window as unknown as { endClosed?: number }).endClosed = ((window as unknown as { endClosed?: number }).endClosed ?? 0) + 1; }}
-        />
-      </div>
+      <Inner />
       <ToastHost />
     </AppProvider>
   );

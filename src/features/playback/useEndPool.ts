@@ -6,13 +6,17 @@
  */
 import { useCallback, useMemo, useRef, useState } from "react";
 import { api } from "../../shared/api/api";
+import { useStore } from "../../shared/model/store";
 import type { VideoCard } from "../../shared/api/types";
 import { buildEndPool, takeBatch, type EndPool, type EndPoolRotation } from "./endPool";
 
 /** 池子轮到底、回到开头时给用户的一句话（不要静默重复同一批） */
-export const END_POOL_WRAPPED_HINT = "已看完推荐池，从头再看";
+export const END_POOL_WRAPPED_HINT = "推荐已轮完一遍，从头开始";
+/** 这句提示要收得快一点：它只是解释「为什么又看到第一批」，不占屏 */
+const END_POOL_TOAST_MS = 1800;
 
 export function useEndPool(curId: number) {
+  const { toast } = useStore();
   const [recs, setRecs] = useState<VideoCard[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState("");
@@ -34,6 +38,8 @@ export function useEndPool(curId: number) {
       }
       const rotation = takeBatch(pool.current.items, cursor.current, shown.current);
       cursor.current = rotation.cursor;
+      /* 轮到底回到开头：卡片里那行小字容易被忽略，单槽 toast 再明确说一次「这是第二轮」 */
+      if (rotation.wrapped) toast(END_POOL_WRAPPED_HINT, "info", "playback-hint", END_POOL_TOAST_MS);
       setHint(rotation.wrapped ? END_POOL_WRAPPED_HINT : "");
       setRecs(rotation.batch);
       return rotation;
@@ -44,7 +50,7 @@ export function useEndPool(curId: number) {
     } finally {
       setBusy(false);
     }
-  }, [curId]);
+  }, [curId, toast]);
 
   const close = useCallback(() => { setRecs(null); setHint(""); }, []);
   const poolSize = useCallback(() => pool.current?.items.length ?? 0, []);
