@@ -882,8 +882,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const go = useCallback((delta: number) => {
     const el = boxRef.current;
     if (!el) return;
-    const step = pageStep(el);
     const next = Math.max(0, Math.min(effectiveVideoIds.length - 1, index + delta));
+    /* 全屏里滚动容器是 overflow:hidden、非当前 section 整个 hidden —— scrollTo 走不动，
+       于是「全屏抖音上滑」看起来毫无反应（真机 B7/X8）。这里直接换索引，
+       滚动的同步交给下面那个 effect（它按 index 反算 scrollTop）。 */
+    if (!isDesktop && fs) { resolveSwipe(next); return; }
+    const step = pageStep(el);
     const target = next * step;
     el.scrollTo({ top: target, behavior: "smooth" });
     /* scroll-snap:mandatory 会打断程序化的 smooth 滚动（真机表现就是「上滑不动」）：
@@ -893,7 +897,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (!box) return;
       if (Math.abs(box.scrollTop - target) > step * 0.5) box.scrollTop = target;
     }, 420);
-  }, [index, effectiveVideoIds.length, pageStep]);
+  }, [index, effectiveVideoIds.length, pageStep, isDesktop, fs, resolveSwipe]);
 
   /** 点推荐剧：在列表里就滚过去，不在就压一层新的播放页从第 1 集开始 */
   const openRecommended = useCallback((id: number) => {
@@ -1537,8 +1541,16 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
             showControls();
             return;
           }
-          /* 播到最后一集后继续上滑：**不再自动滑进下一部剧**（用户要的是选择权），
-             直接给结束态；下滑同理。 */
+          /* 首集下滑：到头了但不是「看完」—— 只回弹 + 一句提示，绝不进结束态。
+             （真机 D1/X6：第 1 集下滑弹出「本剧已看完 / 共 48 集」） */
+          if (dir === -1) {
+            reboundSlide();
+            setEpPreview(null);
+            toast("已经是第一集", "info", "playback-hint");
+            try { navigator.vibrate?.(8); } catch { /* ignore */ }
+            return;
+          }
+          /* 播到最后一集后继续上滑：**不再自动滑进下一部剧**（用户要的是选择权），直接给结束态。 */
           reboundSlide();
           setEpPreview(null);
           try { navigator.vibrate?.(8); } catch { /* ignore */ }

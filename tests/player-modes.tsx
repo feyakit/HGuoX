@@ -27,6 +27,9 @@ const PLAY_SRC = "http://127.0.0.1:9/never.m3u8";
 const CUR_ID = 991;
 /* ?eps=N：详情里的集数（#8 验片尾要用单集，否则 onEnded 会先自动进第 2 集） */
 const EPS = Math.max(1, Number(new URLSearchParams(location.search).get("eps") || 5));
+/* ?vids=N：播放列表长度（验「全屏抖音上滑换作品」需要 ≥2 条） */
+const VIDS = Math.max(1, Number(new URLSearchParams(location.search).get("vids") || 1));
+const IDS = Array.from({ length: VIDS }, (_, i) => 991 + i);
 
 const video = (id: number, title: string) => ({
   id, title, cover: "", tags: [], score: 0, episode_count: EPS, total_episodes: EPS,
@@ -45,7 +48,7 @@ const invoke = (cmd: string, args: Record<string, unknown> = {}) => {
   if (cmd === "app_boot") return Promise.resolve({ user: { id: 7, nickname: "验收" }, logged_in: true, base: "https://fixture.invalid" });
   if (cmd === "debug_log" || cmd === "playback_log_write") return Promise.resolve();
   if (cmd === "playback_log_status") return Promise.resolve({ enabled: false, path: null, error: null });
-  if (cmd === "api_video") return Promise.resolve(DETAIL);
+  if (cmd === "api_video") return Promise.resolve({ ...DETAIL, id: Number(args.id ?? CUR_ID), title: `验收剧集${args.id ?? CUR_ID}` });
   /* 地址必然失败：只关心控件，不关心解码 */
   if (cmd === "api_play") return Promise.resolve({
     id: CUR_ID, ep_num: Number(args.ep ?? 1), duration: 90, title: "验收剧集",
@@ -112,7 +115,7 @@ function Page() {
     <AppProvider>
       <div style={{ position: "relative", width: "100%", height: "100%", background: "#000" }}>
         <EpisodePlayer
-          videoIds={[CUR_ID]} startIndex={0} title="验收剧集" mode={ENDLESS ? "context" : "context"}
+          videoIds={IDS} startIndex={0} title="验收剧集" mode={ENDLESS ? "context" : "context"}
           endless={ENDLESS} kind="video" active bottomInset={0}
           onBack={() => { (window as any).__back = ((window as any).__back || 0) + 1; }}
         />
