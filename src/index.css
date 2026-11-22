@@ -706,6 +706,18 @@ html.plat-android .hg-num { transform: translateY(1px); }
 }
 .hg-endcard-x::after { content: ""; position: absolute; inset: -6px; border-radius: 999px; }
 .hg-endcard-x:active { background: rgba(255, 255, 255, .20); }
+/* 双击点赞：中央红心一次性放大淡出（600ms） */
+.hg-like-burst { display: inline-flex; animation: hg-like-burst 600ms cubic-bezier(.2,.8,.2,1) forwards; }
+@keyframes hg-like-burst {
+  0% { transform: scale(.4); opacity: 0; }
+  25% { transform: scale(1.15); opacity: 1; }
+  60% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(1.25) translateY(-14px); opacity: 0; }
+}
+
+/* 横屏全屏左上角返回：视觉 36 圆片、热区 48×48（::after 撑在按钮自己身上），图标不缩放 */
+.hg-fs-back::after { content: ""; position: absolute; inset: -6px; border-radius: 999px; }
+
 /* ===== 双击快进/快退瞬时提示（v3.0.11 方案 A · 黑胶囊） =====
    高 28 / 圆角 999 / rgba(0,0,0,.62) + 8px 模糊 / 字号 15 / 内边距 12×6。
    动效：120ms 淡入 → 停留 600ms → 200ms 淡出（父级 800ms 卸载）。 */

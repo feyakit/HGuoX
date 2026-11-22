@@ -61,13 +61,25 @@ try {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
 
+  /* v3.0.11 起「全屏」= 屏幕实际是横的（状态源唯一），所以全屏场景要真的换视口 +
+     派发 resize/orientationchange，而不是靠一个 store 开关。 */
   const boot = async (endless, fs) => {
-    await page.goto(`${origin}tests/player-modes.html?endless=${endless ? 1 : 0}&fs=${fs ? 1 : 0}`, { waitUntil: "networkidle" });
+    await page.setViewportSize({ width: 360, height: 640 });
+    await page.goto(`${origin}tests/player-modes.html?endless=${endless ? 1 : 0}&fs=0`, { waitUntil: "networkidle" });
     await page.waitForSelector(".player-root", { timeout: 10000 });
     await page.waitForTimeout(700);
+    if (fs) {
+      await page.setViewportSize({ width: 640, height: 360 });
+      await page.evaluate(() => {
+        window.dispatchEvent(new Event("resize"));
+        window.dispatchEvent(new Event("orientationchange"));
+      });
+      await page.waitForTimeout(450);
+    }
     /* 唤出控件：点画面中部（收起态点一下会唤出） */
-    await page.touchscreen.tap(180, 300);
-    await page.waitForTimeout(350);
+    const cx = fs ? 320 : 180, cy = fs ? 200 : 300;
+    await page.touchscreen.tap(cx, cy);
+    await page.waitForTimeout(400);
   };
 
   for (const [key, endless, fs] of [["douyin-portrait", true, false], ["douyin-fullscreen", true, true],
@@ -100,49 +112,23 @@ try {
   });
 
 
-  /* ───────── 审计 #6：控件收起后第一下点击不再被吞 ───────── */
-  const hiddenTap = async (endless, fs) => {
-    await page.goto(`${origin}tests/player-modes.html?endless=${endless ? 1 : 0}&fs=${fs ? 1 : 0}`, { waitUntil: "networkidle" });
-    await page.waitForSelector(".player-root", { timeout: 10000 });
-    await page.waitForTimeout(500);
-    await page.touchscreen.tap(180, 300);             // 先唤出一次，量出「倍速」胶囊的真实坐标
-    await page.waitForTimeout(400);
-    const at = await page.evaluate(() => {
-      const seg = [...document.querySelectorAll(".player-root .hg-seg")].find(b => /倍速/.test(b.getAttribute("aria-label") || ""));
-      if (!seg) return null;
-      const r = seg.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (seg.textContent || "").trim() };
-    });
-    if (!at) return { error: "找不到倍速胶囊" };
-    /* 等控件自动收起（全屏 1.2s / 竖屏 3s，留足余量） */
-    await page.waitForTimeout(3600);
-    const hidden = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
-    await page.touchscreen.tap(at.x, at.y);            // 收起态，点在那个胶囊原来的位置
-    await page.waitForTimeout(700);
-    const after = await page.evaluate(() => ({
-      segs: [...document.querySelectorAll(".player-root .hg-seg")].map(b => (b.textContent || "").trim()),
-    }));
-    return { at, hiddenCount: hidden, after };
-  };
-
-  await step("审计 #6：收起态点「倍速」位置 → 唤出控件并一并执行（1x→1.25x）", async () => {
-    const r = await hiddenTap(false, false);
-    assert.ok(!r.error, r.error || "");
-    assert.equal(r.hiddenCount, 0, `收起后仍有 ${r.hiddenCount} 个胶囊`);
-    assert.ok(r.after.segs.some(s => /1\.25x/.test(s)), `点完胶囊=${JSON.stringify(r.after.segs)}`);
-  });
-
-  await step("审计 #6：收起态点画面空白处 → 只唤出，不改播放状态", async () => {
-    await page.goto(`${origin}tests/player-modes.html?endless=0&fs=0`, { waitUntil: "networkidle" });
+  /* ───────── v3.0.11 手势重分工：收起态单击 = 暂停/播放（不再「只唤出」） ───────── */
+  await step("收起态单击画面 → 播放/暂停一次，并把控件亮出来", async () => {
+    await page.setViewportSize({ width: 360, height: 640 });
+    await page.goto(`${origin}tests/player-modes.html?endless=0&fs=0&eps=5`, { waitUntil: "networkidle" });
     await page.waitForSelector(".player-root");
-    await page.waitForTimeout(3600);
-    const before = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
-    await page.touchscreen.tap(180, 200);              // 画面上部空白（不是任何控件）
-    await page.waitForTimeout(500);
-    const after = await page.evaluate(() => [...document.querySelectorAll(".player-root .hg-seg")].map(b => (b.textContent || "").trim()));
-    assert.equal(before, 0, `收起前已有 ${before} 个胶囊`);
-    assert.ok(after.some(s => /1x/.test(s)), `唤出后胶囊=${JSON.stringify(after)}`);
-    assert.ok(!after.some(s => /1\.25x/.test(s)), `空白处点击误触发了倍速：${JSON.stringify(after)}`);
+    await page.waitForTimeout(3600);                 // 等控件自动收起
+    const hidden = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
+    await page.evaluate(() => { window.gestureProbe.play = 0; window.gestureProbe.pause = 0; });
+    await page.touchscreen.tap(180, 200);
+    await page.waitForTimeout(600);
+    const r = await page.evaluate(() => ({
+      toggles: window.gestureProbe.play + window.gestureProbe.pause,
+      segs: document.querySelectorAll(".player-root .hg-seg").length,
+    }));
+    assert.equal(hidden, 0, `收起前仍有 ${hidden} 个胶囊`);
+    assert.equal(r.toggles, 1, `播放/暂停调用 ${r.toggles} 次`);
+    assert.ok(r.segs > 0, "单击后控件没有亮出来");
   });
 
   /* ───────── 审计 #8：片尾双触发只取一批推荐 ───────── */

@@ -27,6 +27,8 @@
     "test:seek-hint": "node scripts/shoot-seek-hint.mjs",
     "test:seek-symmetry": "node scripts/verify-seek-hint-symmetry.mjs",
     "test:fav-count": "node scripts/test-fav-count.mjs",
+    "test:fs-entry": "node scripts/test-fs-entry.mjs",
+    "test:gesture-map": "node scripts/test-gesture-map.mjs",
     "test:rank-swipe": "node scripts/test-rank-swipe.mjs",
     "test:cards-badges": "node scripts/test-cards-badges.mjs",
     "test:keyboard-sheet": "node scripts/test-keyboard-sheet.mjs",

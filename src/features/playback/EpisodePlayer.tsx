@@ -25,12 +25,12 @@ import { getHoldZone, HOLD_DELAY_MS, type HoldZone } from "../feed/mobileHold";
 import { playEnter, playExit, originFromPoint } from "./fsTransition";
 import { useFadeMount } from "../../shared/lib/useFadeMount";
 import {
-  GESTURE, PLAYER_TIMING, EPISODE_EASE, canSeek, doubleTapAction, episodeDrag, episodeIntent,
+  GESTURE, PLAYER_TIMING, EPISODE_EASE, canSeek, episodeDrag, episodeIntent,
   episodePageProgress, isDoubleTap, isEdgeBackStart,
   lockAxis, relativeSeek, rotationLocked, seekDeltaSeconds, snapSeek, tapVerdict, type Axis,
 } from "./playerGestures";
 import {
-  IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IGlobe, IHeart, IHeartF, IMore,
+  IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, IExpand, IFileText, IGlobe, IHeart, IHeartF, IMore,
   IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute } from "../../shared/ui/icons";
 import { EndCard } from "./EndCard";
 import { SeekHint } from "./SeekHint";
@@ -214,6 +214,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const theater = store.theater;
   const setTheater = store.setTheater;
   const fs = store.fs;
+  /* 「转屏被系统拒绝」的唯一标记：只有它能让移动端在竖屏下保持沉浸全屏（失败兜底）。
+     移动端 fs 的**唯一写入口**是下面那条由实际方向推导的 effect，任何地方都不再直接 setFs。 */
+  const [fsDenied, setFsDenied] = useState(false);
   const clean = store.clean;
   const setClean = store.setClean;
   const setFs = store.setFs;
@@ -290,10 +293,16 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     edge: boolean;
     /* 舞台高度（换集门槛按屏高百分比算） */
     stageH: number;
+    /* 横屏三区：起手点横向占比（0..1）+ 该手势开始时的亮度/音量（跟手用基准值） */
+    startFrac: number;
+    brightnessAt: number;
+    volumeAt: number;
+    zoneKind?: "left" | "mid" | "right";
   } | null>(null);
-  /* 单击 / 双击判定：
-     单击 = 两态（控件收起→唤出；可见→暂停/播放）；
-     双击 = 三分法：左 1/3 −5s / 中 1/3 播放暂停 / 右 1/3 +5s（窗口 280ms，见 playerGestures.tapZone）。 */
+  /* 单击 / 双击判定（v3.0.11 重分工，用户定稿）：
+     单击 = 播放/暂停（**不再负责唤出控件**），延时 doubleTapMs 确认无双击才执行；
+     双击 = 点赞（与右侧点赞按钮同一 action，中央红心动效）；**不再 seek**；
+     长按 = 2x（HOLD_DELAY_MS 到点即 mode=hold，单击/双击判定直接作废）。 */
   const tapRef = useRef<{ lastAt: number; timer: number | null }>({ lastAt: 0, timer: null });
   /* 瞬时的 seek 提示（双击/松手后 800ms 消失）：不新增常驻控件，样式沿用现有胶囊类 */
   const [seekHint, setSeekHint] = useState<{ delta: number; target: number; side: "left" | "right" } | null>(null);
@@ -307,10 +316,26 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const [vpLandscape, setVpLandscape] = useState(
     () => typeof window !== "undefined" && window.innerWidth > window.innerHeight,
   );
+  /* 移动端全屏 = 屏幕实际是横的（状态源唯一）：
+     `innerWidth > innerHeight` 由 resize / orientationchange 更新到 vpLandscape，
+     这里把它写进外壳要用的 store.fs；转屏被拒时用 fsDenied 兜底成「竖屏沉浸」。
+     桌面仍走原生 Fullscreen API 那一套（store.fs 由 fullscreenchange 写）。 */
+  useEffect(() => {
+    if (isDesktop) return;
+    setFs(vpLandscape || fsDenied);
+  }, [isDesktop, vpLandscape, fsDenied, setFs]);
+
   /* 进出全屏过渡期多次续播，防止 iOS 把播放打断 */
   const keepAliveTimers = useRef<number[]>([]);
   /* 双指缩放：scale 1~4，平移跟手指 */
   const [zoom, setZoom] = useState({ s: 1, x: 0, y: 0, g: false });
+  /* 横屏左 1/3 上/下滑 = 画面亮度（CSS filter，不碰系统亮度）：0.4～1.6 */
+  const [brightness, setBrightness] = useState(1);
+  /* 横屏中 1/3 / 左 1/3 / 右 1/3 上下滑的 HUD（亮度 % / 音量 %） */
+  const [zoneHud, setZoneHud] = useState<{ kind: "brightness" | "volume"; value: number } | null>(null);
+  const zoneHudTimer = useRef<number | undefined>(undefined);
+  /* 双击点赞的中央红心 */
+  const [likeBurst, setLikeBurst] = useState(0);
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ d0: number; mx0: number; my0: number; s0: number; x0: number; y0: number } | null>(null);
 
@@ -556,7 +581,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     /* 先收掉会盖住宿主页的状态：全屏层 z-index 比栈页高，不收的话新页被压在下面，
       用户看到的就是「点了没反应」。 */
     setPanel(null);
-    setFs(false);
+    setFsDenied(false);
     setClean(false);
     showControls();
     /* 退出全屏的另一条路径（不是 exitFs）：必须同样把系统方向还回竖屏，
@@ -730,6 +755,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const cinemaBar = useFadeMount(!isDesktop && !fs && (scrubbing || !clean));
   const actionRail = useFadeMount(!fs && !clean && !isDesktop);
   const portraitVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w <= videoSize.h;
+  /* 横版片源：宽 > 高。只在**元数据到达后**才为真（videoSize 的 key 绑定 playKey + playUrl），
+     所以「全屏观看」入口不会先闪一下再消失；未知宽高一律按竖版处理（不显入口）。 */
+  const landscapeVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w > videoSize.h;
+  const srcAspect = landscapeVideo ? videoSize.h / videoSize.w : 0;
   /* 横屏全屏切集时新一段还没有解码帧、横屏舞台尚未旋转；旧逻辑会立刻按竖屏锚点弹一次，
      等舞台旋转后 ToastHost 又弹一次，看着像弹了两遍（上游 PR #191）。全屏下先把集数提示
      暂存，等新片真正播起来（尺寸已测到 + playingKey 跟上）再弹一次；竖屏/桌面即时弹。
@@ -1158,7 +1187,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       const activeFs = !!document.fullscreenElement;
       setFullscreen(activeFs);
       if (!isDesktop && !activeFs && uiRef.current.fs) {
-        setFs(false);
+        setFsDenied(false);
         showControls();
       }
     };
@@ -1220,6 +1249,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     /* 舞台坐标 = 屏幕坐标（不再有 CSS 旋转舞台，横屏是系统真转出来的） */
     const width = el.clientWidth || 1;
     const stageH = el.clientHeight || 1;
+    /* 控件优先（用户定稿）：指针落在按钮/控件上时不启动画面手势 ——
+       否则「点右侧点赞」「点选集」会同时被当成一次画面单击 → 暂停/播放。
+       进度条自己有一套 pointer 处理，它带 data-hg-control，同样在这里被放过。 */
+    const onControl = (e.target as HTMLElement | null)?.closest?.("button,[role='button'],[data-hg-control],[data-playback-unlock]");
+    if (onControl) { gesture.current = null; return; }
     const sx = e.clientX;
     const sy = e.clientY;
     // 按视觉矩形求真正的正方形（长按菜单热区）
@@ -1242,6 +1276,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       /* 按下这一刻控件是不是收起的：全屏态的 pointerdown 会先 wake() 把 idle 清掉，
          所以不能在 onUp 里读当前值，否则「点一下唤回」会被当成「点一下暂停」（P1-1）。 */
       hiddenAtDown: clean || (!isDesktop && fs && idle),
+      /* 起手点相对舞台宽度的位置（0..1）：横屏竖滑按「左/中/右 1/3」分工 */
+      startFrac: width > 0 ? Math.min(1, Math.max(0, (sx - rect.left) / width)) : 0.5,
+      brightnessAt: brightness,
+      volumeAt: volume,
       playing: videoRef.current?.el()?.paused === false,
       timer: window.setTimeout(() => {
         const cur = gesture.current;
@@ -1301,6 +1339,18 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           showControls();
           videoRef.current?.pause();
         }
+      } else if (fs && !isDesktop) {
+        /* 横屏竖滑分三区（用户定稿）：左 1/3 亮度、右 1/3 音量、中 1/3 切集/切作品。
+           竖屏**不走**这条分支 —— 竖屏上下滑仍是切集/切作品。 */
+        g.mode = "pan";
+        const third = g.startFrac < 1 / 3 ? "left" : g.startFrac > 2 / 3 ? "right" : "mid";
+        g.zoneKind = third;
+        logLine(`[gesture] fs zone start ${third} frac=${g.startFrac.toFixed(2)}`);
+        if (third !== "mid") {
+          window.clearTimeout(zoneHudTimer.current);
+          setZoneHud({ kind: third === "left" ? "brightness" : "volume",
+            value: third === "left" ? g.brightnessAt : g.volumeAt });
+        }
       } else {
         g.mode = "pan";
         /* 真机取证：竖滑换集不生效时，看这一行就知道被哪个条件挡了 */
@@ -1317,6 +1367,18 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       const target = Math.max(0, Math.min(total, g.base + seekDeltaSeconds(dx, total)));
       scrubTarget.current = target;
       setScrub({ pct: (target / total) * 100, target });
+    } else if (g.mode === "pan" && fs && g.zoneKind && g.zoneKind !== "mid") {
+      /* 跟手：上滑（dy<0）增大，1px ≈ 0.4%（用户定的垂直灵敏度） */
+      const pdy = msy - g.startY;
+      const next = Math.min(1.6, Math.max(0.4, (g.zoneKind === "left" ? g.brightnessAt : g.volumeAt) - pdy * 0.004));
+      if (g.zoneKind === "left") {
+        setBrightness(Math.min(1.6, Math.max(0.4, next)));
+      } else {
+        /* 应用内音量（video.volume），不碰系统媒体音量 */
+        setVolume(Math.min(1, Math.max(0, next)));
+      }
+      setZoneHud({ kind: g.zoneKind === "left" ? "brightness" : "volume",
+        value: g.zoneKind === "left" ? Math.min(1.6, Math.max(0.4, next)) : Math.min(1, Math.max(0, next)) });
     } else if (g.mode === "pan" && !fs && !endless && swipeEp && episodes.length > 1 && zoom.s <= 1.05) {
       const pdy = msy - g.startY;
       /* 速度辅助：短促一划也能切（普通上滑往往只有 20–30% 屏高） */
@@ -1399,8 +1461,15 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (g.playing && active) videoRef.current?.play();
       return;
     }
-    /* 上下划手势（全屏态屏蔽上下滑切集防误触） */
-    if (!cancelled && !fs && e && g.mode === "pan") {
+    /* 横屏三区：亮度/音量松手即结束（不需要提交），HUD 1.2s 后自己消失 */
+    if (g.mode === "pan" && fs && g.zoneKind && g.zoneKind !== "mid") {
+      setEpSlide({ y: 0, animate: true });
+      window.clearTimeout(zoneHudTimer.current);
+      zoneHudTimer.current = window.setTimeout(() => setZoneHud(null), 1200) as unknown as number;
+      return;
+    }
+    /* 上下划手势（竖屏切集/切作品；横屏仅中 1/3 才切） */
+    if (!cancelled && e && g.mode === "pan" && (!fs || g.zoneKind === "mid")) {
       const [ux2, uy2] = [e.clientX, e.clientY];
       const dy = uy2 - g.startY;
       const dtUp = Math.max(1, Date.now() - g.t);
@@ -1418,6 +1487,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         const want = dir === 1 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
         /* 抖音模式：竖滑固定「下一部」，不按集切（用户在这个模式里要的是换剧） */
         if (endless) { setEpSlide({ y: 0, animate: false }); go(dir); return; }
+        /* 横屏中 1/3：竖滑就是切集（不受「上下划切集」开关限制 —— 那个开关是给竖屏的） */
+        if (fs) {
+          if (want) { setEpSlide({ y: 0, animate: false }); setEpPreview(null); pickEp(want); }
+          else { reboundSlide(); toast(dir === 1 ? "已经是最后一集" : "已经是第一集", "info", "playback-hint"); }
+          return;
+        }
         if (swipeEp && episodes.length > 1 && want) {
           window.clearTimeout(epSlideTimer.current);
           /* 跟手收尾：先按手指方向把画面整屏滑出（220ms，ease-out-quint），
@@ -1480,57 +1555,24 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const tapDy = e ? e.clientY - g.startY : 0;
     if (!cancelled && g.mode === "idle" && tapVerdict(tapDx, tapDy, Date.now() - g.t) === "tap") {
       const now = Date.now();
+      /* 双击 = 点赞（与右侧点赞按钮同一条 store action：本地乐观 + 失败回滚都复用）。 */
       if (isDoubleTap(tapRef.current.lastAt, now)) {
         window.clearTimeout(tapRef.current.timer ?? undefined);
         tapRef.current = { lastAt: 0, timer: null };
-        const action = doubleTapAction(g.x, g.width);
-        if (action.kind === "toggle") {
-          /* 中区双击：播放/暂停，不出 seek 气泡（避免中间误触跳进度） */
-          videoRef.current?.toggle();
-          showControls();
-          armAutoHide();
-          return;
-        }
-        seekBy(action.seconds);
-        showControls();
+        setLikeBurst((n) => n + 1);
+        try { navigator.vibrate?.(12); } catch { /* ignore */ }
+        void onLike?.();
         return;
       }
-      const hidden = g.hiddenAtDown || clean || (!isDesktop && fs && idle);
       tapRef.current.lastAt = now;
       window.clearTimeout(tapRef.current.timer ?? undefined);
-      if (hidden) {
-        /* 收起态的第一下也进双击判定窗口（审计 #17）：原来这里立刻 showControls()，
-           第二下正好落在刚冒出来的暂停/选集按钮上 —— 双击变成一次误触。
-           现在 280ms 内先不铺控件：第二下仍落在视频层上、走上面的双击分支，
-           没等到第二下才唤出控件。
-           唤出之后再做一次命中测试（审计 #6）：如果这一下正好落在主操作控件（播放/暂停、
-           全屏、选集、锁…）上，就替用户补一次点击 —— 收起态下「点全屏钮要连点两下」以前
-           被读成「功能没反应」。位移/时长判定已经在上面把单击与双击、滑动分开了，
-           所以这里只对「一次干净的单击」生效，不会变成「一唤就播/就切」。 */
-        const root = (e?.currentTarget as HTMLElement | null)?.closest?.(".player-root") as HTMLElement | null;
-        const tx = e?.clientX ?? 0, ty = e?.clientY ?? 0;
-        tapRef.current.timer = window.setTimeout(() => {
-          tapRef.current = { lastAt: 0, timer: null };
-          showControls();
-          if (!root) return;
-          /* 等一帧让控件真正挂上（showControls 是 setState），再按坐标找元素 */
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (!mounted.current || controlsLocked) return;
-            const el = document.elementFromPoint(tx, ty) as HTMLElement | null;
-            const btn = el?.closest?.("button") as HTMLButtonElement | null;
-            if (!btn || !root.contains(btn) || btn.disabled) return;
-            /* 只认播放器自己那一层的主操作控件；结束卡、选集面板、评论区里的按钮不算 */
-            if (btn.closest('[data-hg-control="endcard"],[role="dialog"],[data-hg-overlay]')) return;
-            btn.click();
-          }));
-        }, GESTURE.doubleTapMs) as unknown as number;
-        return;
-      }
-      /* 可见状态：等过双击窗口再切换播放/暂停，避免双击被当成两次暂停 */
+      /* 单击：先等一个双击窗口，确认不是双击再切播放/暂停 ——
+         否则双击点赞的第一下会先把视频暂停。暂停后控件自动亮出来（暂停中 armAutoHide 不收），
+         播放中仍按 3s 自动收起。 */
       tapRef.current.timer = window.setTimeout(() => {
         tapRef.current = { lastAt: 0, timer: null };
         videoRef.current?.toggle();
-        armAutoHide();
+        showControls();
       }, GESTURE.doubleTapMs) as unknown as number;
     }
   };
@@ -1588,7 +1630,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       if (i !== idxRef.current) resolveSwipe(i);
     }
     setClean(false);
-    setFs(true);
+    setFsDenied(false);
     showControls();
     keepAlive();
     requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1601,7 +1643,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
          WebChromeClient.onShowCustomView 把 WebView 挪进全屏容器，等于重建一次视图：
          真机实测点全屏时 CDP 连续 RemoteDisconnected，播放进度有丢失风险。 */
       try { logLine("[orientation] 全屏 → 请求系统横屏"); } catch { /* ignore */ }
-      requestOrientation(true, () => toast("系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）", "info", "playback-hint"));
+      /* 失败兜底：停在竖屏沉浸（fsDenied=true 把 fs 顶起来），只提示、不伪造横屏 */
+      requestOrientation(true, () => {
+        setFsDenied(true);
+        toast("系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）", "info", "playback-hint");
+      });
       /* 800ms 后量一次视口，真机取证用：真转成功的判据是 innerWidth > innerHeight。
          只记日志不弹提示 —— 慢设备旋转可能超过 1s，误报比不报更烦。 */
       window.setTimeout(() => {
@@ -1616,7 +1662,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const fromRect = root ? root.getBoundingClientRect() : null;
     const wasFs = fs;
     setClean(false);
-    setFs(false);
+    setFsDenied(false);
     showControls();
     keepAlive();
     if (wasFs) requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -1663,10 +1709,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const onViewportChange = () => {
       const isLand = window.innerWidth > window.innerHeight;
       setVpLandscape((prev) => {
-        if (prev !== isLand && active) {
-          setFs(isLand);
-          keepAlive();
-        }
+        /* 不再在这里写 fs：横竖本身就是唯一状态源，推导 effect 会跟着改。
+           这里只负责「方向刚变时别把播放打断」。 */
+        if (prev !== isLand && active) keepAlive();
         return isLand;
       });
     };
@@ -1981,13 +2026,15 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     logLine(`[gesture] cancel mode=${g?.mode ?? "-"} moved=${moved}`);
                     onUp(!moved, e);
                   }} onLostPointerCapture={(e) => onUp(true, e)}>
-                <div style={{
+                <div data-hg-brightness={brightness.toFixed(2)} style={{
                   position: "absolute",
                   inset: 0,
                   /* 视频显式压在虚化之上（虚化 z-index:0 / 视频层 z-index:1），
                      不用负值 —— 负 z-index 在带背景的父级里会被吃掉。 */
                   isolation: "isolate",
                   zIndex: 1,
+                  /* 横屏左 1/3 上下滑调的就是这一层（CSS filter），控件与字幕不受影响 */
+                  filter: brightness !== 1 ? `brightness(${brightness.toFixed(2)})` : undefined,
                   transform: isDesktop ? undefined : `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s * epScale})`,
                   opacity: 1,
                   transformOrigin: "center center",
@@ -2058,6 +2105,36 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
               {/* 换源期间保留旧帧：poster 垫住画布，等新集首帧就绪（onPlaying）再淡出 */}
               {isActive && !isDesktop && holdFrame && posterUrl && (
                 <div aria-hidden="true" className="hg-ep-holdframe" style={{ backgroundImage: `url("${posterUrl}")` }} />
+              )}
+
+              {/* 「全屏观看」入口（用户定稿口径）：竖屏 + 横版片源才出现，两种模式一致。
+                  · 位置：视频画面底边再往下 8px —— 竖屏 contain 时画面高度 = 视口宽 × 片源高宽比，
+                    画面垂直居中，所以底边 y = (视口高 + 视口宽×比例) / 2；
+                  · 尺寸：行高 44、整行可点、图标 16 + 文字 13、居中（字号沿用现有 token，不新造）；
+                  · 它不是悬浮控件，故意**不跟 3s 自动收起**：它落在信箱黑边里，
+                    收起后还在原位，用户随时能点（真机上一收起来就找不到入口）。
+                  · stopPropagation：这一层在舞台手势面上，不拦的话点击会冒泡成「单击播放/暂停」。
+                  抖音/剧场两种模式共用同一段（只差手势语义，见 mode 分支）。 */}
+              {isActive && !isDesktop && !fs && !vpLandscape && landscapeVideo && (
+                <Button
+                  type="button"
+                  data-hg-control="fullscreen-entry"
+                  aria-label="全屏观看"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    logLine(`[orientation] 点击「全屏观看」 id=${curId} src=${videoSize.w}x${videoSize.h}`);
+                    enterFs();
+                  }}
+                  className="absolute left-0 right-0 z-20 flex items-center justify-center gap-1.5 pressable"
+                  style={{
+                    top: `calc((var(--vp-h, 100vh) + var(--vp-w, 100vw) * ${srcAspect.toFixed(4)}) / 2 + 8px)`,
+                    height: 44,
+                  }}
+                >
+                  <IExpand size={16} className="hg-ink-2" />
+                  <span className="text-[13px] font-medium hg-ink-2">全屏观看</span>
+                </Button>
               )}
 
               {/* 图文帖：没有视频就给个正文入口 */}
@@ -2135,7 +2212,15 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     <ICommentF size={26} className="hg-ink hg-ov-shadow" />
                     <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums">{fmt(meta.comment)}</span>
                   </Button>
-                  <Button type="button" onClick={() => enterFs()} className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable" aria-label="全屏横屏播放">
+                  {/* 侧栏全屏钮：横版片源时**隐藏但保留占位** —— 入口已经挪到画面下方那行，
+                      直接删掉会让点赞/收藏/评论整体下移 48px（用户明令不许位移）。
+                      竖版片源没有那行入口，这颗仍然是入口。 */}
+                  <Button type="button" onClick={() => enterFs()}
+                    className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable"
+                    aria-label="全屏横屏播放"
+                    aria-hidden={landscapeVideo && !vpLandscape ? true : undefined}
+                    tabIndex={landscapeVideo && !vpLandscape ? -1 : undefined}
+                    style={landscapeVideo && !vpLandscape ? { visibility: "hidden", pointerEvents: "none" } : undefined}>
                     <IExpand size={22} className="hg-ink hg-ov-shadow" />
                     <span className="text-[12px] hg-ink-2 hg-ov-shadow">全屏</span>
                   </Button>
@@ -2409,6 +2494,25 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                 </div>
               )}
 
+              {/* 双击点赞的中央红心（一次性：key 变化就重启动画，600ms 后由 CSS 自己消失） */}
+              {likeBurst > 0 && (
+                <div key={likeBurst} aria-hidden="true"
+                  className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
+                  <span className="hg-like-burst"><IHeartF size={96} className="text-neon drop-shadow-lg" /></span>
+                </div>
+              )}
+
+              {/* 横屏三区 HUD：亮度 / 音量（松手 1.2s 后自己消失） */}
+              {zoneHud && (
+                <div className="absolute inset-x-0 z-30 flex justify-center pointer-events-none" style={{ top: "40%" }}>
+                  <div className="hg-seekhint" data-hg-control="zone-hud">
+                    {zoneHud.kind === "brightness"
+                      ? <span>亮度 {Math.round((zoneHud.value / 1.6) * 100)}%</span>
+                      : <span>音量 {Math.round(zoneHud.value * 100)}%</span>}
+                  </div>
+                </div>
+              )}
+
               {/* 暂停 / 缓冲 / 错误 */}
               {isActive && paused && !err && (
                 <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
@@ -2569,14 +2673,18 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
             <span className="hg-scrim-dither" aria-hidden="true" />
           </div>
 
-          {/* 全屏顶部：返回退出全屏 + 剧名 + 集数 */}
-          <div className="absolute inset-x-0 z-40 flex items-center gap-2.5 px-4"
+          {/* 全屏顶部：**只有**左上角一个返回（用户定稿：不再需要「退出全屏」这个概念）。
+              点它 = 回竖屏，视频下方那行「全屏观看」原位恢复；系统返回键走同一条 exitFs。
+              热区 48×48（视觉仍是 36 的圆片、图标 18 不缩放，::after 撑出来），
+              左偏移吃左侧安全区 --sar，避免横屏刘海/圆角压住。 */}
+          <div className="absolute inset-x-0 z-40 flex items-center gap-2.5"
             style={{
               top: "calc(var(--sat, 0px) + 6px)",
+              paddingLeft: "calc(var(--sar, 0px) + 16px)",
               paddingRight: 108,
             }}>
-            <Button onClick={exitFs} aria-label="退出全屏"
-              className="hg-chip-strong shrink-0 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1">
+            <Button onClick={exitFs} aria-label="返回" title="返回"
+              className="hg-fs-back hg-chip-strong relative shrink-0 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1">
               <IBack size={18} />
             </Button>
             <div className="min-w-0 flex items-center">
@@ -2705,34 +2813,21 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                iPhone 横过来（--sar: 48）按钮会压进圆角。 */
             right: "calc(var(--sar, 0px) + 0.75rem)",
           }}>
-          {/* 两个格子固定：[左] = 静音 / 退出全屏，[右] = 锁。
-              全屏把「退出全屏」放进左格子，锁就不会被挤走（进/退全屏坐标不变）。 */}
-          {fs ? (
-            <Button onClick={exitFs} aria-label="退出全屏" title="退出全屏"
-              className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><ICompress size={17} /></Button>
-          ) : (!clean && <Button onClick={() => setMuted(m => !m)} aria-label={muted ? "取消静音" : "静音"}
+          {/* 两个格子固定：[左] = 静音，[右] = 锁。
+              全屏态**不再有「退出全屏」钮**（用户定稿：横屏只认左上角返回），左格子空出来，
+              锁是右锚定的最后一个元素，位置与竖屏完全一致。 */}
+          {!fs && !clean && <Button onClick={() => setMuted(m => !m)} aria-label={muted ? "取消静音" : "静音"}
             className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1">
             {muted ? <IVolMute size={17} /> : <IVol size={17} />}
-          </Button>)}
+          </Button>}
           <Button onClick={lockControls} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false}
             className={`hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1${clean ? " hidden" : ""}`}><ILockF size={17} /></Button>
         </div>
       )}
-      {/* 控件收起（idle）时的「一步退出全屏」热区：48×48，与上面那个可见的退出钮同一个角，
-          但**不画任何东西**（透明无边框、无子元素）—— 收起态下用户点屏幕只想要回控件，
-          全屏想退却要「点一下唤出 → 再点退出」两步，这里补上直接可点的位置。
-          放在舞台之外，不参与视频区的手势判定。 */}
-      {!isDesktop && fs && idle && !controlsLocked && active && (
-        <button type="button" onClick={exitFs} aria-label="退出全屏" title="退出全屏"
-          style={{
-            position: "absolute",
-            top: "max(calc(var(--sat, 0px) + 6px), 53px)",
-            right: "calc(var(--sar, 0px) + 0.75rem)",
-            width: 48, height: 48,
-            padding: 0, border: 0, background: "transparent",
-            WebkitTapHighlightColor: "transparent", zIndex: 40,
-          }} />
-      )}
+      {/* 收起态的退出路径（用户定稿）：**不再有隐藏的右上角热区**。
+          横屏收起后点屏幕任意处 → 控件唤出（收起态首击本就只唤出，见 tapVerdict 分支），
+          左上角返回随控件一起出现；若这一下正好点在返回钮上，唤出后会同帧补一次点击，
+          一次点击即可退出全屏（审计 #6 的机制）。 */}
       <TagBlockMenu open={active && tagMenu} tags={meta.tags} initialSelected={tagMenuSeed} onClose={() => setTagMenu(false)} />
       {/* 线路面板：播放页内就地弹，不跳设置页 */}
       {!isDesktop && <LineQuickSwitch open={active && lineOpen} onClose={() => setLineOpen(false)} />}
