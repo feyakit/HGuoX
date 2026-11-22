@@ -1473,9 +1473,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       tapRef.current.lastAt = now;
       window.clearTimeout(tapRef.current.timer ?? undefined);
       if (hidden) {
-        /* 收起状态：立刻唤出，体感要跟手 */
-        tapRef.current.timer = null;
-        showControls();
+        /* 收起态的第一下也进双击判定窗口（审计 #17）：原来这里立刻 showControls()，
+           第二下正好落在刚冒出来的暂停/选集按钮上 —— 双击变成一次误触。
+           现在 280ms 内先不铺控件：第二下仍落在视频层上、走上面的双击分支，
+           没等到第二下才唤出控件。 */
+        tapRef.current.timer = window.setTimeout(() => {
+          tapRef.current = { lastAt: 0, timer: null };
+          showControls();
+        }, GESTURE.doubleTapMs) as unknown as number;
         return;
       }
       /* 可见状态：等过双击窗口再切换播放/暂停，避免双击被当成两次暂停 */
