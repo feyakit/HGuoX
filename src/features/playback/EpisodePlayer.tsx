@@ -2572,14 +2572,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
             </div>
           </div>
 
-          <Button onClick={exitFs} aria-label="退出全屏"
-            className="hg-chip-strong absolute z-40 w-9 h-9 rounded-full backdrop-blur-md flex items-center justify-center pressable elev-1"
-            style={{
-              top: rotated ? 12 : "calc(var(--sat, 0px) + 6px)",
-              right: rotated ? "calc(var(--sab, 0px) + 12px)" : 12,
-            }}>
-            <ICompress size={18} />
-          </Button>
+          {/* 右上角的「退出全屏」已并进下面那块右上控件组（占竖屏「静音」的格子）：
+              以前它单独定在 right:12，竖屏那块在 right:56 —— 一进全屏锁就被挤左 44px，
+              用户看到的就是「右上两个按钮位置会变」。现在两个格子固定，锁永远在最右。 */}
 
           {/* 全屏底栏：当前/总时长 + 缩放还原/倍速/选集/下集 */}
           <div className="absolute inset-x-0 z-40 flex items-center gap-2.5 px-4"
@@ -2692,17 +2687,24 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       {!isDesktop && !controlsLocked && active && (!fs || !idle) && (
         <div className={`absolute z-40 flex items-center gap-2`}
           style={{
-            top: rotated ? 12 : "calc(var(--sat, 0px) + 6px)",
-            /* 横向只吃**左右**安全区（刘海 / 圆角）。以前竖屏写死 right-3、旋转分支用的是
-               --sab（那是**底部**安全区）→ iPhone 横过来后按钮既不避开 48px 的刘海，
-               又因为 --sab 34→21 自己横向挪 13px；实测把 --sar 设成 48px，x 一点不动。
-               竖屏仍用 0.75rem（= 原来的 right-3），Android 上位置一个像素都不变。 */
-            right: fs ? "calc(var(--sar, 0px) + 56px)" : "calc(var(--sar, 0px) + 0.75rem)",
+            /* 竖向：竖屏吃顶部安全区（Android 49 → 55、iPhone 47 → 53）。状态栏在横屏/全屏会消失，
+               env(safe-area-inset-top) 掉到 0（--sat 的下限 24）→ 这一块会自己上移 23px。
+               用户要的是「位置不能变」，所以用 53px 兜底：竖屏仍是原值，横屏不再上移。 */
+            top: rotated ? 12 : "max(calc(var(--sat, 0px) + 6px), 53px)",
+            /* 横向只吃**左右**安全区（刘海 / 圆角）。以前竖屏写死 right-3、没有算 --sar，
+               iPhone 横过来（--sar: 48）按钮会压进圆角。伪横屏（rotated）里整块舞台被
+               rotate(90deg)，局部 right 对应的是**物理底边**，所以那里仍用 --sab。 */
+            right: rotated ? "calc(var(--sab, 0px) + 0.75rem)" : "calc(var(--sar, 0px) + 0.75rem)",
           }}>
-          {!fs && !clean && <Button onClick={() => setMuted(m => !m)} aria-label={muted ? "取消静音" : "静音"}
+          {/* 两个格子固定：[左] = 静音 / 退出全屏，[右] = 锁。
+              全屏把「退出全屏」放进左格子，锁就不会被挤走（进/退全屏坐标不变）。 */}
+          {fs ? (
+            <Button onClick={exitFs} aria-label="退出全屏" title="退出全屏"
+              className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1"><ICompress size={17} /></Button>
+          ) : (!clean && <Button onClick={() => setMuted(m => !m)} aria-label={muted ? "取消静音" : "静音"}
             className="hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1">
             {muted ? <IVolMute size={17} /> : <IVol size={17} />}
-          </Button>}
+          </Button>)}
           <Button onClick={lockControls} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false}
             className={`hg-chip w-9 h-9 rounded-full flex items-center justify-center pressable elev-1${clean ? " hidden" : ""}`}><ILockF size={17} /></Button>
         </div>
