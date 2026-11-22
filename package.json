@@ -17,6 +17,7 @@
     "test:post-hot": "node scripts/test-post-detail-hot.mjs",
     "test:post-flicker": "node scripts/test-post-flicker.mjs",
     "test:favorites-return": "node scripts/test-favorites-return.mjs",
+    "test:audit-list-cache": "node scripts/test-audit-list-cache.mjs",
     "test:tab-swipe": "node scripts/test-tab-swipe.mjs",
     "test:cat-tabs": "node scripts/test-cat-tabs.mjs",
     "test:posts-line-refresh": "node scripts/test-posts-line-refresh.mjs",
