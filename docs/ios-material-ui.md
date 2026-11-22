@@ -5,9 +5,9 @@
 ## 样式与组件
 
 - `src/styles/ios.css`：浅色珍珠底、深色炭灰底及语义色；玻璃材质用于导航、工具栏和弹层，内容保持实色。
-- `src/components/ios/controls.tsx`：原生按钮、输入框、表单、分段选择和表面容器。保留标准 HTML 属性、ref 和事件行为。
-- `src/components/ios/overlays.tsx`：统一 Sheet、Modal、DockPanel，处理嵌套顺序、焦点循环/恢复、背景 inert 和返回键。
-- `src/components/cards.tsx`：统一封面比例、标题、副标题、状态和观看进度。
+- `src/shared/ui/ios/controls.tsx`：原生按钮、输入框、表单、分段选择和表面容器。保留标准 HTML 属性、ref 和事件行为。
+- `src/shared/ui/ios/overlays.tsx`：统一 Sheet、Modal、DockPanel，处理嵌套顺序、焦点循环/恢复、背景 inert 和返回键。
+- `src/shared/ui/cards.tsx`：统一封面比例、标题、副标题、状态和观看进度。
 
 桌面标题栏保持 44px，与 macOS 原生标题栏约束一致。移动端导航使用安全区间距；触摸控件至少 44px。已保存的主题继续优先，首次启动按系统明暗外观选择。原有本地数据迁移和环境变量兼容保持生效。
 
