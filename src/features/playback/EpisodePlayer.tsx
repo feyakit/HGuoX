@@ -610,6 +610,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   }, [index, effectiveVideoIds, details]);
 
   const episodeLabel = useCallback((dir: 1 | -1) => {
+    /* 抖音模式（endless）不做集间切换：竖滑的实际行为是「换一部作品」，
+       预览文案也必须这么说，否则会给出一个它不会执行的「下一集 · 第N集」。 */
+    if (endless) {
+      const nb = dramaNeighbor(dir);
+      return `${dir === 1 ? "下一部" : "上一部"}${nb?.title ? ` · 《${nb.title}》` : " · 换一部"}`;
+    }
     const ep = epMap[curId] || 1;
     const want = dir === 1 ? ep + 1 : ep - 1;
     if (!episodes.some((row) => row.ep_num === want)) {
@@ -621,7 +627,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     return `${
       dir === 1 ? "下一集" : "上一集"
     } · 第${want}集${episodes.length ? ` / 共 ${episodes.length} 集` : ""}`;
-  }, [curId, epMap, episodes, dramaNeighbor]);
+  }, [curId, epMap, episodes, dramaNeighbor, endless]);
   /* 底栏分段胶囊：倍速 / 上一集 / 下一集（全屏是 倍速 / 选集 / 下集）共用这一个组件，
      不各写一套；每段没有自己的底与边框，只有一个外容器 + 1px 分隔线。 */
   const SegPill = ({ items }: { items: { key: string; label: ReactNode; ariaLabel?: string; onPress?: () => void; off?: boolean }[] }) => (
@@ -2598,13 +2604,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   },
                   label: <span className="hg-num relative">{effRate}x</span>,
                 },
-                ...(episodes.length > 1 ? [{
+                ...((!endless && episodes.length > 1) ? [{
                   key: "eps",
                   ariaLabel: `选集，当前第 ${curEp} 集，共 ${episodes.length} 集`,
                   onPress: () => setPanel("episodes"),
                   label: `第 ${curEp}/${episodes.length} 集`,
                 }] : []),
-                ...(episodes.length > 1 ? [{
+                ...((!endless && episodes.length > 1) ? [{
                   key: "next",
                   ariaLabel: curEp < episodes.length ? `下一集 第${curEp + 1}集` : "下一集",
                   off: curEp >= episodes.length,
