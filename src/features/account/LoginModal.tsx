@@ -105,11 +105,30 @@ export default function LoginModal() {
     setBusy(true); setErr("");
     const started = context.current;
     const epoch = requestEpoch.current;
+    const task = mode === "login" ? api.login(account, pass) : api.register(account, pass, mail);
+    /* 超时 ≠ 失败：Rust 侧 api_login/api_register 在**写令牌成功之后**才返回
+       （api.rs 的 set_if_revision），15s 的界面死线只说明「回包慢了」，令牌可能已经
+       写进去了。旧代码超时直接走失败分支、不 setUser，于是界面还是游客、后续请求却带着
+       这个令牌。这里超时后主动核对会话：真的登录了就补 setUser，让界面和令牌一致。 */
+    const reconcile = async (): Promise<boolean> => {
+      if (epoch !== requestEpoch.current || started.lineEpoch !== context.current.lineEpoch) return false;
+      try {
+        const session = await api.boot();
+        const next = session?.user && Number.isSafeInteger((session.user as User).id) && (session.user as User).id > 0
+          ? session.user as User : null;
+        if (!session?.logged_in || !next) return false;
+        if (!mounted.current) return false;
+        logLine(`[login] 超时后核对：会话实际已登录（${next.nickname || next.id}），补写界面状态`);
+        setUser(next, session.base);
+        setPassword("");
+        setLoginOpen(false);
+        beginGuestMerge();
+        toast(`线路较慢，登录已确认：${next.nickname || account}`, "ok");
+        return true;
+      } catch { return false; }
+    };
     try {
-      const result = await withDeadline(
-        mode === "login" ? api.login(account, pass) : api.register(account, pass, mail),
-        SUBMIT_TIMEOUT_MS,
-      );
+      const result = await withDeadline(task, SUBMIT_TIMEOUT_MS);
       if (!mounted.current) return;
       if (epoch !== requestEpoch.current || started.accountScope !== context.current.accountScope || started.lineEpoch !== context.current.lineEpoch) {
         setErr("账号或线路已变化，请重新登录");
@@ -122,7 +141,16 @@ export default function LoginModal() {
       toast(mode === "login" ? `欢迎回来，${result.user?.nickname || username}` : "注册成功", "ok");
     } catch (error) {
       logLine(`[login] 失败：${(error as Error)?.message || String(error)}`.slice(0, 160));
-      if (mounted.current) setErr(loginErrorMessage(error));
+      const timedOut = (error as Error)?.message === TIMEOUT_FLAG;
+      if (timedOut) {
+        /* 先核对一次（可能是上一次提交已经写入令牌）；没核对到就把迟到的那次请求当作
+           权威信号——它 resolve 说明 Rust 真的写成功了，那一刻立刻补 setUser。 */
+        const settled = await reconcile();
+        if (!settled) {
+          void task.then(() => reconcile(), () => { /* 真失败：什么都没写，保持游客态 */ });
+          if (mounted.current) setErr(loginErrorMessage(error));
+        }
+      } else if (mounted.current) setErr(loginErrorMessage(error));
     }
     finally { pending.current = false; if (mounted.current) setBusy(false); }
   };
