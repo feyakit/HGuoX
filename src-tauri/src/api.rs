@@ -932,10 +932,14 @@ pub async fn api_category(
 
 #[tauri::command]
 pub async fn api_rank(state: State<'_, Api>, kind: String) -> Result<Value, String> {
-    let kind = match kind.as_str() {
-        "recommend" | "potential" => kind,
-        _ => "hot".to_string(),
-    };
+    /* 热播榜以官网 SSR 页为准（上游 7b98b78）：JSON `/api/ranks/hot` 是历史累计热力，
+       和官网「实时热度」既不同序也不同值；解析失败再回退 JSON，契约不变。 */
+    if !matches!(kind.as_str(), "recommend" | "potential") {
+        if let Ok(rank) = crate::channel_page::fetch_hot_rank().await {
+            return Ok(rank);
+        }
+        return state.get("/api/ranks/hot").await;
+    }
     state.get(&format!("/api/ranks/{kind}")).await
 }
 
