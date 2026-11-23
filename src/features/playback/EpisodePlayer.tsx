@@ -186,7 +186,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
 
   const playbackClock = useMemo(() => createPlaybackClock(), []);
   const [duration, setDuration] = useState(0);
-  const [vsize, setVsize] = useState({ key: "", w: 0, h: 0 });
+  /* `scope` 记这条宽高属于哪部剧（同剧切集沿用，见下方 videoSize） */
+  const [vsize, setVsize] = useState({ key: "", scope: "", w: 0, h: 0 });
   const [paused, setPaused] = useState(false);
   const [controlsLocked, setControlsLocked] = useState(false);
   const [rate, setRate] = useState(1);
@@ -611,7 +612,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     return () => window.clearTimeout(epSlideTimer.current);
   }, [curId]);
   const measurementKey = JSON.stringify([accountScope, store.lineEpoch, permissionKey, playKey, playUrl]);
-  const videoSize = vsize.key === measurementKey ? vsize : { key: measurementKey, w: 0, h: 0 };
+  /* 同剧切集沿用本剧最近一次确认的宽高（上游 5ec709e）：新一集的元数据到达前 `videoSize`
+     不能归零，否则「全屏观看」入口、竖版 cover/contain、横屏舞台判定会在加载窗口里
+     先退回竖屏版式再跳回来 —— 看着是闪一下，实际是舞台丢了。
+     scope 用「同账号 + 同线路 + 同权限 + 同剧」，换剧/换账号/换线路立刻作废。 */
+  const sizeScope = JSON.stringify([accountScope, store.lineEpoch, permissionKey, curId]);
+  const videoSize = vsize.key === measurementKey || (vsize.scope === sizeScope && vsize.w > 0 && vsize.h > 0)
+    ? vsize
+    : { key: measurementKey, scope: sizeScope, w: 0, h: 0 };
   const showHoldGuide = false;
   useEffect(() => {
     const retry = () => {
@@ -770,11 +778,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (!pending) return;
     if (err) { pendingEpisodeToast.current = null; return; }
     if (!fs || isDesktop) { pendingEpisodeToast.current = null; toast(pending, "info", "playback-hint"); return; }
-    /* 等的是「这一段的画面」，不是上一段的：舞台要等自己的尺寸和首帧播放就绪才转。 */
-    if (playingKey !== playKey || videoSize.key !== measurementKey || videoSize.h <= 0) return;
+    /* 等的是「这一段的画面」，不是上一段的：舞台要等自己的尺寸和首帧播放就绪才转。
+       同剧切集时 videoSize 会沿用上一集的（5ec709e），所以这里只认 playingKey —— 新一集
+       真的播起来才弹，不靠尺寸 key 判定（否则沿用逻辑会让提示提前闪在竖屏位置）。 */
+    if (playingKey !== playKey || videoSize.h <= 0) return;
     pendingEpisodeToast.current = null;
     toast(pending, "info", "playback-hint");
-  }, [err, fs, isDesktop, measurementKey, playKey, playingKey, toast, videoSize]);
+  }, [err, fs, isDesktop, playKey, playingKey, toast, videoSize]);
   /* 舞台实测尺寸（用于判断是否真的有 letterbox：容器比画面更"方"才会出现上下黑边） */
   const [stageBox, setStageBox] = useState({ w: 0, h: 0 });
   /* 整页 pager 的进度（位移 / 舞台高，0..1）：高度还没量到时退回视频高，再退回 800 */
@@ -2083,7 +2093,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   onDuration={onDurationTick}
                   onSize={(w, h, key) => {
                     if (key !== measurementKey || !isCurrentPlayback()) return false;
-                    setVsize((prev) => (prev.key === key && prev.w === w && prev.h === h ? prev : { key, w, h }));
+                    setVsize((prev) => (prev.key === key && prev.scope === sizeScope && prev.w === w && prev.h === h ? prev : { key, scope: sizeScope, w, h }));
                     /* 真机取证：片源真实宽高（用户报"画面被压成窄横条"时，先看这里是不是 3.5:1） */
                     logLine(`[play] size id=${curId} ep=${curEp} ${w}x${h} fit=${portraitVideo ? "cover" : "contain"}`);
                     return true;
