@@ -1634,7 +1634,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       const wasHidden = g.hiddenAtDown;
       tapRef.current.timer = window.setTimeout(() => {
         tapRef.current = { lastAt: 0, timer: null };
-        if (wasHidden) showControls(); else hideControls();
+        /* 暂停中、面板打开时单击只「亮出」不「收起」：
+           需求写的是「暂停时控件常驻不收起」，面板开着更不该被一下点掉。 */
+        if (wasHidden || uiRef.current.paused || uiRef.current.panel) { showControls(); return; }
+        hideControls();
       }, GESTURE.doubleTapMs) as unknown as number;
     }
   };
