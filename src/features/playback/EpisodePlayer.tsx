@@ -68,6 +68,9 @@ const TAP_DELAY_MS = 180;
 /* 移动端控件自动隐藏：显示后这么久没操作才收起来；暂停中、面板打开时不收。
    **全屏与竖屏统一 3s**（原来全屏单独 1.2s，见 PLAYER_TIMING 的注释）。 */
 const AUTOHIDE_MS = PLAYER_TIMING.autohideMs;
+/* 点赞/收藏/关注的成功与失败提示共用播放提示槽（上游 9896092）：连点时原地替换，
+   不再堆成三张卡片；也让这三类提示和「已切到第 N 集」一样只占一行。 */
+const ACTION_TOAST_SLOT = "playback-hint";
 
 export type EpisodePlayerProps = {
   videoIds: number[];
@@ -1887,10 +1890,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       setLikeDelta((d) => d - step);
       if (!actionIsCurrent()) return;
       if (on) setHeartBurst((n) => n + 1);
-      toast(on ? "已加入喜欢" : "已取消喜欢", on ? "heart" : "info");
+      toast(on ? "已加入喜欢" : "已取消喜欢", on ? "heart" : "info", ACTION_TOAST_SLOT);
     } catch (error) {
       setLikeDelta((d) => d - step);
-      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "点赞失败，请重试", "info");
+      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "点赞失败，请重试", "info", ACTION_TOAST_SLOT);
     } finally { pendingActions.current.delete(pendingKey); }
   };
 
@@ -1901,9 +1904,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const on = !collected;
     try {
       await setCollected(kind, curId, on, kind === "video" && episodes.length > 0 ? episodes.length : undefined);
-      if (actionIsCurrent()) toast(on ? "已收藏" : "已取消收藏", on ? "star" : "info");
+      if (actionIsCurrent()) toast(on ? "已收藏" : "已取消收藏", on ? "star" : "info", ACTION_TOAST_SLOT);
     } catch (error) {
-      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "收藏失败，请重试", "info");
+      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "收藏失败，请重试", "info", ACTION_TOAST_SLOT);
     } finally { pendingActions.current.delete(pendingKey); }
   };
 
@@ -1916,9 +1919,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     const on = !store.follows.includes(uid);
     try {
       await setFollowing(uid, on);
-      if (actionIsCurrent()) toast(on ? `已关注 ${meta.author}` : "已取消关注", on ? "ok" : "info");
+      if (actionIsCurrent()) toast(on ? `已关注 ${meta.author}` : "已取消关注", on ? "ok" : "info", ACTION_TOAST_SLOT);
     } catch (error) {
-      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "关注失败，请重试", "info");
+      if (actionIsCurrent()) toast(error instanceof Error ? error.message : "关注失败，请重试", "info", ACTION_TOAST_SLOT);
     } finally { pendingActions.current.delete(pendingKey); }
   };
 
