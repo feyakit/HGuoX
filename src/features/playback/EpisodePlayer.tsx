@@ -25,7 +25,7 @@ import { getHoldZone, HOLD_DELAY_MS, type HoldZone } from "../feed/mobileHold";
 import { playEnter, playExit, originFromPoint } from "./fsTransition";
 import { useFadeMount } from "../../shared/lib/useFadeMount";
 import {
-  GESTURE, PLAYER_TIMING, EPISODE_EASE, canSeek, episodeDrag, episodeIntent,
+  GESTURE, PLAYER_TIMING, EPISODE_EASE, EPISODE_REBOUND_EASE, canSeek, episodeDrag, episodeIntent,
   episodePageProgress, isDoubleTap, isEdgeBackStart,
   lockAxis, relativeSeek, rotationLocked, seekDeltaSeconds, snapSeek, tapVerdict, type Axis,
 } from "./playerGestures";
@@ -50,14 +50,23 @@ const PLAYER_SCHEME: AccentScheme = {
    失败**不再退回 CSS 伪横屏**（那条路已整条删除）：只记日志 + 交给调用方弹一条 playback-hint，
    画面停在竖屏沉浸全屏 —— 宁可黑边多一点，也不要「转了 90° 但坐标没转」的半横屏。
    调用一律带日志，真机用「播放诊断」/logcat 分流「JS 没发」还是「发了没成」。 */
-function requestOrientation(landscape: boolean, onFail?: (error: unknown) => void) {
+/** 方向请求的三种语义（3.0.13）：
+    portrait / landscape = 锁死这一种（传感器转不动）；
+    unspecified = 还给系统（离开播放页用，别把整个 App 钉在竖屏）。 */
+export type OrientationMode = "portrait" | "landscape" | "unspecified";
+
+function requestOrientation(
+  landscape: boolean,
+  onFail?: (error: unknown) => void,
+  mode: OrientationMode = landscape ? "landscape" : "portrait",
+) {
   const fail = (error: unknown) => {
-    logLine(`[orientation] set_orientation(landscape=${landscape}) 失败：${String(error)}`);
+    logLine(`[orientation] set_orientation(${mode}) 失败：${String(error)}`);
     try { onFail?.(error); } catch { /* ignore */ }
   };
   try {
-    void invoke("set_orientation", { landscape })
-      .then(() => logLine(`[orientation] set_orientation(landscape=${landscape}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : ""}`))
+    void invoke("set_orientation", { landscape, mode })
+      .then(() => logLine(`[orientation] set_orientation(${mode}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : ""}`))
       .catch(fail);
   } catch (error) { fail(error); }
 }
@@ -265,7 +274,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
      不再往屏幕正中压一层遮罩（上游 dbbef9a 的机制；配色仍走我们的品牌紫）。 */
   const scrubbing = barPct !== null || scrub !== null;
   const activePct = barPct ?? (scrub ? scrub.pct / 100 : null);
-  const [epSlide, setEpSlide] = useState<{ y: number; animate: boolean; ms?: number }>({ y: 0, animate: false });
+  /* ease 缺省走 EPISODE_EASE（提交换集的吸附）；回弹单独给 ease-out（见 reboundSlide） */
+  const [epSlide, setEpSlide] = useState<{ y: number; animate: boolean; ms?: number; ease?: string }>({ y: 0, animate: false });
   /* 回弹时的轻微缩放：1 → .98 → 1，跟 transform 一起走（不额外叠一层 DOM） */
   const [epScale, setEpScale] = useState(1);
   /* 翻页时"下一页"的占位页：整页 pager 需要下一屏从 ±100% 进来（不带第二路视频解码，
@@ -303,9 +313,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     volumeAt: number;
     zoneKind?: "left" | "mid" | "right";
   } | null>(null);
-  /* 单击 / 双击判定（v3.0.11 重分工，用户定稿）：
-     单击 = 播放/暂停（**不再负责唤出控件**），延时 doubleTapMs 确认无双击才执行；
-     双击 = 点赞（与右侧点赞按钮同一 action，中央红心动效）；**不再 seek**；
+  /* 单击 / 双击判定（v3.0.13 第三轮重分工，用户拍定 A 方案）：
+     单击 = 唤出/收起控件（**不再暂停**），延时 doubleTapMs 确认无双击才执行；
+     双击 = 暂停/播放（**不再点赞**，点赞只由右侧按钮触发，画面中央红心已删）；
      长按 = 2x（HOLD_DELAY_MS 到点即 mode=hold，单击/双击判定直接作废）。 */
   const tapRef = useRef<{ lastAt: number; timer: number | null }>({ lastAt: 0, timer: null });
   /* 瞬时的 seek 提示（双击/松手后 800ms 消失）：不新增常驻控件，样式沿用现有胶囊类 */
@@ -338,8 +348,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 横屏中 1/3 / 左 1/3 / 右 1/3 上下滑的 HUD（亮度 % / 音量 %） */
   const [zoneHud, setZoneHud] = useState<{ kind: "brightness" | "volume"; value: number } | null>(null);
   const zoneHudTimer = useRef<number | undefined>(undefined);
-  /* 双击点赞的中央红心 */
-  const [likeBurst, setLikeBurst] = useState(0);
   const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const pinchRef = useRef<{ d0: number; mx0: number; my0: number; s0: number; x0: number; y0: number } | null>(null);
 
@@ -424,10 +432,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     setIdle(false);
     armAutoHide();
   }, [armAutoHide, setClean]);
-  /* 未达门槛的回弹：180ms 回到 0，同时 1 → .98 → 1 的轻微缩放（不抖、不硬跳） */
+  /* 未达门槛的回弹：200ms ease-out 回到 0，同时 1 → .98 → 1 的轻微缩放（不抖、不硬跳）。
+     曲线和提交换集分开：提交要「先快后缓」的吸附感，回弹要「刹得住」。 */
   const reboundSlide = useCallback(() => {
     setEpScale(0.98);
-    setEpSlide({ y: 0, animate: true, ms: GESTURE.episodeReboundMs });
+    setEpSlide({ y: 0, animate: true, ms: GESTURE.episodeReboundMs, ease: EPISODE_REBOUND_EASE });
     window.setTimeout(() => setEpScale(1), 90);
   }, []);
   const hideControls = useCallback(() => {
@@ -435,6 +444,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     window.clearTimeout(idleTimer.current);
     if (!isDesktop && fs) setIdle(true); else setClean(true);
   }, [isDesktop, fs, setClean]);
+  /* 作废挂起的「单击唤出/收起」：真按钮、拖动、长按一旦发生，那一下就不再是单击。
+     少了它就会出现「点一下画面、250ms 内再点选集 → 面板刚开控件又被收走」——
+     按钮本身不进延迟是对的，但前一次单击的计时器必须一起取消。 */
+  const cancelPendingTap = useCallback(() => {
+    if (tapRef.current.timer == null) return;
+    window.clearTimeout(tapRef.current.timer);
+    tapRef.current = { lastAt: 0, timer: null };
+  }, []);
   /* seek 提示气泡：显示 800ms 后自动消失（双击 ±5s / 松手吸附后各用一次；中区双击不出气泡） */
   const flashSeek = useCallback((delta: number, target: number) => {
     window.clearTimeout(seekHintTimer.current);
@@ -464,6 +481,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 离场复位：clean 是**全局**状态（App 里 `!clean` 才渲染底栏），
      播放器收起控件时置 true，不还原的话退出播放页后首页底栏会一直不出现。 */
   useEffect(() => () => setClean(false), [setClean]);
+  /* 离场清掉挂起的单击计时器：它要是活过了卸载，会把下一页的控件收走 */
+  useEffect(() => () => {
+    window.clearTimeout(tapRef.current.timer ?? undefined);
+    tapRef.current = { lastAt: 0, timer: null };
+  }, []);
   /* 进全屏：立刻重新起 1.2s 计时（控件先显示，到点收起）；退全屏：回到 3s 常规计时 */
   useEffect(() => {
     if (isDesktop) return;
@@ -474,9 +496,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     else armAutoHide();
   }, [paused, armAutoHide]);
   useEffect(() => {
-    if (panel) window.clearTimeout(hideTimer.current);
+    /* 面板打开时挂起的单击也要作废：否则 250ms 后 hideControls 把面板连控件一起收掉 */
+    if (panel) { window.clearTimeout(hideTimer.current); cancelPendingTap(); }
     else armAutoHide();
-  }, [panel, armAutoHide]);
+  }, [panel, armAutoHide, cancelPendingTap]);
 
   /* 线路名与「有没有多条」：读取固定线路 + 镜像列表，任一侧多于一条即可就地切换 */
   useEffect(() => {
@@ -588,9 +611,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     setFsDenied(false);
     setClean(false);
     showControls();
-    /* 退出全屏的另一条路径（不是 exitFs）：必须同样把系统方向还回竖屏，
-       否则剧集详情页会横着出现。 */
-    if (!isDesktop) requestOrientation(false);
+    /* 离开播放页的另一条路径（不是 exitFs）：方向还给系统（3.0.13 从「锁竖」改成
+       unspecified）—— 播放页把方向钉死之后，别的页面不该继续被钉着。 */
+    if (!isDesktop) requestOrientation(false, undefined, "unspecified");
     logLine(`[full-series] 打开剧集详情 id=${curId} 第${curEp}集`);
     const v = videoRef.current?.el();
     const curT = v && Number.isFinite(v.currentTime) ? v.currentTime : liveRef.current.t;
@@ -765,6 +788,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* scrub 期间即使处于净屏/收起态也要把底栏挂出来，否则删掉中央浮层后横拖没有反馈 */
   const cinemaBar = useFadeMount(!isDesktop && !fs && (scrubbing || !clean));
   const actionRail = useFadeMount(!fs && !clean && !isDesktop);
+  /* 右侧竖排的热区高 44、间距 14（横屏 10）：整组高度 = n×44 + (n-1)×gap，
+     锚点 58% 要的是「整组中心」，所以往上挪半高（见下面 top 的注释）。 */
+  const railItems = (kind === "video" ? 1 : 0) + 2 + (active ? 1 : 0);
+  const railGap = vpLandscape ? 10 : 14;
+  const railCenterOffset = (railItems * 44 + Math.max(0, railItems - 1) * railGap) / 2;
   const portraitVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w <= videoSize.h;
   /* 横版片源：宽 > 高。只在**元数据到达后**才为真（videoSize 的 key 绑定 playKey + playUrl），
      所以「全屏观看」入口不会先闪一下再消失；未知宽高一律按竖版处理（不显入口）。 */
@@ -1238,7 +1266,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
        真机上点画质胶囊会看起来像「胶囊自己消失了」，点「看全集」也会被这一下干扰
        （bar 在 pointerup 与 click 之间被卸载，click 直接丢失）。 */
     const pressed = e.target instanceof Element ? e.target.closest("[data-hg-control]") : null;
-    if (pressed) return;
+    if (pressed) { cancelPendingTap(); return; }
     /* 方向刚变过（rotation 动画期间）不接受新手势 */
     if (rotationLocked(rotatedAtRef.current, Date.now())) return;
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -1270,7 +1298,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
        否则「点右侧点赞」「点选集」会同时被当成一次画面单击 → 暂停/播放。
        进度条自己有一套 pointer 处理，它带 data-hg-control，同样在这里被放过。 */
     const onControl = (e.target as HTMLElement | null)?.closest?.("button,[role='button'],[data-hg-control],[data-playback-unlock]");
-    if (onControl) { gesture.current = null; return; }
+    if (onControl) { cancelPendingTap(); gesture.current = null; return; }
     const sx = e.clientX;
     const sy = e.clientY;
     // 按视觉矩形求真正的正方形（长按菜单热区）
@@ -1345,6 +1373,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
 
     if (g.mode === "idle") {
       if (g.timer) window.clearTimeout(g.timer);
+      cancelPendingTap();
       if (g.axis === "x") {
         if (g.edge && dx > 0) {
           /* 边缘返回优先：左缘 24px 内右滑=退一层，不参与 seek */
@@ -1408,7 +1437,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
          到了列表头尾按 dy×0.35 衰减 —— 拉得动一点但拉不走，比硬停更像手感。 */
       const dragDir: 1 | -1 = pdy <= 0 ? 1 : -1;
       const atEdge = !dramaNeighbor(dragDir) && !episodes.some((row) => row.ep_num === (epMap[curId] || 1) + dragDir);
-      const limit = g.stageH * 0.62;
+      /* 1:1 跟手：手指能把整页拖出去（limit = 整屏高），不再只给 62% 的余量 */
+      const limit = g.stageH;
       /* 跟手：0.85 阻尼直接把手指位移变成 translateY（只动 transform，不重排） */
       const visual = episodeDrag(pdy, atEdge);
       setEpSlide({ y: Math.max(-limit, Math.min(limit, visual)), animate: false });
@@ -1576,36 +1606,35 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     setEpPreview(null);
     setEpGhost(null);
     /*
-      单击 / 双击语义（重写）：
-        · 双击（280ms 内第二下）：三分法 —— 左 1/3 退 −5s、中 1/3 播放/暂停（不出气泡）、
-          右 1/3 进 +5s，左右区给 800ms 时间气泡；
-        · 单击两态：控件收起 → 唤出；控件可见 → 播放/暂停。
-      以前双击被拆成两次单击（唤出 + 收起）互相抵消，用户根本感受不到双击。
+      单击 / 双击语义（v3.0.13，用户拍定 A 方案）：
+        · 单击：等一个双击窗口（GESTURE.doubleTapMs）确认没有第二击，再**只**唤出 / 收起控件。
+          画面两态由按下那一刻的 hiddenAtDown 决定（收起 → 唤出；可见 → 收起），
+          不读当前 state —— 250ms 里 idle/clean 可能已经被自动收起改掉。
+        · 双击（窗口内两击、每击位移 <6px）：暂停 / 播放。暂停时控件常驻
+          （showControls + 暂停中 armAutoHide 直接 return），播放中照旧 3s 自动收起。
+        · 点赞只由右侧竖排按钮触发：双击点赞与画面中央红心已整段删除。
     */
     /* 单击判定必须同时看位移和时长：以前只看「模式还是 idle」，于是在死区内滑 6–8px
-       也被当成单击，一抖就把视频暂停了。6px ≤ 位移 < 10px 现在是无动作。 */
+       也被当成单击，一抖就把控件唤出/收起。6px ≤ 位移 < 8px 现在是无动作。 */
     const tapDx = e ? e.clientX - g.x : 0;
     const tapDy = e ? e.clientY - g.startY : 0;
     if (!cancelled && g.mode === "idle" && tapVerdict(tapDx, tapDy, Date.now() - g.t) === "tap") {
       const now = Date.now();
-      /* 双击 = 点赞（与右侧点赞按钮同一条 store action：本地乐观 + 失败回滚都复用）。 */
       if (isDoubleTap(tapRef.current.lastAt, now)) {
         window.clearTimeout(tapRef.current.timer ?? undefined);
         tapRef.current = { lastAt: 0, timer: null };
-        setLikeBurst((n) => n + 1);
-        try { navigator.vibrate?.(12); } catch { /* ignore */ }
-        void onLike?.();
+        videoRef.current?.toggle();
+        /* 暂停 → 控件亮出并常驻；播放 → 重新起 3s 计时（showControls 内部会做） */
+        showControls();
+        try { navigator.vibrate?.(10); } catch { /* ignore */ }
         return;
       }
       tapRef.current.lastAt = now;
       window.clearTimeout(tapRef.current.timer ?? undefined);
-      /* 单击：先等一个双击窗口，确认不是双击再切播放/暂停 ——
-         否则双击点赞的第一下会先把视频暂停。暂停后控件自动亮出来（暂停中 armAutoHide 不收），
-         播放中仍按 3s 自动收起。 */
+      const wasHidden = g.hiddenAtDown;
       tapRef.current.timer = window.setTimeout(() => {
         tapRef.current = { lastAt: 0, timer: null };
-        videoRef.current?.toggle();
-        showControls();
+        if (wasHidden) showControls(); else hideControls();
       }, GESTURE.doubleTapMs) as unknown as number;
     }
   };
@@ -1724,23 +1753,44 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
        · 组件卸载（返回上一页 / 换片）→ 还原竖屏；
        · 切后台（visibilitychange hidden）→ 还原竖屏，回来时若还在全屏再转回横屏。
      fs 用 ref 取最新值，避免每次开关全屏都重挂监听（cleanup 里会误还原）。 */
+  /* 已经下发过的「片源 → 方向」组合（`${curId}:${mode}`）：宽高每 120ms 被桩/解码器补一次，
+     不去重的话每个 loadedmetadata 都会打一条 set_orientation。 */
+  const orientationApplied = useRef("");
   const orientationRef = useRef({ fs: false });
   orientationRef.current = { fs };
   useEffect(() => {
     if (isDesktop) return undefined;
-    const setOrientation = (landscape: boolean) => {
-      requestOrientation(landscape);
-    };
     const onVisibility = () => {
-      if (document.visibilityState === "hidden") setOrientation(false);
-      else if (orientationRef.current.fs) setOrientation(true);
+      if (document.visibilityState === "hidden") requestOrientation(false, undefined, "unspecified");
+      else if (orientationRef.current.fs) requestOrientation(true);
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
-      setOrientation(false);
+      /* 离开播放页（卸载 / 失活）：方向恢复 unspecified，把控制权还给系统（3.0.13） */
+      orientationApplied.current = "";
+      requestOrientation(false, undefined, "unspecified");
     };
-  }, [isDesktop]);
+  }, [isDesktop, active]);
+
+  /* 按片源宽高锁方向（3.0.13，用户定稿）：
+       · 竖版片源（宽高比 ≤ 1）→ 锁 portrait：看竖屏剧时手一歪不会整页转成横屏；
+       · 横版片源 → 竖屏下**不主动转**（发 unspecified，跟随系统/用户的旋转，转过去就是全屏）；
+       · 横版的「全屏观看」→ enterFs 里锁 landscape；exitFs 里重新锁 portrait；
+       · 离开播放页 / 切后台 → unspecified（见下面那个 effect）。
+     插件失败不静默：一条 playback-hint，画面停在竖屏（不伪造横屏）。 */
+  useEffect(() => {
+    if (isDesktop || !active) return;
+    if (!videoSize.w || !videoSize.h) return;   // 宽高未到：按竖版处理，先不锁
+    const want: OrientationMode = videoSize.w <= videoSize.h ? "portrait" : "unspecified";
+    const key = `${curId}:${want}`;
+    if (orientationApplied.current === key) return;
+    orientationApplied.current = key;
+    logLine(`[orientation] 片源 ${videoSize.w}x${videoSize.h} → ${want}`);
+    requestOrientation(false, () => {
+      toast("系统未允许锁定屏幕方向：转动手机可能会横屏", "info", "playback-hint");
+    }, want);
+  }, [isDesktop, active, curId, videoSize.w, videoSize.h, toast]);
 
   /* 物理横置手机时自动进入全屏，竖回时自动退出全屏（对齐 LNPANDY 版）。
      只同步 fs 这**一个**状态：要不要转屏由 fs 单方面决定，不看设备上报。 */
@@ -2034,7 +2084,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   background: "#05060a",
                   transform: `translate3d(0, ${(epGhost.dir > 0 ? 1 : -1) * (pageStageH || 800) + epSlide.y}px, 0) scale(.98)`,
                   transition: epSlide.animate
-                    ? `transform ${epSlide.ms ?? GESTURE.episodeCommitMs}ms ${EPISODE_EASE}`
+                    ? `transform ${epSlide.ms ?? GESTURE.episodeCommitMs}ms ${epSlide.ease ?? EPISODE_EASE}`
                     : "none",
                 }}>
                   <span className="text-[15px] font-semibold text-white/70">{epGhost.label}</span>
@@ -2054,7 +2104,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     opacity: isDesktop ? 1 : 1 - 0.45 * pageProgress,
                     transition: isDesktop || zoom.g || !epSlide.animate
                       ? "none"
-                      : `transform ${epSlide.ms ?? GESTURE.episodeReboundMs}ms ${EPISODE_EASE}, opacity ${epSlide.ms ?? GESTURE.episodeReboundMs}ms ${EPISODE_EASE}`,
+                      : `transform ${epSlide.ms ?? GESTURE.episodeReboundMs}ms ${epSlide.ease ?? EPISODE_EASE}, opacity ${epSlide.ms ?? GESTURE.episodeReboundMs}ms ${epSlide.ease ?? EPISODE_EASE}`,
                     willChange: !isDesktop && Math.abs(epSlide.y) > 0 ? "transform, opacity" : undefined,
                   }}
                   onPointerDown={onDown} onPointerMove={onMove} onPointerUp={(e) => onUp(false, e)}
@@ -2080,7 +2130,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   transformOrigin: "center center",
                   transition: isDesktop || zoom.g || !epSlide.animate
                     ? "none"
-                    : `transform ${(epSlide.ms ?? GESTURE.episodeReboundMs)}ms ${EPISODE_EASE}`,
+                    : `transform ${(epSlide.ms ?? GESTURE.episodeReboundMs)}ms ${epSlide.ease ?? EPISODE_EASE}`,
                 }}>
                 <VideoSurface ref={videoRef} src={playUrl} poster={posterUrl} autoPlay active={active && !tagMenu && !showHoldGuide} muted={muted}
                   diagnosticContext={{ active: active && !tagMenu && !showHoldGuide, view: mode, kind, video_id: curId, episode: curEp }}
@@ -2151,11 +2201,11 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   · 位置：视频画面底边再往下 8px —— 竖屏 contain 时画面高度 = 视口宽 × 片源高宽比，
                     画面垂直居中，所以底边 y = (视口高 + 视口宽×比例) / 2；
                   · 尺寸：行高 44、整行可点、图标 16 + 文字 13、居中（字号沿用现有 token，不新造）；
-                  · 它不是悬浮控件，故意**不跟 3s 自动收起**：它落在信箱黑边里，
-                    收起后还在原位，用户随时能点（真机上一收起来就找不到入口）。
-                  · stopPropagation：这一层在舞台手势面上，不拦的话点击会冒泡成「单击播放/暂停」。
+                  · **3.0.13：并入控件层**，跟控件一起收/一起出（复用竖屏的 clean，不新增计时器）。
+                    位置/尺寸一个字没改，只是显隐条件多了 !clean —— 收起态点一下唤出就能看到它。
+                  · stopPropagation：这一层在舞台手势面上，不拦的话点击会冒泡成「单击唤出控件」。
                   抖音/剧场两种模式共用同一段（只差手势语义，见 mode 分支）。 */}
-              {isActive && !isDesktop && !fs && !vpLandscape && landscapeVideo && (
+              {isActive && !isDesktop && !fs && !vpLandscape && landscapeVideo && !clean && (
                 <Button
                   type="button"
                   data-hg-control="fullscreen-entry"
@@ -2231,39 +2281,48 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   </div>
                 </div>
               )}
-              {/* 右侧操作栏（移动端）：点赞 / 收藏 / 评论 / 全屏
-                  颜色写死不跟主题走：浅色主题下这些字必须仍是白色 */}
+              {/* 右侧操作栏（移动端）：点赞 / 收藏 / 评论 / 更多（3.0.13）
+                  颜色写死不跟主题走：浅色主题下这些字必须仍是白色。
+                  · 3.0.13 删掉「全屏」—— 入口统一到视频下方「全屏观看」那行，右上不再有第二颗；
+                  · 「更多」（video-preference-trigger，原来贴在底栏右端）并进这一列，当最后一项；
+                  · 整组垂直锚定在画面 58% 处（居中偏下，拇指好够），距右边缘 = 右安全区 + 12；
+                  · 间距 14（横屏 10），热区统一 44×44，图标 24（点赞 26）。
+                  位置一律走 top/transform，不再用 bottom 反推 —— 少一项不会让整组往下滑。 */}
               {actionRail.mounted && (
-                <div className={`mobile-video-action-rail absolute right-3 z-20 flex flex-col items-center ${actionRail.cls} ${vpLandscape ? "gap-1.5" : "gap-3"}`}
-                  style={{ bottom: vpLandscape ? "calc(var(--sab, 0px) + 12px)" : `calc(var(--sab, 0px) + ${bottomInset + 178}px)` }}>
+                <div className={`mobile-video-action-rail absolute z-30 flex flex-col items-center ${actionRail.cls}`}
+                  style={{
+                    right: "calc(var(--sar, 0px) + 12px)",
+                    /* 垂直锚定 58%：用**算出来的**半高偏移，不用 transform:translateY(-50%)
+                       —— .hg-fade-in 的 keyframes 以 `transform:none` 收尾且 fill-mode:both，
+                       会把行内 transform 永久盖掉（实测整组下坠半屏）。 */
+                    top: `calc(58% - ${railCenterOffset}px)`,
+                    /* 横屏的 .mobile-video-action-rail 是 2 列 grid，这里强制单列竖排 */
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: vpLandscape ? 10 : 14,
+                  }}>
                   {kind === "video" && (
                     <Button key={`like-${likeBump}`} onClick={() => void onLike()} disabled={likePending} aria-busy={likePending}
-                      className={`min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable${likeBump ? " hg-like-bump" : ""}`}
+                      className={`w-11 h-11 flex flex-col items-center justify-center gap-0.5 pressable${likeBump ? " hg-like-bump" : ""}`}
                       aria-pressed={liked} aria-label="点赞">
                       {liked ? <IHeartF size={26} className="text-neon" /> : <IHeart size={26} className="hg-ink hg-ov-shadow" />}
-                      <span className="text-[12px] text-white/90 tabular-nums">{fmt(likeCount)}</span>
+                      <span className="text-[12px] text-white/90 tabular-nums leading-none">{fmt(likeCount)}</span>
                     </Button>
                   )}
-                  <Button onClick={() => void onFav()} disabled={collectPending} aria-busy={collectPending} className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable" aria-pressed={collected} aria-label="收藏">
-                    {collected ? <IStarF size={26} className="hg-gold" /> : <IStar size={26} className="hg-ink hg-ov-shadow" />}
-                    <span className="text-[12px] text-white/90 tabular-nums">{fmt(collectCount)}</span>
+                  <Button onClick={() => void onFav()} disabled={collectPending} aria-busy={collectPending} className="w-11 h-11 flex flex-col items-center justify-center gap-0.5 pressable" aria-pressed={collected} aria-label="收藏">
+                    {collected ? <IStarF size={24} className="hg-gold" /> : <IStar size={24} className="hg-ink hg-ov-shadow" />}
+                    <span className="text-[12px] text-white/90 tabular-nums leading-none">{fmt(collectCount)}</span>
                   </Button>
-                  <Button onClick={() => setPanel("comments")} className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable" aria-label={`评论 ${fmt(meta.comment)} 条`}>
-                    <ICommentF size={26} className="hg-ink hg-ov-shadow" />
-                    <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums">{fmt(meta.comment)}</span>
+                  <Button onClick={() => setPanel("comments")} className="w-11 h-11 flex flex-col items-center justify-center gap-0.5 pressable" aria-label={`评论 ${fmt(meta.comment)} 条`}>
+                    <ICommentF size={24} className="hg-ink hg-ov-shadow" />
+                    <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums leading-none">{fmt(meta.comment)}</span>
                   </Button>
-                  {/* 侧栏全屏钮：横版片源时**隐藏但保留占位** —— 入口已经挪到画面下方那行，
-                      直接删掉会让点赞/收藏/评论整体下移 48px（用户明令不许位移）。
-                      竖版片源没有那行入口，这颗仍然是入口。 */}
-                  <Button type="button" onClick={() => enterFs()}
-                    className="min-w-11 min-h-11 flex flex-col items-center justify-center gap-1 pressable"
-                    aria-label="全屏横屏播放"
-                    aria-hidden={landscapeVideo && !vpLandscape ? true : undefined}
-                    tabIndex={landscapeVideo && !vpLandscape ? -1 : undefined}
-                    style={landscapeVideo && !vpLandscape ? { visibility: "hidden", pointerEvents: "none" } : undefined}>
-                    <IExpand size={22} className="hg-ink hg-ov-shadow" />
-                    <span className="text-[12px] hg-ink-2 hg-ov-shadow">全屏</span>
-                  </Button>
+                  {isActive && (
+                    <Button aria-label={endless ? "不感兴趣，跳过这条" : "不感兴趣"} title={endless ? "不感兴趣 · 立即跳过" : "不感兴趣 / 内容偏好"}
+                      onClick={dislikeCurrent} className="video-preference-trigger">
+                      <IMore size={24} aria-hidden="true" />
+                    </Button>
+                  )}
                 </div>
               )}
 
@@ -2372,61 +2431,80 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     </div>
                   )}
                   <div className="relative pt-1.5 pb-0">
-                    <div className="mobile-video-meta-copy relative z-30 flex flex-wrap items-center gap-2"
+                    {/* 底部操作行：**固定三段**（3.0.13）。
+                        以前是 flex-wrap + gap-2 + 条件渲染：集数文案变长（第 1/5 → 第 12/120）、
+                        线路胶囊在单线路时整颗消失，都会让「详情」被推着左右跳。
+                        现在：
+                          · 左段固定宽 88（集数胶囊），文案超出就省略，绝不推动别人；
+                          · 中段 flex-1 单行省略（详情）；
+                          · 右段站点域名，隐藏时用 visibility 保留同样宽度占位（不可点、无热区）。
+                        行高沿用现状 44（= min-h-11 热区），位置与改前逐像素一致。 */}
+                    <div className="mobile-video-meta-copy relative z-30 flex items-center"
                         data-hg-control="meta-bar"
-                        style={{ paddingRight: 76, pointerEvents: "auto" }}>
-                      {endless ? (
-                        <Button
-                          type="button"
-                          aria-label={kind === "video" && episodes.length > 1 ? `看全集，共 ${episodes.length} 集` : "剧集详情"}
-                          onClick={openFullSeries}
-                          className="min-h-11 flex items-center gap-1 text-[12px] font-semibold hg-ink hg-ov-shadow-strong pressable">
-                          <IList size={13} />
-                          {kind === "video" && episodes.length > 1 ? `看全集 · 共 ${episodes.length} 集` : "剧集详情"}
-                          <IChevR size={11} />
-                        </Button>
-                      ) : (
-                        <>
-                          {/* 入口永远在：集数没拿到时也给「选集」，进面板能看到原因并重试，
-                              不再出现"某些剧连入口都没有"（那是 detail 没回来，不是不需要入口）。 */}
-                          {kind === "video" && (
-                            <Button
-                              aria-label={episodes.length > 1
-                                ? `打开选集，当前第 ${curEp} 集，共 ${episodes.length} 集`
-                                : "打开选集（集数暂未取到，点击重试）"}
-                              data-hg-control="episodes-entry"
-                              onPointerDown={(e) => { e.stopPropagation(); }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                logLine(`[panel] open episodes at ${Math.round(e.clientX)},${Math.round(e.clientY)} eps=${episodes.length} detail=${detail ? "y" : "n"}`);
-                                if (episodes.length <= 1) setProxyRetry(v => v + 1); // 集数缺就顺手重拉一次详情
-                                setPanel("episodes");
-                              }}
-                              className="min-h-11 flex items-center gap-1 text-[12px] font-medium hg-ink-2 hg-ov-shadow-strong pressable">
-                              <IList size={13} />
+                        style={{ paddingRight: 76, pointerEvents: "auto", gap: 8, height: 44 }}>
+                      {/* —— 左段：集数胶囊（固定宽 88） —— */}
+                      <div className="shrink-0 flex items-center" style={{ width: endless ? undefined : 88, height: 44 }}>
+                        {endless ? (
+                          <Button
+                            type="button"
+                            aria-label={kind === "video" && episodes.length > 1 ? `看全集，共 ${episodes.length} 集` : "剧集详情"}
+                            onClick={openFullSeries}
+                            className="min-h-11 flex items-center gap-1 text-[12px] font-semibold hg-ink hg-ov-shadow-strong pressable">
+                            <IList size={13} />
+                            {kind === "video" && episodes.length > 1 ? `看全集 · 共 ${episodes.length} 集` : "剧集详情"}
+                            <IChevR size={11} />
+                          </Button>
+                        ) : kind === "video" ? (
+                          /* 入口永远在：集数没拿到时也给「选集」，进面板能看到原因并重试，
+                             不再出现"某些剧连入口都没有"（那是 detail 没回来，不是不需要入口）。 */
+                          <Button
+                            aria-label={episodes.length > 1
+                              ? `打开选集，当前第 ${curEp} 集，共 ${episodes.length} 集`
+                              : "打开选集（集数暂未取到，点击重试）"}
+                            data-hg-control="episodes-entry"
+                            onPointerDown={(e) => { e.stopPropagation(); }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              logLine(`[panel] open episodes at ${Math.round(e.clientX)},${Math.round(e.clientY)} eps=${episodes.length} detail=${detail ? "y" : "n"}`);
+                              if (episodes.length <= 1) setProxyRetry(v => v + 1); // 集数缺就顺手重拉一次详情
+                              setPanel("episodes");
+                            }}
+                            className="w-full min-w-0 min-h-11 flex items-center gap-1 text-[12px] font-medium hg-ink-2 hg-ov-shadow-strong pressable">
+                            <IList size={13} className="shrink-0" />
+                            <span className="truncate">
                               {episodes.length > 1
-                                ? (seriesEnded ? "选集" : `选集 · 第 ${curEp}/${episodes.length} 集`)
+                                ? (seriesEnded ? "选集" : `第 ${curEp}/${episodes.length} 集`)
                                 : "选集"}
-                            </Button>
-                          )}
+                            </span>
+                          </Button>
+                        ) : null}
+                      </div>
+                      {/* —— 中段：详情（flex-1，单行省略） —— */}
+                      <div className="min-w-0 flex-1 flex items-center" style={{ height: 44 }}>
+                        {!endless && (
                           <Button aria-label="视频详情"
                             data-hg-control="detail-entry"
                             onPointerDown={(e) => { e.stopPropagation(); }}
                             onClick={(e) => { e.stopPropagation(); logLine(`[panel] open detail at ${Math.round(e.clientX)},${Math.round(e.clientY)}`); setPanel("detail"); }}
-                            className="min-h-11 flex items-center gap-0.5 text-[12px] font-medium hg-ink-3 hg-ov-shadow-strong pressable">
-                            详情<IChevR size={11} />
+                            className="min-w-0 max-w-full min-h-11 flex items-center gap-0.5 text-[12px] font-medium hg-ink-3 hg-ov-shadow-strong pressable">
+                            <span className="truncate">详情</span><IChevR size={11} className="shrink-0" />
                           </Button>
-                        </>
-                      )}
-                      {isActive && <Button aria-label={endless ? "不感兴趣，跳过这条" : "不感兴趣"} title={endless ? "不感兴趣 · 立即跳过" : "不感兴趣 / 内容偏好"} onClick={dislikeCurrent}
-                        className="video-preference-trigger"><IMore size={19} aria-hidden="true" /></Button>}
-                      {/* 线路就地切换：一个小胶囊 + 播放页内的底部面板，不再跳设置页 */}
-                      {lineInfo.multi && (
+                        )}
+                      </div>
+                      {/* —— 右段：站点域名（线路就地切换）——
+                          单线路时**保留宽度占位**（visibility:hidden + 关掉热区），
+                          切换线路时右段出现也不会挤动「详情」。 */}
+                      <div className="shrink-0 flex items-center justify-end"
+                        style={{
+                          visibility: lineInfo.multi ? "visible" : "hidden",
+                          pointerEvents: lineInfo.multi ? "auto" : "none",
+                        }}>
                         <Button aria-label={`切换线路，当前 ${lineInfo.label}`} onClick={() => setLineOpen(true)}
+                          tabIndex={lineInfo.multi ? undefined : -1}
                           className="min-h-11 flex items-center gap-1 text-[12px] font-medium hg-ink-3 hg-ov-shadow-strong pressable">
-                          <IGlobe size={13} />{lineInfo.label}
+                          <IGlobe size={13} className="shrink-0" /><span className="max-w-[104px] truncate">{lineInfo.label}</span>
                         </Button>
-                      )}
+                      </div>
                     </div>
                     {/* 压光已上移到播放器根节点：底栏内部这一条止于底栏下沿，
                         屏幕最底部（14px + 安全区）反而没暗化，就是用户看到的分界线。 */}
@@ -2531,14 +2609,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   <div className="hg-chip hg-ink px-4 py-2 rounded-full text-[13px] font-semibold backdrop-blur-md elev-2">
                     {epPreview.label}
                   </div>
-                </div>
-              )}
-
-              {/* 双击点赞的中央红心（一次性：key 变化就重启动画，600ms 后由 CSS 自己消失） */}
-              {likeBurst > 0 && (
-                <div key={likeBurst} aria-hidden="true"
-                  className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
-                  <span className="hg-like-burst"><IHeartF size={96} className="text-neon drop-shadow-lg" /></span>
                 </div>
               )}
 
