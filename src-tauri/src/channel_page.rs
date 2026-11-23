@@ -93,13 +93,19 @@ fn parse_episode(raw: &str) -> (bool, u32, u32) {
     (finished, count, total)
 }
 
-fn parse_views(raw: &str) -> u64 {
+/// 播放量/热度文本 → 数字：支持 `万`/`W`/`k`/`K`/`千`（上游 5d14cb1 补齐 K 与千）。
+/// 吃瓜列表的 SSR 卡片写的是 `8.6K阅读`，只认「万」时会被截成 8。
+pub(crate) fn parse_views(raw: &str) -> u64 {
     let text = raw.trim().replace(',', "");
     if text.is_empty() {
         return 0;
     }
     let lower = text.to_ascii_lowercase();
-    let (num_part, multiplier) = if let Some(stripped) = lower.strip_suffix('w') {
+    let (num_part, multiplier) = if let Some(stripped) = lower.strip_suffix('k') {
+        (stripped, 1_000.0)
+    } else if let Some(stripped) = text.strip_suffix('千') {
+        (stripped, 1_000.0)
+    } else if let Some(stripped) = lower.strip_suffix('w') {
         (stripped, 10_000.0)
     } else if let Some(stripped) = text.strip_suffix('万') {
         (stripped, 10_000.0)
@@ -393,9 +399,168 @@ pub async fn fetch_original(cate: &str, page: u32, size: u32) -> Result<Value, S
     parse_channel_html(&html, panel, page, size)
 }
 
+/* ── 热播榜：优先解析官网服务端渲染页（上游 7b98b78 / #226） ──
+   上游 JSON `/api/ranks/hot` 返回的是**历史累计热力**，官网 `/ranks/hot/` 展示的是
+   「实时热度」，两者榜单与数值都不一样（用户看到的就是「热播榜里全是老剧」）。
+   所以 hot 榜改读 SSR 页，解析失败才回退 JSON，`{ type, items: RankItem[] }` 契约不变。 */
+
+/// 取卡片的真实封面：站内 SSR 往往先给占位图再 data-src 懒加载
+fn extract_img_cover(img: Selection<'_>) -> String {
+    for attr in ["data-src", "src"] {
+        if let Some(raw) = img.attr(attr) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !trimmed.contains("cover-placeholder") {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+pub(crate) fn parse_hot_rank_html(html: &str) -> Result<Value, String> {
+    let doc = Document::from(html);
+    let list = doc.select("section.hg-rank-page [data-rank-list]");
+    let scope = if list.length() > 0 {
+        list
+    } else {
+        doc.select("section.hg-rank-page")
+    };
+    if scope.length() == 0 {
+        return Err("官网热播榜容器缺失".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for card_node in scope.select(".hg-rank-item[data-rank-item]").iter() {
+        let card = Selection::from(card_node);
+        let video_id = card
+            .attr("data-track-id")
+            .and_then(|value| video_id_from_str(&value))
+            .or_else(|| {
+                card.select(".hg-rank-item__cover")
+                    .attr("href")
+                    .and_then(|href| video_id_from_href(&href))
+            })
+            .or_else(|| {
+                card.select(".hg-rank-item__title a")
+                    .attr("href")
+                    .and_then(|href| video_id_from_href(&href))
+            });
+        let Some(video_id) = video_id else {
+            continue;
+        };
+        if !seen.insert(video_id) {
+            continue;
+        }
+
+        let title = {
+            let link = normalized_text(card.select(".hg-rank-item__title a"));
+            if !link.is_empty() {
+                link
+            } else {
+                let heading = normalized_text(card.select(".hg-rank-item__title"));
+                if !heading.is_empty() {
+                    heading
+                } else {
+                    card.attr("data-track-title")
+                        .map(|value| normalized_string(&value))
+                        .unwrap_or_default()
+                }
+            }
+        };
+        if title.is_empty() {
+            continue;
+        }
+
+        /* 名次：`<span class="hg-rank-num">TOP01</span>`，只取数字；异常时按出现顺序补 */
+        let rank_digits: String = normalized_text(card.select(".hg-rank-num"))
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let rank = rank_digits
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| (items.len() + 1) as u32);
+
+        let cover = extract_img_cover(card.select(".hg-rank-item__cover img"));
+        let cate_name = card
+            .attr("data-track-type-name")
+            .map(|value| normalized_string(&value))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| normalized_text(card.select(".hg-rank-item__tags > span:first-child")));
+
+        let mut tags = Vec::new();
+        let mut seen_tags = HashSet::new();
+        for tag_node in card.select(".hg-rank-item__tags a[href*='/tag/']").iter() {
+            let tag = normalized_text(Selection::from(tag_node));
+            if !tag.is_empty() && seen_tags.insert(tag.clone()) {
+                tags.push(tag);
+            }
+        }
+
+        let score = parse_score(&normalized_text(card.select(".hg-rank-item__score")));
+        let (is_finished, episode_count, _) =
+            parse_episode(&normalized_text(card.select(".hg-rank-item__ep")));
+
+        let metric_label = {
+            let label = normalized_text(card.select(".hg-rank-item__heat-label"));
+            if !label.is_empty() {
+                label
+            } else {
+                let side = normalized_text(card.select(".hg-rank-item__label"));
+                if !side.is_empty() {
+                    side
+                } else {
+                    "实时热度".to_string()
+                }
+            }
+        };
+        let metric_value = {
+            let raw = normalized_text(card.select(".hg-rank-item__heat-value"));
+            let text = if !raw.is_empty() {
+                raw
+            } else {
+                normalized_text(card.select(".hg-rank-item__value"))
+            };
+            parse_views(&text)
+        };
+
+        items.push(json!({
+            "rank": rank,
+            "video_id": video_id,
+            "title": title,
+            "cover": cover,
+            "tags": tags,
+            "score": score,
+            "cate_name": cate_name,
+            "episode_count": episode_count,
+            "is_finished": is_finished,
+            "intervened": false,
+            "metric_label": metric_label,
+            "metric_value": metric_value,
+            "metrics": { "collect": 0, "comment": 0, "like": 0, "play": 0 }
+        }));
+    }
+
+    if items.is_empty() {
+        return Err("官网热播榜未解析到有效条目".to_string());
+    }
+
+    Ok(json!({
+        "type": "hot",
+        "items": items,
+    }))
+}
+
+pub async fn fetch_hot_rank() -> Result<Value, String> {
+    let html = fetch_html("/ranks/hot/").await?;
+    parse_hot_rank_html(&html)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{category_route, original_route, parse_channel_html};
+    use super::{category_route, original_route, parse_channel_html, parse_hot_rank_html};
 
     const SAMPLE_CHANNEL_HTML: &str = r#"
         <header>
@@ -509,6 +674,60 @@ mod tests {
         let preview = parse_channel_html(SAMPLE_CHANNEL_HTML, "latest", 1, 1).unwrap();
         assert_eq!(preview["items"].as_array().unwrap().len(), 1);
         assert_eq!(preview["pagination"]["pages"], 42);
+    }
+
+    /* 夹具取自官网 `/ranks/hot/` 的真实结构（去掉文案素材，只留解析需要的节点） */
+    const SAMPLE_HOT_RANK_HTML: &str = r#"
+        <section class="hg-list-page hg-rank-page hg-rank-page--hot">
+          <div data-rank-list>
+            <div class="hg-rank-item" data-rank-item data-track-id="13781" data-track-title="榜单剧A" data-track-type-name="漫剧">
+              <span class="hg-rank-num is-top hg-rank-num--1"><i class="hg-rank-num__top">TOP</i>01</span>
+              <a href="/video/13781/" class="hg-rank-item__cover"><img src="/static/web/images/cover-placeholder.png" data-src="https://pic.example.com/a.jpeg"><span class="hg-rank-item__ep">更新至1集</span></a>
+              <div class="hg-rank-item__main">
+                <h2 class="hg-rank-item__title"><a href="/video/13781/">榜单剧A</a></h2>
+                <div class="hg-rank-item__tags"><span>漫剧</span><span><i class="hg-rank-item__sep"></i><a href="/tag/ntr/">ntr</a></span><span class="hg-rank-item__score">9.0分</span></div>
+                <div class="hg-rank-item__heat"><span class="hg-rank-item__heat-label">实时热度</span><span class="hg-rank-item__heat-value">29.9W</span></div>
+              </div>
+              <div class="hg-rank-item__side"><span class="hg-rank-item__value">29.9W</span><span class="hg-rank-item__label">实时热度</span></div>
+            </div>
+            <div class="hg-rank-item" data-rank-item data-track-type-name="短剧">
+              <span class="hg-rank-num hg-rank-num--2">02</span>
+              <a href="/video/2833/" class="hg-rank-item__cover"><img data-src="https://pic.example.com/b.jpg"><span class="hg-rank-item__ep">全15集</span></a>
+              <h2 class="hg-rank-item__title"><a href="/video/2833/">榜单剧B</a></h2>
+            </div>
+          </div>
+        </section>
+    "#;
+
+    #[test]
+    fn parses_hot_rank_ssr_page_into_rank_items() {
+        let value = parse_hot_rank_html(SAMPLE_HOT_RANK_HTML).expect("官网热播榜应可解析");
+        assert_eq!(value["type"], "hot");
+        let items = value["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["rank"], 1);
+        assert_eq!(items[0]["video_id"], 13781);
+        assert_eq!(items[0]["title"], "榜单剧A");
+        /* 占位图不能当封面：必须取 data-src */
+        assert_eq!(items[0]["cover"], "https://pic.example.com/a.jpeg");
+        assert_eq!(items[0]["cate_name"], "漫剧");
+        assert_eq!(items[0]["score"], 9.0);
+        assert_eq!(items[0]["episode_count"], 1);
+        assert_eq!(items[0]["is_finished"], false);
+        assert_eq!(items[0]["metric_label"], "实时热度");
+        /* "29.9W" 是 29.9 万，不是 29 */
+        assert_eq!(items[0]["metric_value"], 299000);
+        /* 没有 data-track-id 时按 /video/{id}/ 还原，名次按出现顺序补 */
+        assert_eq!(items[1]["rank"], 2);
+        assert_eq!(items[1]["video_id"], 2833);
+        assert_eq!(items[1]["is_finished"], true);
+        assert_eq!(items[1]["episode_count"], 15);
+    }
+
+    #[test]
+    fn rejects_hot_rank_page_without_items() {
+        assert!(parse_hot_rank_html("<section class=\"hg-rank-page\"></section>").is_err());
+        assert!(parse_hot_rank_html("<div>不是榜单页</div>").is_err());
     }
 
     #[test]

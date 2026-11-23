@@ -883,10 +883,20 @@ pub async fn api_tag_videos(
     tag: String,
     page: u32,
     size: u32,
+    sort: Option<String>,
 ) -> Result<Value, String> {
     let encoded: String = url::form_urlencoded::byte_serialize(tag.as_bytes()).collect();
+    /* 默认排序对齐官网标签页（上游 42d7d71）：`/tag/{slug}/` 默认 `data-active-tab="latest"`，
+       而 `/api/videos/tag/{tag}` 省略 sort 时按 hot 出，两边顺序对不上。
+       只有显式要 hot 才切 hot。 */
+    let sort = match sort.as_deref() {
+        Some("hot") => "hot",
+        _ => "latest",
+    };
     state
-        .get(&format!("/api/videos/tag/{encoded}?page={page}&size={size}"))
+        .get(&format!(
+            "/api/videos/tag/{encoded}?page={page}&size={size}&sort={sort}"
+        ))
         .await
 }
 
@@ -932,10 +942,14 @@ pub async fn api_category(
 
 #[tauri::command]
 pub async fn api_rank(state: State<'_, Api>, kind: String) -> Result<Value, String> {
-    let kind = match kind.as_str() {
-        "recommend" | "potential" => kind,
-        _ => "hot".to_string(),
-    };
+    /* 热播榜以官网 SSR 页为准（上游 7b98b78）：JSON `/api/ranks/hot` 是历史累计热力，
+       和官网「实时热度」既不同序也不同值；解析失败再回退 JSON，契约不变。 */
+    if !matches!(kind.as_str(), "recommend" | "potential") {
+        if let Ok(rank) = crate::channel_page::fetch_hot_rank().await {
+            return Ok(rank);
+        }
+        return state.get("/api/ranks/hot").await;
+    }
     state.get(&format!("/api/ranks/{kind}")).await
 }
 

@@ -10,7 +10,7 @@ import { Empty, Img, Sheet } from "../../shared/ui/ui";
 import { CommentsPanel } from "../feed/Panels";
 import Player from "../playback/Player";
 import { IBack, IComment, IFireF, IHeart, IHeartF, IPlayF, ISearch, IStar, IStarF } from "../../shared/ui/icons";
-import { handleArticleClick, sanitizeHtml } from "../../shared/lib/html";
+import { handleArticleClick, parseInternalVideoId, sanitizeHtml } from "../../shared/lib/html";
 import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { TagBlockMenu } from "../../shared/ui/TagBlockMenu";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
@@ -539,6 +539,12 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
   const latestView = useRef({ loadedId: null as number | null, segs: [] as string[] });
   latestView.current = { loadedId, segs };
   const openSafeLink = (url: string) => {
+    /* 同源站内短剧链接在 App 内打开（上游 6cff406），外链仍走系统浏览器 + 复制兜底 */
+    const videoId = parseInternalVideoId(url);
+    if (videoId !== null) {
+      push({ kind: "feed", videoIds: [videoId], index: 0, title: currentPost?.title || "吃瓜" });
+      return;
+    }
     api.openUrl(url).catch(() => {
       copyText(url).then(() => toast("链接已复制", "ok")).catch(() => toast("复制失败", "info"));
     });

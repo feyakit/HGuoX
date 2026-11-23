@@ -81,13 +81,19 @@ Object.assign(window, { gestureProbe: media });
   } catch { /* ignore */ }
 })();
 
-/** 片源宽高打桩（?src=land|port）。真机由解码器给，这里只验版式与显隐链路。 */
+/** 片源宽高打桩（?src=land|port）。真机由解码器给，这里只验版式与显隐链路。
+ *  `window.__holdMetadata(ms)` 让打桩在 ms 内不再派发 loadedmetadata —— 用来模拟「切集后
+ *  新一集的解码宽高还没到」这段加载窗口（验收同剧切集是否保住舞台）。 */
+let holdMetadataUntil = 0;
+Object.assign(window, { __holdMetadata: (ms: number) => { holdMetadataUntil = Date.now() + ms; } });
+
 function SourceStub() {
   React.useEffect(() => {
     if (!SRC_KIND) return undefined;
     const size = SRC_KIND === "land" ? [1280, 720] : [720, 1280];
     let tries = 0;
     const timer = window.setInterval(() => {
+      if (Date.now() < holdMetadataUntil) return;
       const v = document.querySelector("video") as HTMLVideoElement | null;
       tries += 1;
       if (!v) { if (tries > 60) window.clearInterval(timer); return; }

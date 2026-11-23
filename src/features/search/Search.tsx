@@ -9,6 +9,7 @@ import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { Empty, Img } from "../../shared/ui/ui";
 import { useSearchResults } from "./useSearchResults";
 import { useRankSwipe } from "./useRankSwipe";
+import { useTabSwipe } from "../../shared/lib/useTabSwipe";
 import { useApiRefresh, useForegroundRefresh, useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { PullIndicator, usePullToRefresh } from "../../shared/lib/usePullToRefresh";
 import { SearchTags } from "./SearchTags";
@@ -92,10 +93,33 @@ export default function Search({
     busy: loading,
   });
 
+  const querying = submitted.length > 0;
+
   const changeTab = (next: "video" | "post") => {
     if (next === tab) return;
     setTab(next);
     if (submitted) results.search(submitted, next, true);
+  };
+
+  /* 结果区左右横滑切 tab（上游 36f9058）：阈值/轴比沿用 useTabSwipe（与分类页同一套），
+     只在已经出结果时生效；没搜索词时只有一个 tab，滑了也不该动。 */
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const tabSwipe = useTabSwipe<HTMLDivElement>({
+    rootRef: scrollRef,
+    tabIndex: querying && tab === "post" ? 1 : 0,
+    tabCount: querying ? 2 : 1,
+    onTabChange: index => changeTab(index === 0 ? "video" : "post"),
+  });
+
+  /* 清空搜索的唯一出口（上游 5df811a）：结果、输入、已提交词、tab、滚动位置一起回位。
+     以前只清结果和输入，切到「吃瓜帖子」再清空会停在一个空的结果 tab 上。 */
+  const resetSearch = () => {
+    results.clear();
+    setQ("");
+    setSubmitted("");
+    setTab("video");
+    inputRef.current?.focus();
+    scrollRef.current?.scrollTo({ top: 0 });
   };
 
   const submit = (keyword: string) => {
@@ -106,8 +130,6 @@ export default function Search({
     addSearch(k);
     results.search(k, tab);
   };
-
-  const querying = submitted.length > 0;
 
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
@@ -126,7 +148,7 @@ export default function Search({
           <Input aria-label="搜索短剧、帖子、题材…" ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} onFocus={refocusRefresh}
             placeholder={tab === "post" ? "搜索吃瓜帖子、话题…" : "搜索短剧、帖子、题材…"}
             className="flex-1 min-w-0 bg-transparent text-[14px] text-on placeholder-dim outline-none" />
-          {q && <Button aria-label="清空搜索" type="button" onClick={() => { results.clear(); setQ(""); setSubmitted(""); inputRef.current?.focus(); }} className="ios-icon-button ios-search-clear"><IClose size={16} /></Button>}
+          {q && <Button aria-label="清空搜索" type="button" onClick={resetSearch} className="ios-icon-button ios-search-clear"><IClose size={16} /></Button>}
         </Form>
         <Button card onClick={() => push({ kind: "ranks" })} aria-label="排行榜"
           className="hg-sub-btn" style={{ color: "#FFD19A", borderColor: "rgba(255, 179, 71, 0.35)" }}>
@@ -143,7 +165,7 @@ export default function Search({
         </SegmentedControl>
       </div>
 
-      <div className="flex-1 scroll-y hg-page-x pt-1 relative z-10" style={{ paddingBottom: "calc(32px + var(--sab, 0px))" }}>
+      <div ref={scrollRef} {...tabSwipe} style={{ touchAction: "pan-y", paddingBottom: "calc(32px + var(--sab, 0px))" }} className="flex-1 scroll-y hg-page-x pt-1 relative z-10">
         {!querying ? (
           <>
             {searchHist.length > 0 && (
