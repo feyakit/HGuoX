@@ -57,7 +57,12 @@
     "android:build": "tauri android build",
     "test:player-gestures": "node scripts/test-player-gestures.mjs",
     "test:balance-volume": "node scripts/test-balance-volume.mjs",
-    "test:hidden-hits": "node scripts/test-hidden-hit-targets.mjs"
+    "test:hidden-hits": "node scripts/test-hidden-hit-targets.mjs",
+    "test:episode-stage": "node scripts/test-episode-stage.mjs",
+    "test:player-lock": "node scripts/test-player-lock-idle.mjs",
+    "test:action-toast": "node scripts/test-action-toast-slot.mjs",
+    "test:internal-link": "node scripts/test-internal-video-link.mjs",
+    "test:search-tab": "node scripts/test-search-tab-swipe.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
