@@ -2,7 +2,7 @@ import { Button, Form, Image, Input } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, fmt, cover as imageCover } from "../../shared/api/api";
-import { handleArticleClick, sanitizeHtml } from "../../shared/lib/html";
+import { handleArticleClick, parseInternalVideoId, sanitizeHtml } from "../../shared/lib/html";
 import { commentText } from "./commentText";
 import type { Comment, CommentPage, Episode } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
@@ -233,9 +233,16 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
 export function ArticlePanel({ title, html, cover, hot, onClose }: {
   title: string; html: string; cover?: string; hot?: number; onClose: () => void;
 }) {
-  const { toast, strictSecurity } = useStore();
+  const { toast, strictSecurity, push } = useStore();
   const safeHtml = useMemo(() => sanitizeHtml(html), [html, strictSecurity]);
   const openSafeLink = (url: string) => {
+    /* 正文里链到站内短剧（`/video/{id}/`）就在 App 内直接进播放（上游 6cff406）：
+       以前一律甩给系统浏览器，用户点一下就被踢出 App。 */
+    const videoId = parseInternalVideoId(url);
+    if (videoId !== null) {
+      push({ kind: "feed", videoIds: [videoId], index: 0, title: title || "图文详情" });
+      return;
+    }
     api.openUrl(url).catch(() => {
       copyText(url).then(() => toast("链接已复制", "ok")).catch(() => toast("复制失败", "info"));
     });

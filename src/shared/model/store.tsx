@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, platform as envPlatform } from "../api/api";
-import { isStrictSecurity, setStrictSecurity as setHtmlStrictSecurity } from "../lib/html";
+import { isStrictSecurity, setSiteOrigin, setStrictSecurity as setHtmlStrictSecurity } from "../lib/html";
 import type { User } from "../api/types";
 import { readStorage, STORAGE_KEYS } from "../storage/storage";
 import type { AccentScheme } from "../ui/accent";
@@ -265,6 +265,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const generation = accountRef.current.generation();
       void api.boot().then((r) => {
         if (!active || current !== request) return;
+        /* 正文里的站内链接要按当前线路的域名认（上游 6cff406）：
+           boot 回来的 base 就是这一轮实际生效的线路，换线路后重建 App 也会重算。 */
+        setSiteOrigin(r.base || "");
         accountRef.current.restoreSession(r.user && (r.user as User).id ? r.user as User : null, r.base || "", generation);
         if (typeof r.strict_security === "boolean") {
           setStrictSecurityState(r.strict_security);
