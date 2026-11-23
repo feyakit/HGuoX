@@ -29,13 +29,16 @@ fn post_id_from_card(card: &Selection<'_>) -> Option<i64> {
     (id > 0 && id <= JS_MAX_SAFE_INTEGER).then_some(id)
 }
 
-fn parse_leading_number(text: &str) -> Option<u64> {
-    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse::<u64>().ok()
-    }
+/// 卡片右下角的阅读量（`8.6K阅读` / `1.2万阅读` / `8600阅读`）→ 数字。
+/// 直接取前导数字会把 `8.6K` 读成 8（上游 5d14cb1 修的正是这个口径）。
+fn parse_stats_hot(text: &str) -> u64 {
+    let trimmed = text
+        .trim_end_matches("次阅读")
+        .trim_end_matches("阅读")
+        .trim_end_matches("次浏览")
+        .trim_end_matches("浏览")
+        .trim();
+    crate::channel_page::parse_views(trimmed)
 }
 
 fn parse_page(html: &str, page: u32) -> Result<(Vec<Value>, u32), String> {
@@ -77,7 +80,8 @@ fn parse_page(html: &str, page: u32) -> Result<(Vec<Value>, u32), String> {
         for stat in card.select(".hg-cate-feed__stats span").iter() {
             let txt = normalized_text(Selection::from(stat));
             if txt.contains("阅读") {
-                if let Some(n) = parse_leading_number(&txt) {
+                let n = parse_stats_hot(&txt);
+                if n > 0 {
                     hot = n;
                 }
             }
@@ -194,7 +198,7 @@ pub async fn fetch(cate: Option<String>, page: u32) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blog_path, parse_page};
+    use super::{blog_path, parse_page, parse_stats_hot};
 
     #[test]
     fn builds_expected_blog_paths() {
@@ -204,6 +208,18 @@ mod tests {
         assert_eq!(blog_path("gossip", 3).unwrap(), "/blog/gossip/3/");
         assert_eq!(blog_path("reviews", 1).unwrap(), "/blog/reviews/");
         assert_eq!(blog_path("reviews", 4).unwrap(), "/blog/reviews/4/");
+    }
+
+    #[test]
+    fn parses_ssr_read_counts_with_unit_suffixes() {
+        /* 官网吃瓜卡片的真实写法；K/千/万 都要按倍数算，不能只取前导数字。
+           上游 5d14cb1（#232）修的就是这里：列表热度显示成 8 而不是 8600。 */
+        assert_eq!(parse_stats_hot("8.6K阅读"), 8_600);
+        assert_eq!(parse_stats_hot("2.6k次浏览"), 2_600);
+        assert_eq!(parse_stats_hot("3.2千阅读"), 3_200);
+        assert_eq!(parse_stats_hot("1.2万阅读"), 12_000);
+        assert_eq!(parse_stats_hot("8600阅读"), 8_600);
+        assert_eq!(parse_stats_hot("0评论"), 0);
     }
 
     #[test]

@@ -93,13 +93,19 @@ fn parse_episode(raw: &str) -> (bool, u32, u32) {
     (finished, count, total)
 }
 
-fn parse_views(raw: &str) -> u64 {
+/// 播放量/热度文本 → 数字：支持 `万`/`W`/`k`/`K`/`千`（上游 5d14cb1 补齐 K 与千）。
+/// 吃瓜列表的 SSR 卡片写的是 `8.6K阅读`，只认「万」时会被截成 8。
+pub(crate) fn parse_views(raw: &str) -> u64 {
     let text = raw.trim().replace(',', "");
     if text.is_empty() {
         return 0;
     }
     let lower = text.to_ascii_lowercase();
-    let (num_part, multiplier) = if let Some(stripped) = lower.strip_suffix('w') {
+    let (num_part, multiplier) = if let Some(stripped) = lower.strip_suffix('k') {
+        (stripped, 1_000.0)
+    } else if let Some(stripped) = text.strip_suffix('千') {
+        (stripped, 1_000.0)
+    } else if let Some(stripped) = lower.strip_suffix('w') {
         (stripped, 10_000.0)
     } else if let Some(stripped) = text.strip_suffix('万') {
         (stripped, 10_000.0)
