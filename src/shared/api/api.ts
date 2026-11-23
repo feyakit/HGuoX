@@ -298,8 +298,9 @@ export const api = {
   topics: (force = false) => call<{ items: TopicCard[] }>("api_topics", undefined, force),
   topic: (slug: string, page = 1, size = 20, force = false) => call<TopicDetail>("api_topic", { slug, page, size }, force),
   tags: () => call<{ categories: TagGroup[] }>("api_tags"),
-  tagVideos: (tag: string, page = 1, size = 20, force = false) =>
-    call<Paged<VideoCard>>("api_tag_videos", { tag, page, size }, force),
+  /* 默认 latest：官网标签页默认就是「最新」，省略 sort 时后端按 hot 出（上游 42d7d71） */
+  tagVideos: (tag: string, page = 1, size = 20, sort: "latest" | "hot" = "latest", force = false) =>
+    call<Paged<VideoCard>>("api_tag_videos", { tag, page, size, sort }, force),
   postTag: (tag: string, page = 1, size = 20) =>
     call<Paged<Post>>("api_post_tag", { tag, page, size }),
   category: (cate: string, page = 1, size = 20, sort?: string, force = false) =>
