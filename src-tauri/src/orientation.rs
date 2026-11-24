@@ -51,6 +51,7 @@ pub fn plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 pub async fn request<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     landscape: bool,
+    mode: Option<&str>,
 ) -> Result<(), String> {
     /* try_state 而不是 state：没注册成功时 state() 会 panic，这里必须走 Option。 */
     let handle = app
@@ -59,7 +60,7 @@ pub async fn request<R: tauri::Runtime>(
     handle
         .run_mobile_plugin_async::<serde_json::Value>(
             "setOrientation",
-            serde_json::json!({ "landscape": landscape }),
+            serde_json::json!({ "landscape": landscape, "mode": mode }),
         )
         .await
         .map(|_| ())

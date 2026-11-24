@@ -10,8 +10,10 @@
  */
 
 export const GESTURE = {
-  /** 起手死区：位移没超过这个值之前不定方向（px） */
-  deadZone: 10,
+  /** 起手方向锁：位移没超过这个值之前不定方向（px）。
+      3.0.13 从 10 收到 8 —— 横滑 seek / 竖滑换集 / 进度条拖动三者谁先定轴谁接管，
+      手指刚离开的那 8px 里就要分出主方向，否则斜着起手会两边都不响应。 */
+  deadZone: 8,
   /** 点击容差：总位移 < 6px 且时长 < 300ms 才算「单击」；
       6px ≤ 位移 < deadZone 的微动属于**无动作**（不 tap、不 seek、不换集） */
   tapSlop: 6,
@@ -23,7 +25,8 @@ export const GESTURE = {
   edgeBack: 24,
   /** 左缘右滑生效距离（px）——超过才真的退一层，避免误触 */
   edgeBackCommit: 72,
-  /** 双击窗口（ms） */
+  /** 双击窗口（ms）：单击要先等这么久确认没有第二击，
+      才决定「唤出/收起控件」（3.0.13）—— 不能先闪一下 */
   doubleTapMs: 280,
   /** 双击 seek 步长（秒）：用户定 5s（原 10s 太跳） */
   doubleTapSeek: 5,
@@ -31,24 +34,25 @@ export const GESTURE = {
   zoneSplit: 1 / 3,
   /** 短滑不 seek 的最小位移（px） */
   minSeekPx: 20,
-  /** 换集提交门槛：拖过屏高的 25% 就切（原来 40%，普通上滑只有 20–30% → 全部回弹） */
-  episodeSwitch: 0.25,
-  /** 换集辅助判定：手势速度超过这个值（px/s）也算提交（短促一划即可，和首页切 tab 一致） */
-  episodeVelocity: 600,
-  /** 速度辅助的最小位移（px）：低于它即使很快也不切，避免 120px 轻甩误切 */
-  episodeVelocityMinPx: 160,
-  /** 跟手阻尼：普通 / 到边界 */
-  episodeDamp: 0.85,
+  /** 换集提交门槛：拖过舞台高的 24% 就切（3.0.13 从 25% 收紧，配合 1:1 跟手） */
+  episodeSwitch: 0.24,
+  /** 换集辅助判定：手势速度超过这个值（px/s = 0.5px/ms）也算提交 */
+  episodeVelocity: 500,
+  /** 速度辅助的最小位移（px）：短促一划 40px 起就认，低于它即使很快也不切 */
+  episodeVelocityMinPx: 40,
+  /** 跟手阻尼：正常 1（内容与手指 1:1），到第一/最后一集 0.35 */
+  episodeDamp: 1,
   episodeEdgeDamp: 0.35,
   /** 松手后的动画时长 */
-  /* 整页 pager：松手吸附 300ms，先快后缓（.16,1,.3,1），不要 ease-out 那种"一上来就慢"的手感 */
+  /* 整页 pager：提交换集 300ms，先快后缓（.16,1,.3,1），不要 ease-out 那种"一上来就慢"的手感 */
   episodeCommitMs: 300,
-  episodeReboundMs: 180,
+  /* 回弹 200ms ease-out（用户定稿）：回弹要"刹得住"，和提交的吸附曲线分开 */
+  episodeReboundMs: 200,
   /** 标题/进度条在翻页中的淡出淡入 */
   episodeTitleFadeMs: 160,
   /** prefers-reduced-motion 下退化成的淡入时长 */
   episodeReducedMotionMs: 150,
-  /** 换集预览门槛：拖过屏高的 70% 才露预览 */
+  /** 换集预览门槛：拖过舞台高的 12% 才露预览文案 */
   episodePreview: 0.12,
   /** 松手吸附到整 5 秒 */
   snapSeconds: 5,
@@ -186,12 +190,17 @@ export function rotationLocked(changedAt: number, now: number): boolean {
  */
 /**
  * 拖动时的跟手位移（带阻尼，直接拿来当 translateY）：
- * 正常 0.85（手指走 100，画面走 85，跟手但不过冲）；到第一/最后一集 0.35（拉得动但拉不走）。
+ * 正常 1:1（手指走 100，画面走 100）；到第一/最后一集 0.35（拉得动但拉不走）。
  */
 export function episodeDrag(dy: number, atEdge: boolean): number {
   return dy * (atEdge ? GESTURE.episodeEdgeDamp : GESTURE.episodeDamp);
 }
 
+/**
+ * 上下滑换集：dy<0（上滑）= 下一集，dy>0（下滑）= 上一集。
+ * commit 门槛 24% 舞台高，或速度 ≥500px/s 且位移 ≥40px（短促快滑也能切）；
+ * preview 门槛 12% 舞台高（过了才出预览文案）。
+ */
 export function episodeIntent(
   dy: number,
   stageHeight: number,
@@ -200,7 +209,7 @@ export function episodeIntent(
   const dir: 1 | -1 = dy <= 0 ? 1 : -1;
   const height = Number.isFinite(stageHeight) && stageHeight > 0 ? stageHeight : 0;
   const ratio = height ? Math.abs(dy) / height : 0;
-  /* 两种提交方式：拖过 25% 屏高，或者速度够快（≥600px/s）且确实动了（>12px，避免抖一下就切） */
+  /* 两种提交方式：拖过 24% 舞台高，或者速度够快（≥500px/s）且位移 ≥40px（短促快滑，防抖一下） */
   const fast = Math.abs(velocity) >= GESTURE.episodeVelocity && Math.abs(dy) >= GESTURE.episodeVelocityMinPx;
   return {
     dir,
@@ -257,6 +266,9 @@ export const PLAYER_TIMING = { autohideMs: 3000 } as const;
 
 /** 翻页吸附曲线：先快后缓的减速感（对标抖音/红果的上下翻页） */
 export const EPISODE_EASE = "cubic-bezier(.16,1,.3,1)";
+
+/** 回弹曲线：没到门槛要"刹得住"，用标准 ease-out（200ms） */
+export const EPISODE_REBOUND_EASE = "ease-out";
 
 /**
  * 翻页过程中当前页的形变：位移越大越缩小、越淡（1 → .96 / 1 → .55）。

@@ -25,6 +25,8 @@ import app.tauri.plugin.Plugin
 @InvokeArg
 class SetOrientationArgs {
     var landscape: Boolean = false
+    /** 3.0.13：portrait / landscape / unspecified（null = 按 landscape 布尔走，兼容旧调用） */
+    var mode: String? = null
 }
 
 @TauriPlugin
@@ -40,10 +42,17 @@ class OrientationPlugin(private val activity: Activity) : Plugin(activity) {
         activity.runOnUiThread {
             try {
                 val args = invoke.parseArgs(SetOrientationArgs::class.java)
-                activity.requestedOrientation = if (args.landscape) {
-                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                } else {
-                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                /* unspecified = 把方向还给系统（离开播放页 / 横版片源竖屏时）。
+                   写回 UNSPECIFIED 而不是 PORTRAIT：后者会一直把 App 钉在竖屏。 */
+                activity.requestedOrientation = when (args.mode) {
+                    "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    "unspecified" -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    else -> if (args.landscape) {
+                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    } else {
+                        ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    }
                 }
                 invoke.resolve()
             } catch (error: Throwable) {

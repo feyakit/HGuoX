@@ -76,10 +76,14 @@ try {
       });
       await page.waitForTimeout(450);
     }
-    /* 唤出控件：点画面中部（收起态点一下会唤出） */
-    const cx = fs ? 320 : 180, cy = fs ? 200 : 300;
-    await page.touchscreen.tap(cx, cy);
-    await page.waitForTimeout(400);
+    /* 3.0.13：单击 = 唤出/收起控件（不再是暂停）。进页面控件本来就是亮的，
+       所以这里**不再补点一下**（补点反而会把它收起来）；只在确实收起时才点一次唤出。 */
+    const segs = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length);
+    if (!segs) {
+      const cx = fs ? 320 : 180, cy = fs ? 200 : 300;
+      await page.touchscreen.tap(cx, cy);
+      await page.waitForTimeout(400);
+    }
   };
 
   for (const [key, endless, fs] of [["douyin-portrait", true, false], ["douyin-fullscreen", true, true],
@@ -112,8 +116,8 @@ try {
   });
 
 
-  /* ───────── v3.0.11 手势重分工：收起态单击 = 暂停/播放（不再「只唤出」） ───────── */
-  await step("收起态单击画面 → 播放/暂停一次，并把控件亮出来", async () => {
+  /* ───────── v3.0.13 手势重分工：收起态单击 = 只唤出控件（双击才暂停） ───────── */
+  await step("收起态单击画面 → 只唤出控件，不切播放/暂停", async () => {
     await page.setViewportSize({ width: 360, height: 640 });
     await page.goto(`${origin}tests/player-modes.html?endless=0&fs=0&eps=5`, { waitUntil: "networkidle" });
     await page.waitForSelector(".player-root");
@@ -125,10 +129,11 @@ try {
     const r = await page.evaluate(() => ({
       toggles: window.gestureProbe.play + window.gestureProbe.pause,
       segs: document.querySelectorAll(".player-root .hg-seg").length,
+      paused: window.gestureProbe.paused,
     }));
     assert.equal(hidden, 0, `收起前仍有 ${hidden} 个胶囊`);
-    assert.equal(r.toggles, 1, `播放/暂停调用 ${r.toggles} 次`);
     assert.ok(r.segs > 0, "单击后控件没有亮出来");
+    assert.equal(r.toggles, 0, `单击触发了 ${r.toggles} 次播放/暂停（应当只唤出控件）`);
   });
 
   /* ───────── 审计 #8：片尾双触发只取一批推荐 ───────── */

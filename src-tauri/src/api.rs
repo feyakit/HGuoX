@@ -479,14 +479,23 @@ pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> 
 /// 审计 #8：失败**必须回到前端**。原来两端拿到失败都只 `eprintln` 再 `Ok(())`，
 /// 前端只在 invoke reject 时提示 —— 于是「点了全屏没转」永远是静默的。
 /// 现在失败一律 `Err(原因)`，`requestOrientation.onFail` 会弹一条 playback-hint（UI 不动）。
+///
+/// 3.0.13 加了 `mode`（`portrait` / `landscape` / `unspecified`）：播放页要按片源宽高
+/// 主动锁竖，离开播放页再把方向还给系统。`landscape` 保留是为了兼容旧调用方。
 #[tauri::command]
-pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(), String> {
+pub async fn set_orientation(
+    app: tauri::AppHandle,
+    landscape: bool,
+    mode: Option<String>,
+) -> Result<(), String> {
+    let mode = mode.as_deref();
     #[cfg(target_os = "ios")]
     {
         /* run_on_main_thread 的闭包没有返回值，用 channel 把结果带回来才算真的知道成没成。 */
         let (tx, rx) = std::sync::mpsc::channel();
+        let ios_mode = mode.map(|m| m.to_string());
         app.run_on_main_thread(move || {
-            let _ = tx.send(request_ios_orientation(landscape));
+            let _ = tx.send(request_ios_orientation(landscape, ios_mode.as_deref()));
         })
         .map_err(|error| format!("转屏请求没能派发到主线程：{error}"))?;
         match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
@@ -503,8 +512,8 @@ pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(
         /* 安卓：走 Kotlin 插件（orientation.rs），Rust 里**不再有任何裸 JNI** ——
            上一版那条 JNI 路径没清 Java 异常，点全屏直接 SIGABRT 把进程带走。
            插件 reject / 未注册时返回 Err 给前端（审计 #8），画面停在竖屏沉浸全屏。 */
-        match crate::orientation::request(&app, landscape).await {
-            Ok(()) => eprintln!("[orientation] 已下发 Kotlin setOrientation(landscape={landscape})"),
+        match crate::orientation::request(&app, landscape, mode).await {
+            Ok(()) => eprintln!("[orientation] 已下发 Kotlin setOrientation(landscape={landscape} mode={mode:?})"),
             Err(error) => {
                 eprintln!("[orientation] 下发失败：{error}");
                 return Err(format!("系统未允许转屏：{error}"));
@@ -513,7 +522,7 @@ pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        let _ = (&app, landscape);
+        let _ = (&app, landscape, mode);
     }
     Ok(())
 }
@@ -539,7 +548,7 @@ pub fn set_text_interaction(app: tauri::AppHandle, enabled: bool) -> Result<(), 
 }
 
 #[cfg(target_os = "ios")]
-fn request_ios_orientation(landscape: bool) -> Result<(), String> {
+fn request_ios_orientation(landscape: bool, mode: Option<&str>) -> Result<(), String> {
     /* iOS 16+ 的正确转屏姿势：拿前台活跃的 UIWindowScene，调
        -[UIWindowScene requestGeometryUpdateWithPreferences:errorHandler:]。
        参数用 +[UIWindowSceneGeometryPreferencesIOS preferencesWithInterfaceOrientations:]。
@@ -593,7 +602,14 @@ fn request_ios_orientation(landscape: bool) -> Result<(), String> {
         if !msg1_bool(prefs_cls, responds, sel_prefs) {
             return Err("系统不响应 preferencesWithInterfaceOrientations:".to_string());
         }
-        let mask = if landscape { MASK_LANDSCAPE } else { MASK_PORTRAIT };
+        /* mode 优先：unspecified = 两个方向都允许（26），等于把方向还给系统。
+           旧调用方只传 landscape 时行为与以前一致。 */
+        let mask = match mode {
+            Some("portrait") => MASK_PORTRAIT,
+            Some("landscape") => MASK_LANDSCAPE,
+            Some("unspecified") => MASK_PORTRAIT | MASK_LANDSCAPE,
+            _ => if landscape { MASK_LANDSCAPE } else { MASK_PORTRAIT },
+        };
         let prefs = msg1_usize(prefs_cls, sel_prefs, mask);
         if prefs.is_null() {
             return Err("几何偏好对象创建失败".to_string());
