@@ -1148,6 +1148,9 @@ pub async fn failover(exclude: &str) -> Value {
     const FAILOVER_PROBE: Duration = Duration::from_secs(7);
     const FAILOVER_MAX: usize = 8;
 
+    /* 发布页在后台先抓起来 —— 真机上它常常是唯一还能拿到「当前族」的来源，
+       和第一阶段的探活并行，省掉 5~10 秒。 */
+    let published = tokio::spawn(async { mirrors().await });
     let excluded = crate::net::normalize_base(exclude).unwrap_or_default();
     let mut seen = HashSet::new();
     seen.insert(excluded);
@@ -1188,7 +1191,10 @@ pub async fn failover(exclude: &str) -> Value {
     /* 第二阶段：磁盘缓存 + 内置种子全挂 → 抓一次发布页再试。
        真机教训：上游换族很勤（这次实测发布页已经给出 wsaditmwl.cc，而种子还是上一族），
        只靠内置种子必然追不上。这里多花几秒，但换来「被墙网络里还有路可走」。 */
-    if let Ok(listing) = mirrors_cached().await {
+    /* 这里必须强制重抓发布页：mirrors_cached() 在 TTL 内会直接回旧列表，
+       而旧列表正是「上一个族」，全都被墙 —— 真机上就是这个原因导致
+       failover 明明有可用镜像却报「全部不可用」。 */
+    if let Ok(Ok(listing)) = published.await {
         let items = listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         let mut fresh: Vec<(String, &'static str)> = Vec::new();
         for item in items {
