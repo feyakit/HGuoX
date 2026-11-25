@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../../shared/api/api";
+import { api, logLine } from "../../shared/api/api";
 import type { TagItem } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
 import { IFireF, IRefresh } from "../../shared/ui/icons";
@@ -8,11 +8,13 @@ import { Loader } from "../../shared/ui/ios/effects";
 
 const BATCH_SIZE = 12;
 const heat = (tag: TagItem) => Number.isFinite(tag.hot_score) ? tag.hot_score! : 0;
+/** 官网首页 SSR 的题材只有名字（slug 是官网路由，标签页按中文名取，用不上）。 */
+type HotTagChip = { name: string; is_hot?: boolean; hot_score?: number };
 
 /** Use the catalog's actual tag names: keyword search is a different endpoint. */
 export function SearchTags({ active }: { active: boolean }) {
   const { push } = useStore();
-  const [tags, setTags] = useState<TagItem[] | null>(null);
+  const [tags, setTags] = useState<HotTagChip[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [batch, setBatch] = useState(0);
@@ -26,6 +28,22 @@ export function SearchTags({ active }: { active: boolean }) {
     const token = ++sequence.current;
     setLoading(true); setError("");
     try {
+      /* 优先官网首页 SSR 的热门题材（上游 25d69b8 行为）：集合与顺序跟官网一致。
+         首页结构变了 / 被墙 / 解析不到，才回退 /api/tags 的 is_hot + hot_score 排序。 */
+      try {
+        const hot = await api.hotTags();
+        const names = (hot?.items ?? [])
+          .map(item => (item?.name ?? "").trim())
+          .filter(name => name.length > 0);
+        if (names.length) {
+          if (sequence.current !== token) return;
+          loaded.current = true;
+          setTags([...new Set(names)].map(name => ({ name, is_hot: true })));
+          return;
+        }
+      } catch (error) {
+        logLine(`[tags] 官网热门题材拉取失败，回退 /api/tags：${(error as Error)?.message ?? error}`);
+      }
       const response = await api.tags();
       if (!Array.isArray(response?.categories)) throw new Error("标签数据格式异常，请重试");
       const sorted = response.categories.flatMap(group => Array.isArray(group.tags) ? group.tags : [])

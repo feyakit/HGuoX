@@ -136,6 +136,7 @@ pub async fn line_state() -> Result<Value, String> {
         "base": base(),
         "default": crate::net::DEFAULT_BASE,
         "custom": crate::net::is_custom_line(),
+        "manual": crate::net::is_manual_line(),
         "fixed": crate::lines::fixed(),
     }))
 }
@@ -151,12 +152,30 @@ fn trusted_line_origin(origin: &str) -> bool {
 /// 手动切换线路：只允许固定线路或刚从可信发布页读取的镜像。
 ///
 /// 可信↔可信之间保留登录（同一账号体系）；任一端不可信则清空会话。
+/// 3.0.14 起标成「手动线路」：之后自动换线不得再动它（硬约束）。
 #[tauri::command]
 pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, String> {
+    apply_line(&state, &url, true)
+}
+
+/// 自动选线用：应用一条**没有**被用户手动指定的线路（偏好让位 / 恢复回切）。
+///
+/// 和 [`line_set`] 的区别只有一个 `manual` 标记：用户手动摆上的线路会被锁住，
+/// 而自动选出来的线路下次还得能被自动改，否则一次让位就永久锁死。
+#[tauri::command]
+pub async fn line_set_auto(state: State<'_, Api>, url: String) -> Result<String, String> {
+    apply_line(&state, &url, false)
+}
+
+fn apply_line(state: &State<'_, Api>, url: &str, manual: bool) -> Result<String, String> {
     let mut generation = LINE_SELECTION.lock().map_err(|_| "线路选择锁失败")?;
     *generation = generation.wrapping_add(1);
     let previous = base();
-    let applied = crate::net::set_base(&url)?;
+    let applied = if manual {
+        crate::net::set_base_manual(url)?
+    } else {
+        crate::net::set_base(url)?
+    };
     crate::net::refresh_client();
     if previous != applied && !state.session.rebase_if_trusted(&applied, trusted_line_origin) {
         state.session.clear();
@@ -177,7 +196,8 @@ pub async fn line_custom_set(state: State<'_, Api>, url: String) -> Result<Value
 
 #[tauri::command]
 pub async fn line_reset(state: State<'_, Api>) -> Result<Value, String> {
-    let base = line_set(state, crate::net::DEFAULT_BASE.to_string()).await?;
+    /* 回到默认主站 = 取消所有手动指定，自动选线重新接管。 */
+    let base = apply_line(&state, crate::net::DEFAULT_BASE, false)?;
     Ok(json!({ "base": base, "custom": false }))
 }
 
@@ -289,8 +309,57 @@ pub async fn line_try_main(state: State<'_, Api>) -> Result<Value, String> {
     }))
 }
 
-/* ───────────────────────── 更新检查 ───────────────────────── */
+/// 紧急换线（3.0.14 A 节）：主域被网络层拦住（TLS 阻断 / 连接重置 / DNS 污染）时，
+/// 不等常规自动选线（那要抓发布页，最长 12 秒），直接用磁盘缓存 + 内置种子探一遍，
+/// 找到第一条真能用的就切过去，让调用方马上重试。
+///
+/// **硬约束**：用户手动选定的线路（含自定义线路）失败时这里拒绝切换，
+/// 只把 `reason: "manual"` 交回前端去提示 —— 自动流程不许动用户的选择。
+#[tauri::command]
+pub async fn line_failover(state: State<'_, Api>) -> Result<Value, String> {
+    let selection = begin_line_selection()?;
+    let previous = base();
+    if crate::net::is_manual_line() {
+        crate::playback_log::record("line.failover", json!({ "reason": "manual-keep", "manual": true }));
+        return Ok(json!({
+            "previous": previous, "base": previous, "switched": false,
+            "reason": "manual", "pick": Value::Null,
+        }));
+    }
+    /* 刚失败的那条立刻判死，别在候选里再把时间浪费一遍 */
+    crate::line_health::penalize(&previous);
+    crate::net::refresh_client();
+    let pick = crate::lines::failover(&previous).await;
+    let chosen = pick.get("base").and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut switched = false;
+    let generation = LINE_SELECTION.lock().map_err(|_| "线路选择锁失败")?;
+    if *generation == selection && !chosen.is_empty() {
+        let next = crate::net::set_base(&chosen)?;
+        crate::net::refresh_client();
+        switched = next != previous;
+        if switched && !state.session.rebase_if_trusted(&next, trusted_line_origin) {
+            state.session.clear();
+        }
+    }
+    let outcome = json!({
+        "previous": previous,
+        "base": base(),
+        "switched": switched,
+        "cancelled": *generation != selection,
+        "reason": pick.get("reason").cloned().unwrap_or(Value::Null),
+        "ms": pick.get("ms").cloned().unwrap_or(Value::Null),
+        "pick": pick,
+    });
+    crate::playback_log::record("line.failover", json!({
+        "previous_host": url::Url::parse(&previous).ok().and_then(|u| u.host_str().map(str::to_owned)),
+        "line_host": url::Url::parse(&outcome["base"].as_str().unwrap_or_default()).ok().and_then(|u| u.host_str().map(str::to_owned)),
+        "switched": switched,
+        "reason": outcome["reason"],
+    }));
+    Ok(outcome)
+}
 
+/* ───────────────────────── 更新检查 ───────────────────────── */
 const REPO: &str = "feyakit/HGuoX";
 
 fn ver_parts(v: &str) -> Vec<u64> {
@@ -868,6 +937,93 @@ pub async fn api_original_videos(
     state.get(&path).await
 }
 
+/* ───────────────────────── 首页 banners ───────────────────────── */
+
+/// 官网首页横幅（3.0.14 C 节）：`GET /api/home` 里的 `banners`，**保持官网返回顺序**。
+///
+/// 字段只透出 `id` / `video_id` / `image` / `score` / `desc`（已确认没有广告位），
+/// 另外把每条对应的剧目信息（标题 / 标签 / 集数）补上 —— 官网接口只给图片和文案，
+/// 而首页 hero 要显示剧名，让前端再为 8 条 banner 各发一次请求更慢。
+/// 单条补全失败不影响这一条：它还是一条可点的横幅，只是没有剧名。
+#[tauri::command]
+pub async fn api_home(state: State<'_, Api>) -> Result<Value, String> {
+    let value = state.get("/api/home").await?;
+    let banners: Vec<Value> = value
+        .get("banners")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter(|item| item.is_object()).cloned().collect())
+        .unwrap_or_default();
+    let origin = crate::net::base();
+
+    let mut set = tokio::task::JoinSet::new();
+    for (index, banner) in banners.iter().enumerate() {
+        let Some(video_id) = banner.get("video_id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+            continue;
+        };
+        let origin = origin.clone();
+        set.spawn(async move {
+            let path = format!("/api/videos/{video_id}");
+            let detail = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                crate::net::edge_once(&origin, "GET", &path, None, None),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            (index, detail)
+        });
+    }
+    let mut enriched = std::collections::HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, Some(detail))) = joined {
+            enriched.insert(index, detail);
+        }
+    }
+
+    let items: Vec<Value> = banners
+        .iter()
+        .enumerate()
+        .filter_map(|(index, banner)| {
+            let video_id = banner.get("video_id").and_then(Value::as_i64).unwrap_or(0);
+            if video_id <= 0 {
+                return None;
+            }
+            let raw_image = banner.get("image").and_then(Value::as_str).unwrap_or("");
+            let detail = enriched.get(&index);
+            /* 官网 banner 的 image 是站内相对路径（/upload_01/...），实际文件在图片 CDN 上；
+               剧目详情里的 cover 是带签名的完整地址，优先用它，失败再退回 CDN 前缀。 */
+            let image = detail
+                .and_then(|detail| detail.get("cover"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|cover| !cover.trim().is_empty())
+                .or_else(|| {
+                    (!raw_image.trim().is_empty())
+                        .then(|| format!("https://pic.qnlycc.cn{}", raw_image.trim()))
+                })
+                .unwrap_or_default();
+            if image.is_empty() {
+                return None;
+            }
+            let field = |key: &str| detail.and_then(|detail| detail.get(key)).cloned().unwrap_or(Value::Null);
+            Some(json!({
+                "id": banner.get("id").cloned().unwrap_or(Value::Null),
+                "video_id": video_id,
+                "image": raw_image,
+                "image_url": image,
+                "score": banner.get("score").cloned().unwrap_or(Value::Null),
+                "desc": banner.get("desc").and_then(Value::as_str).unwrap_or(""),
+                "title": field("title"),
+                "tags": field("tags"),
+                "episode_count": field("episode_count"),
+                "total_episodes": field("total_episodes"),
+                "is_finished": field("is_finished"),
+            }))
+        })
+        .collect();
+    Ok(json!({ "banners": items, "source": "api/home" }))
+}
+
 /* ───────────────────────── 专题 / 标签 ───────────────────────── */
 
 /// 专题列表：`/api/topics` 返回 data.items（标题/封面/简介/收录数）。
@@ -890,6 +1046,14 @@ pub async fn api_topic(state: State<'_, Api>, slug: String, page: u32, size: u32
 #[tauri::command]
 pub async fn api_tags(state: State<'_, Api>) -> Result<Value, String> {
     state.get("/api/tags").await
+}
+
+/// 热门题材（上游 25d69b8 行为）：官网首页 SSR 的热门标签，集合与顺序都和官网一致。
+/// 前端拿到失败/空列表时回退 [`api_tags`]，两边结构都是 `{ items: [{ name, slug }] }`
+/// 与 `{ categories: [...] }`，由前端决定用哪个。
+#[tauri::command]
+pub async fn api_hot_tags(_state: State<'_, Api>) -> Result<Value, String> {
+    crate::search_hot::fetch_hot_tags().await
 }
 
 /// 按标签取短剧：后端按中文标签名匹配；社区标签需使用 api_post_tag。

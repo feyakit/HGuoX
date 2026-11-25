@@ -3,6 +3,7 @@ import { ACCOUNT_CHANGED_EVENT, api, setApiAccountScope } from "../api/api";
 import type { AccountHistoryItem, AccountIdentity, AccountInteractions, User } from "../api/types";
 import type { WatchProgress } from "./store";
 import { migrateLegacyKey } from "../storage/legacyKeys";
+import { repickForSlowRequest } from "../network/autoLine";
 
 type Kind = "video" | "post";
 export type GuestData = {
@@ -63,7 +64,9 @@ const message = (error: unknown) => {
   const raw = error instanceof Error ? error.message.trim() : "";
   if (!raw) return "账号同步失败，请重试";
   if (/^401\b|\b401\b/.test(raw)) return "登录状态已失效，请重新登录";
-  if (/^403\b/.test(raw)) return "暂无同步权限，请重新登录";
+  /* 403 不再冒充 401（上游 0c13ceb）：区域限制/风控/WAF 也会返 403，
+     当成「登录失效」会让人去重登（也没用），换个线路通常就好了。 */
+  if (/^403\b/.test(raw)) return "当前线路拒绝了这次请求（403），可换个线路再试";
   if (/^5\d{2}\b/.test(raw)) return "服务器暂时不可用，请稍后重试";
   return raw;
 };
@@ -101,6 +104,8 @@ export function useAccountData(initialGuest: GuestData, saveGuest: (data: GuestD
   const mutation = useRef(0);
   const historyMutation = useRef(0);
   const clearVersion = useRef(0);
+  /* 401 静默恢复：本次同步只换一次线，避免「401 → 换线 → 又 401」死循环 */
+  const lineRecovered = useRef(false);
   const storageError = useRef("");
   const needsResync = useRef(false);
   const synchronizing = useRef<{ generation: number; promise: Promise<void> } | null>(null);
@@ -191,11 +196,29 @@ export function useAccountData(initialGuest: GuestData, saveGuest: (data: GuestD
     const startHistory = new Map(s.data.history.map(row => [row.id, row]));
     const run = (async () => {
       // Only replay observed playback, never silently upload the guest's library.
-      const [profile, remote] = await Promise.allSettled([
+      let [profile, remote] = await Promise.allSettled([
         api.me(auth),
         (async () => { await flushHistory(); return readHistory(auth, generation); })(),
       ]);
       if (!isCurrent(generation)) return;
+      /* 上游 0c13ceb（按行为重写）：401 先试一次换线再判死。
+         镜像不一定认别的线路签发的 token，换到认它的那条线后重试一次就能静默恢复；
+         换了线还是 401 才把「请重新登录」交给界面。瞬时网络失败不进这里 —— 没拿到 401
+         就不该动登录态，凭据留着等网络恢复。 */
+      const rejectedAs401 = (result: PromiseSettledResult<unknown>) =>
+        result.status === "rejected" && /^401\b/.test(String((result.reason as Error)?.message ?? result.reason ?? ""));
+      if (!lineRecovered.current && (rejectedAs401(profile) || rejectedAs401(remote))) {
+        lineRecovered.current = true;
+        const switched = await repickForSlowRequest("auth-401").catch(() => false);
+        if (!isCurrent(generation)) return;
+        if (switched) {
+          [profile, remote] = await Promise.allSettled([
+            api.me(identity()),
+            (async () => { await flushHistory(); return readHistory(identity(), generation); })(),
+          ]);
+          if (!isCurrent(generation)) return;
+        }
+      }
       let current = state.current!.data;
       let favoritesKnown = state.current!.sync.favoritesKnown;
       const errors: string[] = [];
@@ -276,6 +299,7 @@ export function useAccountData(initialGuest: GuestData, saveGuest: (data: GuestD
     s.data = next ? accounts.current[key] || applyInteractions(empty(), next.interactions) : guest.current;
     s.sync = { busy: false, error: "", lastSynced: 0, favoritesKnown: false };
     sentHistory.current.clear(); pending.current.clear(); needsResync.current = false; storageError.current = "";
+    lineRecovered.current = false;
     render();
     if (next) void syncRef.current().catch(() => {});
   }, []);

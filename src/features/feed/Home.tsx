@@ -1,8 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { prefetchDetails } from "../../shared/api/detailFast";
 import { useTabSwipe } from "./useTabSwipe";
-import { api, fmt, isMobile, logLine } from "../../shared/api/api";
+import { ApiError, api, fmt, hostOf, isMobile, logLine } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
+import type { HomeBanner } from "../../shared/api/api";
 import { useStore } from "../../shared/model/store";
 import { Button } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
@@ -12,6 +13,7 @@ import { useContentPreferences } from "../../shared/model/contentPreferences";
 import { PreferenceStorageNotice } from "../../shared/ui/PreferenceStorageNotice";
 import { FRESH_GAP_MS, useApiRefresh, useForegroundRefresh, useFreshness, useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { PullIndicator, usePullToRefresh } from "../../shared/lib/usePullToRefresh";
+import LinePicker from "../settings/LinePicker";
 
 const RankView = lazy(() => import("../search/Search").then(m => ({ default: m.RankView })));
 
@@ -93,6 +95,40 @@ const releaseLabel = (v: VideoCard) => {
   return m ? `${Number(m[2])}月${Number(m[3])}日 上新` : "新片上架";
 };
 
+/** 加载失败卡片（3.0.14 G 节）。
+ *
+ *  三个硬要求：① 说人话，不再把 `tls handshake eof` 直接怼给用户；
+ *  ② 两个出口：「重试」原地再拉一次，「换个线路」打开播放源面板；
+ *  ③ 原始错误折叠进「详情」，默认不展示。 */
+function FeedError({ error, raw, networkish, onRetry, onSwitch }: {
+  error: string; raw: string; networkish: boolean; onRetry: () => void; onSwitch: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="ios-empty flex flex-col items-center justify-center py-14 px-8 text-center a-rise" role="alert">
+      <div className="w-16 h-16 rounded-(--r-md) tonal flex items-center justify-center mb-4">
+        <IRefresh size={26} />
+      </div>
+      <div className="text-[16px] font-semibold text-on/90">{networkish ? "当前线路连不上" : "加载失败"}</div>
+      <p className="text-xs text-mut mt-1.5 leading-relaxed max-w-[34em]">{error}</p>
+      <div className="flex items-center gap-2.5 mt-5">
+        <Button onClick={onRetry} className="px-5 h-10 rounded-(--r-ctl) bg-primary text-on-primary text-[14px] font-bold pressable">重试</Button>
+        <Button onClick={onSwitch} className="px-5 h-10 rounded-(--r-ctl) tonal text-on text-[14px] font-semibold pressable">换个线路</Button>
+      </div>
+      {raw && (
+        <div className="mt-4 w-full max-w-[34em]">
+          <button type="button" onClick={() => setOpen(v => !v)}
+            className="text-[12px] text-mut underline underline-offset-2 pressable"
+            aria-expanded={open}>
+            {open ? "收起详情" : "详情"}
+          </button>
+          {open && <pre className="mt-2 text-left text-[11px] leading-relaxed text-mut whitespace-pre-wrap break-words select-text">{raw}</pre>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Home({ active }: { active: boolean; bottomInset?: number }) {
   const { push, lineEpoch, user, history, toast, stack, loginOpen } = useStore();
   const { preferences, storageError, blockReason } = useContentPreferences();
@@ -109,6 +145,15 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const [shuffling, setShuffling] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState("");
+  /* 错误页要「人话 + 可折叠原文」（G 节）：原文只在这里留着，折叠后才给用户看 */
+  const [errorRaw, setErrorRaw] = useState("");
+  const [errorNetworkish, setErrorNetworkish] = useState(false);
+  const [lineOpen, setLineOpen] = useState(false);
+  /* 当前线路（左上角胶囊只在不是主站时出现） */
+  const [lineHost, setLineHost] = useState("");
+  /* 官网首页 banners（C 节）：非空时 hero 只按它来，空则回落到原来的口碑榜规则 */
+  const [banners, setBanners] = useState<HomeBanner[]>([]);
+  const bannersAt = useRef(0);
   const [heroIndex, setHeroIndex] = useState(0);
   const [heroDragX, setHeroDragX] = useState(0);
   const heroTouch = useRef<{ x: number; y: number } | null>(null);
@@ -164,6 +209,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       setDone(!rows.length || p >= pages);
       fresh.mark();
       if (silent) setError("");
+      if (my === seq.current) { setErrorRaw(""); setErrorNetworkish(false); }
       /* 空闲时预取下一页（滚动到底时命中读缓存，省掉一个来回）：
          首屏 → 第 2 页；每次追加完 → 再下一页。失败无所谓，滚到底还会正常请求。 */
       if (key === "all" && !replaceBatch && p + 1 <= pages) {
@@ -171,7 +217,13 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
         scheduleIdle(() => { void api.feed(next, 21).catch(() => { /* 预取失败无所谓 */ }); }, 1400);
       }
     } catch (e) {
-      if (my === seq.current && !silent) setError((e as Error)?.message || "加载失败");
+      if (my === seq.current && !silent) {
+        const failure = e as ApiError;
+        setError((e as Error)?.message || "加载失败");
+        /* G 节：原始错误（tls handshake eof / connection reset…）只进「详情」，默认不展示 */
+        setErrorRaw(typeof failure?.raw === "string" ? failure.raw : ((e as Error)?.message || ""));
+        setErrorNetworkish(!!failure?.networkish);
+      }
       if (silent) throw e;
     } finally {
       if (my === seq.current) {
@@ -201,6 +253,21 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     shelvesAt.current = Date.now();
   }, []);
 
+  /* 官网首页 banners（C 节）：和货架同一档 30s，force 由下拉刷新传入。
+     失败就保持空数组 —— hero 会自动回落到原来的口碑榜规则，不额外弹错。 */
+  const loadBanners = useCallback(async (force: boolean) => {
+    try {
+      const res = await api.home(force);
+      const rows = (res?.banners ?? []).filter(b => b && b.video_id > 0 && !!b.image_url);
+      if (!aliveRef.current) return;
+      setBanners(rows);
+      bannersAt.current = Date.now();
+      if (rows.length) logLine(`[home] banners=${rows.length} order=${rows.map(b => b.video_id).join(",")}`);
+    } catch (e) {
+      logLine(`[home] banners 拉取失败，回落口碑榜：${(e as Error)?.message ?? e}`);
+    }
+  }, []);
+
   /* 精选专题：最底部的一个横滑货架，既不参与主推/热榜的错峰去重，也不参与"为你推荐"的过滤，
      所以晚到不会引起任何重排。放到首屏卡片出来之后再空闲时取，首屏少一个并发请求。 */
   const loadTopics = useCallback(async (force: boolean) => {
@@ -215,15 +282,17 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
 
   /* 切线路：货架/专题的时间戳与在途请求全部作废，下一次进页强制重拉 */
   useEffect(() => {
-    shelvesAt.current = 0; topicsAt.current = 0;
+    shelvesAt.current = 0; topicsAt.current = 0; bannersAt.current = 0;
     shelfSeq.current++; topicSeq.current++;
+    setBanners([]);
   }, [lineEpoch]);
 
   useEffect(() => {
     if (!active || tab !== "all") return;
     if (shelvesAt.current && Date.now() - shelvesAt.current < FRESH_GAP_MS) return;
     void loadShelves(shelvesAt.current > 0);
-  }, [active, tab, lineEpoch, loadShelves]);
+    void loadBanners(bannersAt.current > 0);
+  }, [active, tab, lineEpoch, loadShelves, loadBanners]);
 
   useEffect(() => {
     if (!active || tab !== "all" || !items.length) return;
@@ -286,11 +355,11 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       }));
     } else {
       jobs.push(load(1, tab, false, { force: true, silent: true }));
-      if (tab === "all") jobs.push(loadShelves(true), loadTopics(true));
+      if (tab === "all") jobs.push(loadShelves(true), loadTopics(true), loadBanners(true));
     }
     await Promise.all(jobs);
     fresh.mark();
-  }, [tab, load, loadShelves, loadTopics, fresh]);
+  }, [tab, load, loadShelves, loadTopics, loadBanners, fresh]);
 
   const pull = usePullToRefresh({
     ref: scrollRef,
@@ -336,8 +405,26 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const visibleRanks = useMemo(() => filterAllowed(topRanks), [topRanks, filterAllowed]);
   const visibleOriginals = useMemo(() => filterAllowed(originals), [originals, filterAllowed]);
 
+  /* 0. 官网主推横幅（C 节，口径已定）：只要有 banners 就用它，**顺序即官网顺序**，
+        几条算几条，不和热播榜做任何排重；单条缺标题（详情补全失败）就跳过那一条。
+        banners 为空/失败时才回落到下面第 1 段原来的口碑榜规则。 */
+  const bannerHeroes = useMemo<HeroSpot[]>(() => banners
+    .filter(b => (b.title || "").trim().length > 0)
+    .map(b => ({
+      id: b.video_id,
+      title: (b.title || "").trim(),
+      cover: b.image_url,
+      tags: Array.isArray(b.tags) ? b.tags.filter(t => typeof t === "string" && t.trim()) : [],
+      score: Number(b.score) || 0,
+      episode_count: Number(b.episode_count) || 0,
+      total_episodes: Number(b.total_episodes) || undefined,
+      is_finished: !!b.is_finished,
+      kicker: Number(b.score) > 0 ? `官网主推 · ${Number(b.score).toFixed(1)}分` : "官网主推",
+    })), [banners]);
+
   /* 1. 顶部主推优选：优先从源站真实「口碑推荐榜」挑选高分剧，并主动错峰避开下方热播榜前 10 */
   const heroes = useMemo<HeroSpot[]>(() => {
+    if (bannerHeroes.length) return bannerHeroes;
     const hotTop10 = new Set(visibleRanks.map(r => r.video_id));
     const hotTop3 = new Set(visibleRanks.slice(0, 3).map(r => r.video_id));
     const picked: HeroSpot[] = [];
@@ -406,7 +493,22 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       }
     }
     return picked;
-  }, [visibleRecRanks, visibleRanks, visible]);
+  }, [bannerHeroes, visibleRecRanks, visibleRanks, visible]);
+
+  /* 左上角线路胶囊（G 节）：只有当前不在主站时才出现，告诉用户「你现在走的是备用线路」。
+     lineEpoch 每次换线都 +1，所以这里顺便在换线后重新读一次。 */
+  const backupLine = !!lineHost && !/(^|\.)huangguoai\.com$/i.test(lineHost);
+  useEffect(() => {
+    let live = true;
+    const read = () => {
+      api.lineState()
+        .then(state => { if (live) setLineHost(hostOf(state.base)); })
+        .catch(() => { /* 读不到就不显示胶囊，不影响首屏 */ });
+    };
+    read();
+    window.addEventListener("hg:line-changed", read);
+    return () => { live = false; window.removeEventListener("hg:line-changed", read); };
+  }, [lineEpoch]);
 
   const safeHeroIdx = Math.min(heroIndex, Math.max(heroes.length - 1, 0));
   const hero = heroes[safeHeroIdx];
@@ -497,6 +599,13 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       {/* 一级大字重流光顶栏：品牌徽标 + 推荐/上新/热榜 大字排版 + 全局搜索（省掉整排胶囊栏） */}
       <header className="shrink-0 hg-page-x hg-editorial-bar relative z-10">
         <Logo size={23} className="shrink-0 mr-1" />
+        {backupLine && (
+          <Button card className="hg-line-chip" onClick={() => setLineOpen(true)}
+            aria-label={`当前走备用线路 ${lineHost}，点按切换`} title={lineHost}>
+            <span className="hg-line-chip-dot" aria-hidden="true" />
+            <span className="hg-line-chip-text">{lineHost}</span>
+          </Button>
+        )}
         <div className="hg-ed-tabs" role="tablist" aria-label="首页分栏">
           {TABS.map(t => (
             <Button key={t.key} card role="tab" aria-selected={t.key === tab}
@@ -551,7 +660,8 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
           <div className="pt-1">
             {!items.length && loading && <div className="flex justify-center py-12"><Loader className="w-7 h-7 spinner" /></div>}
             {!items.length && !loading && error && (
-              <Empty icon={<ISearch size={26} />} title="新片加载失败" sub={error} action="重试" onAction={() => void load(1, "new")} />
+              <FeedError error={error} raw={errorRaw} networkish={errorNetworkish}
+                onRetry={() => void load(1, "new")} onSwitch={() => setLineOpen(true)} />
             )}
             {!items.length && !loading && !error && done && (
               <Empty icon={<ISearch size={26} />} title="暂无新片" sub="稍后刷新试试" action="刷新" onAction={() => void load(1, "new")} />
@@ -667,7 +777,8 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
           <>
             {!items.length && loading && <div className="flex justify-center py-12"><Loader className="w-7 h-7 spinner" /></div>}
             {!items.length && !loading && error && (
-              <Empty icon={<ISearch size={26} />} title="首页加载失败" sub={error} action="重试" onAction={() => void load(1, "all")} />
+              <FeedError error={error} raw={errorRaw} networkish={errorNetworkish}
+                onRetry={() => void load(1, "all")} onSwitch={() => setLineOpen(true)} />
             )}
             {!items.length && !loading && !error && done && (
               <Empty icon={<ISearch size={26} />} title="暂无视频" sub="稍后刷新试试" action="刷新" onAction={() => void load(1, "all")} />
@@ -912,6 +1023,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
           {continuePct > 0 && <span className="hg-continue-fill" style={{ width: `${continuePct}%` }} aria-hidden="true" />}
         </div>
       )}
+
+      {/* 播放源面板：首页线路胶囊与错误页的「换个线路」都走这里，切完 reload 由 lineEpoch 驱动 */}
+      <LinePicker open={lineOpen} onClose={() => setLineOpen(false)} />
     </div>
   );
 }

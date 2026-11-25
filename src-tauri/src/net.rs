@@ -58,11 +58,13 @@ fn doh_first(host: &str) -> bool {
 struct LineConfig {
     base: String,
     custom: bool,
+    /// 用户手动选定的线路（设置页点选）。自动换线**绝不动**它，见 [`is_manual_line`]。
+    manual: bool,
 }
 
 impl Default for LineConfig {
     fn default() -> Self {
-        Self { base: DEFAULT_BASE.to_string(), custom: false }
+        Self { base: DEFAULT_BASE.to_string(), custom: false, manual: false }
     }
 }
 
@@ -79,6 +81,11 @@ pub fn base() -> String {
 
 pub fn is_custom_line() -> bool {
     BASE.read().is_ok_and(|line| line.custom)
+}
+
+/// 用户手动选定的线路：自动换线/紧急换线都不得改动它（硬约束）。
+pub fn is_manual_line() -> bool {
+    BASE.read().is_ok_and(|line| line.manual || line.custom)
 }
 
 /// 线路必须是纯 HTTPS origin，不允许路径、认证、查询串或片段。
@@ -117,10 +124,17 @@ fn persisted_line(text: &str) -> Option<LineConfig> {
     let value: Value = serde_json::from_str(text).ok()?;
     // Accept the fork's v2 format as well as legacy {base}. Only explicit v2
     // custom selections carry custom-origin consent across restarts.
-    let custom = value.get("v").and_then(Value::as_u64) == Some(2)
-        && value.get("custom").and_then(Value::as_bool).unwrap_or(false)
+    let version = value.get("v").and_then(Value::as_u64).unwrap_or(0);
+    let marked_custom = value.get("custom").and_then(Value::as_bool).unwrap_or(false) && base != DEFAULT_BASE;
+    /* v2 起 custom 才是有意为之的（v1 旧格式只有 base，不授予自定义线路的信任）。 */
+    let custom = version >= 2 && marked_custom;
+    /* v3 起记录「用户手动选定」：自动换线不再动它。旧 v2 文件没有这个字段，
+       一律按自动线路处理（升级前手动选的线路会被自动选线接管一次，
+       这比「因为一个不存在的字段就永远不换线」更安全）。 */
+    let manual = version >= 3
+        && value.get("manual").and_then(Value::as_bool).unwrap_or(false)
         && base != DEFAULT_BASE;
-    Some(LineConfig { base, custom })
+    Some(LineConfig { base, custom: custom || (manual && marked_custom), manual })
 }
 
 /// 启动时恢复旧线路，但本地文件本身不会授予镜像凭据权限。
@@ -139,20 +153,25 @@ pub fn bind_base(dir: &std::path::Path) {
     refresh_media_scope();
 }
 
-/// 切换线路并落盘，返回规整后的地址。
+/// 切换线路并落盘，返回规整后的地址。**自动换线用**：不标记手动。
 pub fn set_base(url: &str) -> Result<String, String> {
-    apply_base(url, false)
+    apply_base(url, false, false)
+}
+
+/// 用户在设置页手动点选线路：以后自动换线不得再动它。
+pub fn set_base_manual(url: &str) -> Result<String, String> {
+    apply_base(url, false, true)
 }
 
 /// An explicit custom selection, separate from published/automatic candidates.
 pub fn set_custom_base(url: &str) -> Result<String, String> {
-    apply_base(url, true)
+    apply_base(url, true, true)
 }
 
 fn save_line(current: &mut LineConfig, next: LineConfig, path: Option<&std::path::Path>) -> Result<(), String> {
     if let Some(path) = path {
         let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, json!({ "v": 2, "base": next.base, "custom": next.custom }).to_string())
+        std::fs::write(&temp, json!({ "v": 3, "base": next.base, "custom": next.custom, "manual": next.manual }).to_string())
             .and_then(|_| std::fs::rename(&temp, path))
             .map_err(|_| "线路保存失败，已保持原线路，请检查应用数据目录")?;
     }
@@ -160,7 +179,7 @@ fn save_line(current: &mut LineConfig, next: LineConfig, path: Option<&std::path
     Ok(())
 }
 
-fn apply_base(url: &str, custom: bool) -> Result<String, String> {
+fn apply_base(url: &str, custom: bool, manual: bool) -> Result<String, String> {
     let next = normalize_base(url)
         .ok_or_else(|| "线路地址无效（需要纯 HTTPS 站点地址，禁止内网）".to_string())?;
     if !custom
@@ -173,7 +192,7 @@ fn apply_base(url: &str, custom: bool) -> Result<String, String> {
     let mut current = BASE.write().map_err(|_| "线路设置锁失败")?;
     let previous = current.base.clone();
     let file = BASE_FILE.read().map_err(|_| "线路配置锁失败")?;
-    save_line(&mut current, LineConfig { base: next.clone(), custom: custom && next != DEFAULT_BASE }, file.as_deref())?;
+    save_line(&mut current, LineConfig { base: next.clone(), custom: custom && next != DEFAULT_BASE, manual: manual && next != DEFAULT_BASE }, file.as_deref())?;
     drop(current);
     if previous != next {
         crate::playback_log::record(
@@ -547,17 +566,70 @@ async fn resolve_doh_fallback(
     port: u16,
     route: &ProxyRoute,
     strict: bool,
-) -> Result<crate::media_dns::Resolution, String> {
+) -> Result<(crate::media_dns::Resolution, &'static str), String> {
+    /* 5 分钟内的 DoH 结果直接复用：被污染的网络里每次解析都是一次赌，
+       缓存住正确地址，一个页面十几个请求就不用反复赌。 */
+    if let Some(addrs) = crate::media_dns::cache_get(host, port) {
+        return Ok((
+            crate::media_dns::Resolution { addresses: addrs, ttl: Duration::from_secs(300) },
+            "doh-cache",
+        ));
+    }
+    let mut last_error: String;
     let ali = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP, route)?;
-    if let Ok(resolution) = crate::media_dns::resolve(&ali, host, port).await {
-        if network_policy::check_addresses_with_mode(&resolution.addresses, strict).is_ok() {
-            return Ok(resolution);
+    match crate::media_dns::resolve(&ali, host, port).await {
+        Ok(resolution) if network_policy::check_addresses_with_mode(&resolution.addresses, strict).is_ok() => {
+            crate::media_dns::cache_put(host, port, &resolution.addresses);
+            return Ok((resolution, "doh-ali"));
+        }
+        Ok(_) => last_error = "阿里 DoH 返回内网/保留地址".into(),
+        Err(error) => last_error = error,
+    }
+    /* 腾讯 DoH：和阿里不在一条链路上，阿里被拦时常常还能用。 */
+    if let Ok(pubdns) = build_client(crate::media_dns::PUB_HOST, &crate::media_dns::PUB_BOOTSTRAP, route) {
+        match crate::media_dns::resolve_pub(&pubdns, host, port).await {
+            Ok(resolution) if network_policy::check_addresses_with_mode(&resolution.addresses, strict).is_ok() => {
+                crate::media_dns::cache_put(host, port, &resolution.addresses);
+                return Ok((resolution, "doh-pub"));
+            }
+            Ok(_) => last_error = "腾讯 DoH 返回内网/保留地址".into(),
+            Err(error) => last_error = error,
         }
     }
     let cf = build_client(crate::media_dns::CF_HOST, &crate::media_dns::CF_BOOTSTRAP, route)?;
-    let resolution = crate::media_dns::resolve_cloudflare(&cf, host, port).await?;
-    network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
-    Ok(resolution)
+    match crate::media_dns::resolve_cloudflare(&cf, host, port).await {
+        Ok(resolution) => {
+            network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
+            crate::media_dns::cache_put(host, port, &resolution.addresses);
+            Ok((resolution, "doh-cf"))
+        }
+        Err(error) => Err(if last_error.is_empty() { error } else { format!("{last_error}；{error}") }),
+    }
+}
+
+/// 最近一次给某个 host 定下的「最终连接地址」与来源，诊断用（不含查询内容）。
+static RESOLUTION_SOURCE: Lazy<Mutex<HashMap<String, (Instant, &'static str, Vec<SocketAddr>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn remember_resolution(host: &str, source: &'static str, addrs: &[SocketAddr]) {
+    let Ok(mut map) = RESOLUTION_SOURCE.lock() else { return };
+    if map.len() >= 32 {
+        map.clear();
+    }
+    map.insert(host.to_string(), (Instant::now(), source, addrs.to_vec()));
+}
+
+/// 某个 host 上一次实际使用的解析结果：`{ source, addrs, age_ms }`。
+pub fn resolution_source(host: &str) -> Value {
+    let Ok(map) = RESOLUTION_SOURCE.lock() else { return Value::Null };
+    match map.get(host) {
+        Some((at, source, addrs)) => json!({
+            "source": source,
+            "addrs": addrs.iter().map(|addr| addr.ip().to_string()).collect::<Vec<_>>(),
+            "age_ms": at.elapsed().as_millis() as u64,
+        }),
+        None => json!({}),
+    }
 }
 
 async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
@@ -574,33 +646,33 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
             return Ok((target, http));
         }
     }
-    let (addrs, ttl) = if proxy {
+    let (addrs, ttl, dns_source) = if proxy {
         // 有代理：跳过本地解析与 IP 校验，addrs 留空，域名交给代理。
-        (Vec::new(), CLIENT_TTL)
+        (Vec::new(), CLIENT_TTL, "proxy")
     } else if public_dns {
-        let resolution = resolve_doh_fallback(host, port, &route, strict).await?;
-        (resolution.addresses, CLIENT_TTL.min(resolution.ttl))
+        let (resolution, source) = resolve_doh_fallback(host, port, &route, strict).await?;
+        (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source)
     } else if strict {
         if doh_first(host) {
             // 先 DoH：被污染的域名拿到真地址，才不会在 TCP 上白等一整份超时。
             match resolve_doh_fallback(host, port, &route, strict).await {
-                Ok(resolution) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl)),
+                Ok((resolution, source)) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source),
                 Err(_) => match network_policy::resolve_target(&target, strict).await {
-                    Ok(addrs) => (addrs, CLIENT_TTL),
+                    Ok(addrs) => (addrs, CLIENT_TTL, "system"),
                     Err(err) => return Err(err),
                 },
             }
         } else {
             match network_policy::resolve_target(&target, strict).await {
-                Ok(addrs) => (addrs, CLIENT_TTL),
+                Ok(addrs) => (addrs, CLIENT_TTL, "system"),
                 Err(err)
                     if target.scheme() == "https"
                         && matches!(target.host(), Some(url::Host::Domain(_))) =>
                 {
                     // 系统 DNS 超时、失败或被运营商/路由器污染为 127.0.0.1 / 0.0.0.0 / 私网黑洞地址时，
-                    // 自动回退加密 DoH（阿里 + Cloudflare）获取真实公网地址；DoH 结果仍经过严格公网 IP 校验。
+                    // 自动回退加密 DoH（阿里 + 腾讯 + Cloudflare）获取真实公网地址；DoH 结果仍经过严格公网 IP 校验。
                     match resolve_doh_fallback(host, port, &route, strict).await {
-                        Ok(resolution) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl)),
+                        Ok((resolution, source)) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source),
                         Err(_) => return Err(err),
                     }
                 }
@@ -608,8 +680,9 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
             }
         }
     } else {
-        (Vec::new(), CLIENT_TTL)
+        (Vec::new(), CLIENT_TTL, "relaxed")
     };
+    remember_resolution(host, dns_source, &addrs);
     let http = Arc::new(build_client(host, &addrs, &route)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
@@ -637,6 +710,8 @@ pub fn refresh_client() {
     if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
         *routes = crate::media_dns::Routes::default();
     }
+    /* 换代理/换线路之后，5 分钟内的 DoH 缓存也该作废：新路径可能走另一张网络。 */
+    crate::media_dns::cache_clear();
 }
 
 /// 不可信 GET 的统一入口；自动重定向被关闭，每一跳重新检查 URL、DNS 并固定解析地址。
@@ -1237,6 +1312,7 @@ pub async fn diagnose() -> Value {
     // 否则会出现「诊断报解析失败、实际却打得开」的假阴性。
     let dns_started = Instant::now();
     let mut first_addr: Option<SocketAddr> = None;
+    let mut system_ips: Vec<String> = Vec::new();
     let dns = if host.is_empty() {
         json!({ "error": "当前线路没有主机名" })
     } else {
@@ -1250,6 +1326,7 @@ pub async fn diagnose() -> Value {
                 let addrs: Vec<SocketAddr> = iter.collect();
                 let ms = dns_started.elapsed().as_millis();
                 first_addr = addrs.first().copied();
+                system_ips = addrs.iter().map(|addr| addr.ip().to_string()).take(8).collect();
                 dns_report(&addrs, ms)
             }
             Ok(Err(e)) => json!({
@@ -1288,6 +1365,37 @@ pub async fn diagnose() -> Value {
 
     let (code, summary, advice) = verdict(&dns, &tcp, &http);
 
+    /* DoH 对照（3.0.14 B 节）：系统解析 vs 加密 DoH vs 实际连接地址。
+       三者写进诊断报告，被污染的网络上一眼能看出「系统 DNS 说 A、DoH 说 B、我们用了 B」。 */
+    let doh = if host.is_empty() {
+        json!({})
+    } else {
+        match url::Url::parse(&format!("{cur}/")) {
+            Ok(target) => {
+                let route = ProxyRoute::for_config(&crate::proxy::snapshot(), &target);
+                let strict_flag = network_policy::strict_security();
+                match resolve_doh_fallback(&host, 443, &route, strict_flag).await {
+                    Ok((resolution, source)) => {
+                        let ips: Vec<String> = resolution
+                            .addresses
+                            .iter()
+                            .map(|addr| addr.ip().to_string())
+                            .take(8)
+                            .collect();
+                        let mismatch = !system_ips.is_empty()
+                            && ips.iter().any(|ip| !system_ips.contains(ip));
+                        json!({
+                            "ok": true, "source": source, "addrs": ips,
+                            "system_addrs": system_ips, "mismatch": mismatch,
+                        })
+                    }
+                    Err(error) => json!({ "ok": false, "error": error, "system_addrs": system_ips }),
+                }
+            }
+            Err(_) => json!({ "error": "当前线路地址无效" }),
+        }
+    };
+
     json!({
         "verdict": code,
         "summary": summary,
@@ -1295,6 +1403,9 @@ pub async fn diagnose() -> Value {
         "base": cur,
         "host": host,
         "dns": dns,
+        "doh": doh,
+        "connect": resolution_source(&host),
+        "line_health": crate::line_health::snapshot(),
         "tcp": tcp,
         "http": http,
         "env": {
@@ -1402,6 +1513,9 @@ fn edge_redirect_target(
     }
     network_policy::redirect_target(current, location)
 }
+
+/// 链路层失败的统一前缀。前端看到它就换线重试；`HTTP 4xx/5xx` 与业务错误不带。
+pub const NETWORK_ERROR_PREFIX: &str = "NET:";
 
 /// 业务请求：走边缘信封。
 pub async fn edge(
@@ -1527,8 +1641,14 @@ async fn edge_inner(
                         continue;
                     }
                     let text = resp.text().await.map_err(|e| err_text(&e))?;
-                    if status.as_u16() == 401 || status.as_u16() == 403 {
+                    /* 上游 0c13ceb：403 不再冒充 401。403 常见于区域限制/风控/WAF，
+                       把它当成「登录态失效」会让前端去重登（重登也没用），
+                       也会把「线路被拦」误判成「账号问题」。 */
+                    if status.as_u16() == 401 {
                         return Err("401".to_string());
+                    }
+                    if status.as_u16() == 403 {
+                        return Err("403".to_string());
                     }
                     if !status.is_success() {
                         return Err(format!(
@@ -1556,7 +1676,31 @@ async fn edge_inner(
             result
         }
     })
-    .await?;
+    .await;
+
+    /* 线路健康（3.0.14 A 节）：只有链路层硬错误才计数/进黑名单；HTTP 与业务错误不算。
+       失败样本除了黑名单，还写一行 playback.log，便于用「origin + 错误类型」复盘。 */
+    let value = match value {
+        Ok(value) => {
+            crate::line_health::note_success(&cur);
+            value
+        }
+        Err(error) => match crate::line_health::note_failure(&cur, &error) {
+            Some(kind) => {
+                crate::playback_log::record(
+                    "line.fault",
+                    json!({ "line_host": line_host, "kind": kind, "operation": operation,
+                        "blacklisted": crate::line_health::blacklisted(&cur) }),
+                );
+                /* 类型化返回（3.0.14 A 节真机补丁）：前端只看文案猜「这是不是网络层失败」
+                   会漏 —— 真机上 `tcp connect error` / `deadline has elapsed` 都没命中
+                   前端那份正则，于是既没换线、也把英文原文直接甩给用户。
+                   这里用后端同一套判定加前缀，前端按前缀处理，不再猜。 */
+                return Err(format!("{NETWORK_ERROR_PREFIX}{kind} · {}", error.trim()));
+            }
+            None => return Err(error),
+        },
+    };
 
     if value.is_null() {
         return Ok(Value::Null);
@@ -2171,7 +2315,7 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("line.json");
-        let next = LineConfig { base: "https://mirror.fixture.invalid".into(), custom: true };
+        let next = LineConfig { base: "https://mirror.fixture.invalid".into(), custom: true, manual: false };
         let mut current = LineConfig::default();
         save_line(&mut current, next.clone(), Some(&path)).unwrap();
         assert_eq!(persisted_line(&std::fs::read_to_string(&path).unwrap()), Some(next.clone()));

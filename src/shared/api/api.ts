@@ -69,6 +69,7 @@ const READ_ONLY = new Set([
   "api_posts", "api_blog_posts", "api_post", "api_post_comments", "api_video", "api_play", "api_comments",
   "api_topics", "api_topic", "api_tags", "api_tag_videos", "api_search_hot",
   "api_post_playback", "api_post_categories", "api_post_category", "api_post_tag", "api_related", "api_following", "api_user", "api_user_stats", "api_user_videos",
+  "api_home", "api_hot_tags",
 ]);
 /** 给自动选线用的观察点。api.ts 不反向依赖 autoLine，避免循环 import。 */
 export type NetObserver = (r: { ok: boolean; cmd: string; msg?: string; networkish?: boolean }) => void;
@@ -77,6 +78,25 @@ export const setNetObserver = (fn: NetObserver | null) => { netObserver = fn; };
 const notifyNet = (r: Parameters<NetObserver>[0]) => {
   try { netObserver?.(r); } catch { /* 观察者不能影响请求本身 */ }
 };
+/** 请求失败的错误对象：界面要「人话 + 可折叠的原始错误」两样东西。
+ *  以前只 throw Error(message)，错误页只能把 `tls handshake eof` 直接怼给用户看。 */
+export class ApiError extends Error {
+  /** 原始错误链（折叠在「详情」里） */
+  raw: string;
+  /** 纯链路层失败（DNS/TLS/连接/超时），不是站点在说话 */
+  networkish: boolean;
+  /** 已经自动换过备用线路仍然失败 */
+  failoverTried: boolean;
+  constructor(message: string, raw: string, networkish: boolean, failoverTried: boolean) {
+    super(message);
+    this.name = "ApiError";
+    this.raw = raw;
+    this.networkish = networkish;
+    this.failoverTried = failoverTried;
+  }
+}
+/** 链路层失败时给用户看的话（报告 G 节）：说清楚「可能被拦」，并给一条可执行的建议。 */
+export const NETWORK_FAIL_TEXT = "可能被网络拦截。已尝试切换到备用线路，仍然失败。如果开了代理，请把 huangguoai.com 设为直连或全局代理。";
 const failMessage = (msg: string, status?: string) =>
   status
     ? `服务器请求失败（HTTP ${status}），请稍后重试或在设置中切换线路`
@@ -112,6 +132,10 @@ const CACHE_TTL: Record<string, number> = {
   api_tags: 300_000,
   api_post_categories: 300_000,
   api_search_hot: 120_000,
+  /* 首页 banners：和分类页同一档 30s —— 官网运营换横幅是「小时级」的，
+     但用户下拉刷新要求真的出网，所以 force 仍然绕过。 */
+  api_home: 30_000,
+  api_hot_tags: 300_000,
 };
 /** 过了 TTL 还能当"垫底数据"用的窗口：先给旧内容，后台静默刷新。
  *  10min 太长——用户看到的是十分钟前的内容，且旧代码刷新完也不回填界面，
@@ -170,46 +194,104 @@ function remember(key: string, ttl: number, value: unknown) {
   READ_CACHE.set(key, { value, expires: Date.now() + ttl, at: Date.now() });
 }
 
-/** 一次真正的请求（含链路异常重试一次），成功后写缓存并广播。 */
+/** 紧急换线（3.0.14 A 节）：链路层硬错误时让后端马上去找一条备用线路。
+ *  同一时刻只跑一次（首页一屏十几个请求同时挂，不能各自触发一轮探活）。
+ *  返回是否真的换了线路；换了就派 `hg:line-changed`（缓存与页面自己刷新）。 */
+let failoverFlight: Promise<boolean> | null = null;
+/** 最近一次紧急换线切到的 host。冷启动时事件可能早于界面的监听器（子组件 effect 先跑），
+ *  所以除了派事件，还留一份给界面「补拿」——见 store 里的 takeFailoverNotice()。 */
+let pendingFailoverHost = "";
+export const takeFailoverNotice = (): string => {
+  const host = pendingFailoverHost;
+  pendingFailoverHost = "";
+  return host;
+};
+export function failoverOnce(): Promise<boolean> {
+  if (!failoverFlight) {
+    failoverFlight = invoke<{ switched?: boolean; base?: string; reason?: string }>("line_failover")
+      .then((result) => {
+        if (!result?.switched || !result.base) {
+          logLine(`[line] failover 未换线（${result?.reason ?? "all-down"}）`);
+          return false;
+        }
+        const host = hostOf(result.base);
+        logLine(`[line] failover 已切到 ${host}（${result.reason ?? ""}）`);
+        pendingFailoverHost = host;
+        /* 先派「换了哪条」（让提示能弹出来），再派「线路变了」（各页重挂载重拉） */
+        window.dispatchEvent(new CustomEvent("hg:line-failover", { detail: { host, base: result.base } }));
+        window.dispatchEvent(new Event("hg:line-changed"));
+        return true;
+      })
+      .catch((error) => {
+        logLine(`[line] failover 失败：${(error as Error)?.message ?? error}`);
+        return false;
+      })
+      .finally(() => { failoverFlight = null; });
+  }
+  return failoverFlight;
+}
+
+/** 一次真正的请求（含链路异常换线 + 重试一次），成功后写缓存并广播。
+ *
+ *  3.0.14：链路层硬错误（TLS 阻断 / 连接重置 / DNS 污染）不再是「等 1.2 秒原地重试」——
+ *  那 1.2 秒里线路根本没变，重试必然再挂，用户看到的还是「加载失败」。
+ *  现在先让后端换一次镜像（磁盘缓存 + 种子，4 秒上限），换了就立刻重试；没换成才短暂等待。 */
+/** 后端给链路层失败打的类型化前缀（`NET:tls · ...`）。
+ *  真机教训：靠前端正则猜「是不是网络层失败」会漏 —— `tcp connect error`、
+ *  `deadline has elapsed` 都不在那份正则里，结果既不换线、还把英文原文甩给用户。 */
+const NET_PREFIX = "NET:";
+const isNetworkMessage = (msg: string) => msg.startsWith(NET_PREFIX) || (!/^HTTP (\d{3})\b/.test(msg) && NET_FAIL.test(msg));
+const stripNetPrefix = (msg: string) => (msg.startsWith(NET_PREFIX) ? msg.slice(NET_PREFIX.length).trim() : msg);
+
+/** 一次真正的请求：链路层失败 → 换线 → 重试（最多两轮换线）。
+ *
+ *  为什么是两轮：真机上第一条镜像可能「探活通、真请求又超时」（4s 探活 vs 10s 请求）。
+ *  只换一次就放弃的话，用户看到的还是错误页；第二轮会把刚失败的那条拉黑、换下一条。 */
 async function request<T>(cmd: string, args: Record<string, unknown> | undefined, key: string, ttl: number): Promise<T> {
   const once = () => invoke(cmd, args) as Promise<T>;
-  try {
-    const r = await once();
+  const succeed = (value: T) => {
     notifyNet({ ok: true, cmd });
-    remember(key, ttl, r);
-    publishData(cmd, key, r);
-    return r;
+    remember(key, ttl, value);
+    publishData(cmd, key, value);
+    return value;
+  };
+  let last = { msg: "", raw: "", networkish: false, switched: false };
+  try {
+    return succeed(await once());
   } catch (e) {
     const msg = typeof e === "string" ? e : "请求失败，请检查网络";
     const status = /^HTTP (\d{3})\b/.exec(msg)?.[1];
-    const networkish = !status && NET_FAIL.test(msg);
-    // 落盘完整错误链（dns error / connection refused / 证书错误…），toast 只显示截断版
+    const networkish = !status && isNetworkMessage(msg);
     logLine(`[api] ${cmd} → ${msg}`);
     tracePlayback("api.fail", { cmd, err: msg, status: status ?? null, networkish });
     notifyNet({ ok: false, cmd, msg, networkish });
-    // 线路可能正被自动切走：给切换留一点时间，只读请求重试一次，用户就不用看见这条错误
-    if (networkish && READ_ONLY.has(cmd)) {
-      logLine(`[api] ${cmd} 链路异常，1.2s 后重试一次`);
-      tracePlayback("api.retry", { cmd, err: msg });
-      await new Promise((r) => setTimeout(r, 1200));
-      try {
-        const r = await once();
-        logLine(`[api] ${cmd} 重试成功`);
-        tracePlayback("api.retry_ok", { cmd });
-        notifyNet({ ok: true, cmd });
-        remember(key, ttl, r);
-        publishData(cmd, key, r);
-        return r;
-      } catch (e2) {
-        const again = typeof e2 === "string" ? e2 : msg;
-        const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
-        logLine(`[api] ${cmd} 重试仍失败 → ${again}`);
-        tracePlayback("api.retry_failed", { cmd, err: again, status: againStatus ?? null });
-        throw new Error(failMessage(again, againStatus));
-      }
-    }
-    throw new Error(failMessage(msg, status));
+    last = { msg, raw: stripNetPrefix(msg), networkish, switched: false };
+    if (!networkish || !READ_ONLY.has(cmd)) throw new ApiError(failMessage(msg, status), stripNetPrefix(msg), networkish, false);
   }
+
+  const rounds = 2;
+  for (let round = 0; round < rounds; round += 1) {
+    const switched = await failoverOnce();
+    last.switched = last.switched || switched;
+    logLine(`[api] ${cmd} 链路异常，${switched ? `已换线（第 ${round + 1} 轮），立刻重试` : "1.2s 后原地重试一次"}`);
+    tracePlayback("api.retry", { cmd, err: last.msg, round, switched });
+    if (!switched) await new Promise((r) => setTimeout(r, 1200));
+    try {
+      const value = await once();
+      logLine(`[api] ${cmd} 重试成功${switched ? "（换线后）" : ""}`);
+      tracePlayback("api.retry_ok", { cmd, round, switched });
+      return succeed(value);
+    } catch (e2) {
+      const again = typeof e2 === "string" ? e2 : last.msg;
+      const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
+      const againNetworkish = !againStatus && isNetworkMessage(again);
+      last = { msg: again, raw: stripNetPrefix(again), networkish: againNetworkish, switched: last.switched };
+      logLine(`[api] ${cmd} 第 ${round + 1} 轮重试仍失败 → ${again}`);
+      tracePlayback("api.retry_failed", { cmd, err: again, round, status: againStatus ?? null });
+      if (!againNetworkish) throw new ApiError(failMessage(again, againStatus), stripNetPrefix(again), false, last.switched);
+    }
+  }
+  throw new ApiError(last.networkish ? NETWORK_FAIL_TEXT : failMessage(last.msg), last.raw, last.networkish, last.switched);
 }
 
 /** 后台静默刷新：同一个 key 只跑一次，失败不弹任何东西（下次进来还是旧值兜底）。 */
@@ -295,9 +377,13 @@ export const api = {
   /** `sort="new"` = 站点「最新上架」（/api/videos?sort=new，实测有效）。
    *  最后一个参数 `force=true` 表示刷新语义（绕过读缓存），下拉刷新/回前台/切 tab 用。 */
   feed: (page = 1, size = 20, sort?: "new", force = false) => call<Paged<VideoCard>>("api_feed", { page, size, sort: sort ?? null }, force),
+  /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。 */
+  home: (force = false) => call<{ banners: HomeBanner[]; source: string }>("api_home", undefined, force),
   topics: (force = false) => call<{ items: TopicCard[] }>("api_topics", undefined, force),
   topic: (slug: string, page = 1, size = 20, force = false) => call<TopicDetail>("api_topic", { slug, page, size }, force),
   tags: () => call<{ categories: TagGroup[] }>("api_tags"),
+  /** 官网首页 SSR 的热门题材（slug + name，顺序即官网顺序）；失败时前端回退 tags()。 */
+  hotTags: (force = false) => call<{ items: { name: string; slug: string }[] }>("api_hot_tags", undefined, force),
   /* 默认 latest：官网标签页默认就是「最新」，省略 sort 时后端按 hot 出（上游 42d7d71） */
   tagVideos: (tag: string, page = 1, size = 20, sort: "latest" | "hot" = "latest", force = false) =>
     call<Paged<VideoCard>>("api_tag_videos", { tag, page, size, sort }, force),
@@ -370,6 +456,10 @@ export const api = {
   /* 线路（数据源）：固定线路写死在 Rust 侧，镜像线路从地址发布页拉、推荐镜像从发布入口页拉 */
   lineState: () => call<LineState>("line_state"),
   lineSet: (url: string) => call<string>("line_set", { url }),
+  /* 自动选线专用：应用一条不是用户手动指定的线路（偏好让位 / 恢复回切） */
+  lineSetAuto: (url: string) => call<string>("line_set_auto", { url }),
+  /* 链路层硬错误时立刻换一条备用线路（A 节）；页面一般不用直接调，request() 已经代劳 */
+  lineFailover: () => call<LineFailover>("line_failover"),
   lineCustomSet: (url: string) => call<LineApply>("line_custom_set", { url }),
   lineReset: () => call<LineApply>("line_reset"),
   lineCancel: () => call<void>("line_cancel"),
@@ -409,7 +499,7 @@ export type UpdateInfo = {
 /* ── 线路（数据源） ─────────────────────────────────────── */
 
 export type LineItem = { name?: string; url: string; host?: string };
-export type LineState = { base: string; default: string; fixed: LineItem[]; custom?: boolean };
+export type LineState = { base: string; default: string; fixed: LineItem[]; custom?: boolean; manual?: boolean };
 export type LineApply = { base: string; custom: boolean };
 export type LineMirrors = { source: string; script?: string; items: LineItem[]; recommended_source?: string; recommended: LineItem[] };
 export type LineProbe = { url: string; ok: boolean; status?: number; ms: number; error?: string };
@@ -449,6 +539,31 @@ export type LineAuto = {
     reason: string;
     candidates: LineAutoCandidate[];
   };
+};
+
+/** 链路层硬错误后的紧急换线结果（A 节）。`reason` 为 manual 表示当前是用户手动选的线路，拒绝自动换。 */
+export type LineFailover = {
+  cancelled?: boolean;
+  previous: string;
+  base: string;
+  switched: boolean;
+  reason: string | null;
+  ms: number | null;
+};
+
+/** 官网首页横幅（C 节）。`image_url` 是可直接当封面用的绝对地址，`image` 保留官网原始相对路径。 */
+export type HomeBanner = {
+  id: number | null;
+  video_id: number;
+  image: string;
+  image_url: string;
+  score: number | null;
+  desc: string;
+  title: string | null;
+  tags: string[] | null;
+  episode_count: number | null;
+  total_episodes: number | null;
+  is_finished: boolean | null;
 };
 
 /** 回切主站的探测结果：`probe.ok` 为主站到底通不通 */

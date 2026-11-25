@@ -9,6 +9,7 @@ mod env;
 mod ios_layout;
 #[cfg(any(target_os = "ios", test))]
 mod ios_media_http;
+mod line_health;
 mod lines;
 #[cfg(target_os = "linux")]
 mod linux_http;
@@ -114,6 +115,7 @@ pub fn run() {
                 // 上次选择的线路（设置 → 线路）在启动时恢复
                 net::bind_base(&dir);
                 lines::bind(&dir);
+                line_health::bind(&dir);
                 playback_log::bind(&dir);
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
@@ -234,6 +236,8 @@ pub fn run() {
             api::line_probe,
             api::line_auto,
             api::line_try_main,
+            api::line_failover,
+            api::line_set_auto,
             api::line_health,
             api::proxy_state,
             api::proxy_set,
@@ -250,6 +254,7 @@ pub fn run() {
             api::api_account_history_record,
             api::api_account_history_delete,
             api::api_feed,
+            api::api_home,
             api::api_original_videos,
             api::api_topics,
             api::api_topic,
@@ -260,6 +265,7 @@ pub fn run() {
             api::api_rank,
             api::api_search,
             api::api_search_hot,
+            api::api_hot_tags,
             api::cache_clear,
             api::api_posts,
             api::api_blog_posts,

@@ -2131,3 +2131,23 @@
 .hg-premiere-card,
 .ios-search-hot-item, .ios-button.ios-search-hot-item,
 .ios-poster { border-radius: var(--r-card); }
+
+/* 备用线路胶囊（3.0.14 G 节）：只在「当前不是主站」时出现，贴在品牌徽标右侧。
+   尺寸钉死（高 26 / 圆角 999 / 11-600），最多 108px 宽，长域名省略，
+   保证 360dp 下顶栏三个 tab + 抖音模式 + 搜索不会被挤换行。 */
+.ios-button.hg-line-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 4px;
+  height: 26px; min-block-size: 0; min-inline-size: 0; padding: 0 9px;
+  border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.82);
+  font-size: 11px; font-weight: 600; line-height: 1; white-space: nowrap;
+}
+.ios-button.hg-line-chip:active { transform: scale(.97); }
+.hg-line-chip-dot {
+  width: 5px; height: 5px; border-radius: 50%; flex: none;
+  background: #FFB347; box-shadow: 0 0 6px rgba(255, 179, 71, 0.85);
+}
+.hg-line-chip-text { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 359px) {
+  .hg-line-chip-text { max-width: 74px; }
+}
