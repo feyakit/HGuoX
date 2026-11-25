@@ -955,30 +955,52 @@ pub async fn api_home(state: State<'_, Api>) -> Result<Value, String> {
         .unwrap_or_default();
     let origin = crate::net::base();
 
-    let mut set = tokio::task::JoinSet::new();
-    for (index, banner) in banners.iter().enumerate() {
-        let Some(video_id) = banner.get("video_id").and_then(Value::as_i64).filter(|id| *id > 0) else {
-            continue;
-        };
-        let origin = origin.clone();
-        set.spawn(async move {
-            let path = format!("/api/videos/{video_id}");
-            let detail = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                crate::net::edge_once(&origin, "GET", &path, None, None),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            (index, detail)
-        });
-    }
-    let mut enriched = std::collections::HashMap::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok((index, Some(detail))) = joined {
-            enriched.insert(index, detail);
+    /* 官网 banner 只给 video_id 和 desc，标题/集数/评分都得逐条补详情。
+       真机上这份补齐曾经只活下来一条 —— 4 秒的预算在被墙网络里太紧，
+       于是首页 hero 只剩一张卡。这里给 6 秒，没回来的再补一轮 8 秒。 */
+    let mut enriched: std::collections::HashMap<usize, Value> = std::collections::HashMap::new();
+    let mut pending: Vec<(usize, i64)> = banners
+        .iter()
+        .enumerate()
+        .filter_map(|(index, banner)| {
+            banner
+                .get("video_id")
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+                .map(|id| (index, id))
+        })
+        .collect();
+    for budget in [6u64, 8u64] {
+        if pending.is_empty() {
+            break;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for (index, video_id) in pending.drain(..) {
+            let origin = origin.clone();
+            set.spawn(async move {
+                let path = format!("/api/videos/{video_id}");
+                let detail = tokio::time::timeout(
+                    std::time::Duration::from_secs(budget),
+                    crate::net::edge_once(&origin, "GET", &path, None, None),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
+                (index, video_id, detail)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((index, video_id, detail)) = joined {
+                match detail {
+                    Some(detail) => {
+                        enriched.insert(index, detail);
+                    }
+                    None => pending.push((index, video_id)),
+                }
+            }
         }
     }
+
 
     let items: Vec<Value> = banners
         .iter()
