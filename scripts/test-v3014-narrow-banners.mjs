@@ -52,7 +52,7 @@ async function openApp(context, { mode }) {
     });
     const banners_ = banners.map((banner, index) => ({ ...banner, id: 28 + index }));
     localStorage.setItem("hguox_usage_agreement", JSON.stringify({ version: "2026-11-15-v1", accepted: true, acceptedAt: "2026-11-15T00:00:00.000Z" }));
-    window.v3014 = { calls, feedFails: mode === "all-down" ? 9 : mode === "failover" ? 1 : 0, switched: false, banners: banners_, events: [] };
+    window.v3014 = { calls, feedFails: mode === "failover" ? 1 : mode === "ok" ? 0 : 99, switched: false, banners: banners_, events: [] };
     ["hg:line-failover", "hg:line-changed"].forEach(name => window.addEventListener(name, () => window.v3014.events.push(name)));
     /* toast 只活 3.6s，靠轮询会错过：MutationObserver 全程记下来 */
     window.v3014.toastSeen = [];
@@ -75,6 +75,8 @@ async function openApp(context, { mode }) {
           case "line_auto": return Promise.resolve({ base: "https://huangguoai.com", previous: "https://huangguoai.com", switched: false, pick: { base: "https://huangguoai.com", tier: "main", ms: 1, reason: "fixture", candidates: [] } });
           case "line_health": return Promise.resolve({ base: "https://huangguoai.com", ok: true, ms: 1, status: 200 });
           case "line_failover": {
+            /* manual：模拟用户手动选了线路，后端拒绝自动换（硬约束） */
+            if (mode === "manual-down") return Promise.resolve({ previous: "https://thu.dvygahpw.cc", base: "https://thu.dvygahpw.cc", switched: false, reason: "manual", ms: 0, pick: null });
             const canSwitch = mode === "failover";
             window.v3014.switched = canSwitch;
             return Promise.resolve({ previous: "https://huangguoai.com", base: canSwitch ? "https://thu.dvygahpw.cc" : "https://huangguoai.com", switched: canSwitch, reason: canSwitch ? "failover-ok" : "all-down", ms: 12 });
@@ -272,6 +274,20 @@ try {
   assert.ok(recovered, "换线后重试成功时首页应出内容，而不是错误页");
   await failoverPage.screenshot({ path: join(output, "home-failover-ok.png") });
   await failoverPage.close();
+
+  // ── 3b. 手动选定的线路不可用时：不许自动换，只提示 ────────────────
+  const manualPage = await openApp(context, { mode: "manual-down" });
+  await manualPage.waitForSelector('[role="alert"]', { timeout: 15000 });
+  const manualState = await manualPage.evaluate(() => ({
+    events: window.v3014.events,
+    calls: window.v3014.calls.map(c => c.cmd),
+    alert: document.querySelector('[role="alert"]')?.textContent?.slice(0, 120) || "",
+  }));
+  const notSwitched = !manualState.events.includes("hg:line-changed") && !manualPage.url().includes("?line=");
+  report.cases.push({ case: "手动线路失败：不自动换线，只给提示", ...manualState, notSwitched, pass: notSwitched && manualState.calls.includes("line_failover") });
+  assert.ok(notSwitched, "手动选定的线路失败时不允许自动跳线");
+  await manualPage.screenshot({ path: join(output, "home-manual-line-down.png") });
+  await manualPage.close();
 
   // ── 4. 全挂：错误页文案 / 详情折叠 / 两个按钮 ──────────────────────
   const downPage = await openApp(context, { mode: "all-down" });
