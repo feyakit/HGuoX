@@ -70,6 +70,16 @@ export function formatNetDiag(raw: Json): string {
   lines.push(`${pad("主机")}${str(raw.host) || "-"}`);
   lines.push("");
 
+  /* ── DoH 对照（3.0.14）：系统解析 vs 加密 DoH ── */
+  const doh = obj(raw.doh);
+  if (str(doh.source) || arr(doh.addrs).length) {
+    lines.push("── DoH ───────────────────────────");
+    lines.push(`${pad("系统解析")}${arr(doh.system_addrs).map(String).join(", ") || "-"}`);
+    lines.push(`${pad("DoH 解析")}${arr(doh.addrs).map(String).join(", ") || "-"}${str(doh.source) ? `（${str(doh.source)}）` : ""}`);
+    lines.push(`${pad("两者一致")}${doh.mismatch === true ? "否（系统 DNS 被污染/改写）" : "是"}`);
+    lines.push("");
+  }
+
   /* ── DNS ── */
   lines.push("── DNS ───────────────────────────");
   if (str(dns.error)) {
