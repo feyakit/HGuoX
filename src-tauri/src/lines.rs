@@ -805,6 +805,12 @@ impl Hit {
 }
 
 async fn probe_hit(tier: &'static str, raw: &str) -> Hit {
+    probe_hit_with(tier, raw, AUTO_PROBE_TIMEOUT).await
+}
+
+/// 同 [`probe_hit`]，超时可调：硬错误后的紧急换线只给 4 秒，
+/// 不能让一条被墙的镜像把首屏拖到 5 秒以上。
+async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit {
     let mut hit = Hit {
         tier,
         url: raw.to_owned(),
@@ -823,7 +829,7 @@ async fn probe_hit(tier: &'static str, raw: &str) -> Hit {
     // edge_once sends the upstream's real envelope without retry backoff.
     // This total deadline covers DNS, TLS, and the response body.
     match tokio::time::timeout(
-        AUTO_PROBE_TIMEOUT,
+        timeout,
         crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
     )
     .await
@@ -840,7 +846,7 @@ async fn probe_hit(tier: &'static str, raw: &str) -> Hit {
             hit.error = Some(error);
         }
         Err(_) => {
-            hit.error = Some("视频接口探测超时（3 秒）".into());
+            hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
         }
     }
     hit.ms = started.elapsed().as_millis() as u64;
@@ -936,9 +942,58 @@ fn custom_candidate(current: &str) -> Option<String> {
 /// Prefer the real main API when it responds promptly; otherwise fetch cached
 /// mirrors concurrently and settle shortly after the first healthy mirror.
 pub async fn auto_pick() -> Value {
-    let mut main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
+    /* A4：上次真正连通过的线路优先试一次，和主站并行、只给 3.5 秒。
+       被墙的网络里主站必挂，而发布页经常一起挂——旧流程会先白等 12 秒发布页
+       才轮到镜像，用户看到的就是「首页一直转圈」。这条快路只要有一条通就直接用，
+       两条都不通才回到下面完整流程（发布页 + 种子 + 自定义线路）。 */
+    if let Some(good) = crate::line_health::last_good()
+        .filter(|origin| !is_fixed(origin) && !crate::line_health::blacklisted(origin))
+        .filter(|origin| origin != &crate::net::base())
+    {
+        let main = FIXED[0].1.to_string();
+        let good_for_probe = good.clone();
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async move { probe_hit_with("main", &main, Duration::from_secs(3)).await });
+        set.spawn(async move {
+            probe_hit_with("mirror", &good_for_probe, Duration::from_secs(3)).await
+        });
+        let mut hits = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
+        loop {
+            let next = tokio::select! {
+                joined = set.join_next() => joined,
+                _ = tokio::time::sleep_until(deadline) => None,
+            };
+            let Some(joined) = next else { break };
+            let Ok(hit) = joined else { continue };
+            let ok = hit.ok;
+            let is_main = hit.tier == "main";
+            hits.push(hit);
+            if ok {
+                /* 主站通了优先用主站；镜像先通就先回镜像（速度优先，之后 try_main 会回切） */
+                set.abort_all();
+                let mut result = pick_from_hits(&hits);
+                result["reason"] = json!(if is_main { "main-ok-fast" } else { "last-good-fast" });
+                return result;
+            }
+        }
+        set.abort_all();
+        /* 两条都快挂：保留失败样本给 pick_from_hits / 日志，继续完整流程 */
+        let main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
+        let mirrors_handle = tokio::spawn(mirrors_cached());
+        return auto_pick_full(main_handle, mirrors_handle, hits).await;
+    }
+    let main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
     let mirrors_handle = tokio::spawn(mirrors_cached());
-    let mut hits = Vec::new();
+    auto_pick_full(main_handle, mirrors_handle, Vec::new()).await
+}
+
+async fn auto_pick_full(
+    main_handle: tokio::task::JoinHandle<Hit>,
+    mirrors_handle: tokio::task::JoinHandle<Result<Value, String>>,
+    mut hits: Vec<Hit>,
+) -> Value {
+    let mut main_handle = main_handle;
     let mut main_pending = true;
 
     tokio::select! {
@@ -1031,6 +1086,72 @@ pub async fn auto_pick() -> Value {
         result["mirror_error"] = json!(error);
     }
     result
+}
+
+/// 紧急换线：网络层硬错误（TLS 被阻断 / 连接重置 / DNS 污染）时，立刻在
+/// 「磁盘缓存的镜像 + 内置种子」里找一条真能用的，第一个成功的就算数。
+///
+/// 故意**不抓发布页**：发布页一次要 2–12 秒（还可能同样被墙），首屏等不起。
+/// 候选顺序：上次可用（磁盘 line-health.json）→ 发布页缓存 → 内置种子；
+/// 黑名单里的（刚失败过）与 `exclude` 本身直接跳过。
+pub async fn failover(exclude: &str) -> Value {
+    const FAILOVER_PROBE: Duration = Duration::from_secs(4);
+    const FAILOVER_MAX: usize = 8;
+
+    let excluded = crate::net::normalize_base(exclude).unwrap_or_default();
+    let mut seen = HashSet::new();
+    seen.insert(excluded);
+    let mut candidates: Vec<(String, &'static str)> = Vec::new();
+
+    let mut push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>| {
+        if candidates.len() >= FAILOVER_MAX {
+            return;
+        }
+        let Some(origin) = crate::net::normalize_base(&raw) else { return };
+        if is_fixed(&origin) || crate::line_health::blacklisted(&origin) || !seen.insert(origin.clone()) {
+            return;
+        }
+        candidates.push((origin, tier));
+    };
+
+    if let Some(good) = crate::line_health::last_good() {
+        push(good, "last-good", &mut candidates);
+    }
+    if let Some(listing) = load_mirrors_cache() {
+        for item in listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            if let Some(url) = item.get("url").and_then(Value::as_str) {
+                push(url.to_string(), "mirror", &mut candidates);
+            }
+        }
+    }
+    for origin in SEED_MIRRORS {
+        push(origin.to_string(), "seed", &mut candidates);
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for (origin, tier) in candidates {
+        let origin = origin.clone();
+        set.spawn(async move { probe_hit_with(tier, &origin, FAILOVER_PROBE).await });
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(hit) = joined {
+            let ok = hit.ok;
+            let url = hit.url.clone();
+            hits.push(hit);
+            if ok {
+                set.abort_all();
+                return json!({
+                    "base": url, "tier": "failover", "ms": hits.last().map(|hit| hit.ms).unwrap_or(0),
+                    "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+                });
+            }
+        }
+    }
+    json!({
+        "base": "", "tier": "none", "ms": 0, "reason": "all-down",
+        "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+    })
 }
 
 pub async fn try_main() -> Value {

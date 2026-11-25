@@ -1,7 +1,9 @@
 use crate::network_policy;
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(crate) const HOST: &str = "dns.alidns.com";
@@ -9,12 +11,55 @@ pub(crate) const BOOTSTRAP: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 443),
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(223, 6, 6, 6)), 443),
 ];
+/// 腾讯 DoH：阿里解析失败时的第二选择（国内可达，和阿里/CF 走的是不同网络）。
+pub(crate) const PUB_HOST: &str = "doh.pub";
+pub(crate) const PUB_BOOTSTRAP: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(120, 53, 53, 53)), 443),
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 12, 12, 12)), 443),
+];
 pub(crate) const CF_HOST: &str = "cloudflare-dns.com";
 pub(crate) const CF_BOOTSTRAP: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 443),
 ];
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+/// DoH 结果缓存：5 分钟（报告 B 节）。DNS 污染是「每次解析都被带偏」，
+/// 缓存住正确结果才能让首页连续几个请求都走同一条正路，而不是每请求再赌一次。
+const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+static RESOLVED: Lazy<Mutex<HashMap<String, (Instant, Vec<SocketAddr>)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn cache_key(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
+}
+
+/// 取 5 分钟内的 DoH 结果（含端口，A 记录）。
+pub(crate) fn cache_get(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let now = Instant::now();
+    let cache = RESOLVED.lock().ok()?;
+    let (at, addrs) = cache.get(&cache_key(host, port))?;
+    (now.duration_since(*at) < RESOLVE_CACHE_TTL).then(|| addrs.clone())
+}
+
+pub(crate) fn cache_put(host: &str, port: u16, addrs: &[SocketAddr]) {
+    if addrs.is_empty() {
+        return;
+    }
+    let Ok(mut cache) = RESOLVED.lock() else { return };
+    let now = Instant::now();
+    cache.retain(|_, (at, _)| now.duration_since(*at) < RESOLVE_CACHE_TTL);
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(cache_key(host, port), (now, addrs.to_vec()));
+}
+
+pub(crate) fn cache_clear() {
+    if let Ok(mut cache) = RESOLVED.lock() {
+        cache.clear();
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Routes(HashMap<String, Instant>);
@@ -126,6 +171,15 @@ pub(crate) async fn resolve_cloudflare(
     port: u16,
 ) -> Result<Resolution, String> {
     resolve_json_endpoint(http, &format!("https://{CF_HOST}/dns-query"), host, port).await
+}
+
+/// 腾讯 DoH（`doh.pub`）：同样支持 JSON 形式的 `/dns-query`。
+pub(crate) async fn resolve_pub(
+    http: &reqwest::Client,
+    host: &str,
+    port: u16,
+) -> Result<Resolution, String> {
+    resolve_json_endpoint(http, &format!("https://{PUB_HOST}/dns-query"), host, port).await
 }
 
 #[cfg(test)]
