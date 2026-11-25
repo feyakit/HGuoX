@@ -857,7 +857,16 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
                 hit.status = Some(200);
                 hit.ok = healthy_video_data(&data);
                 if !hit.ok {
-                    hit.error = Some("接口未返回有效视频列表数据".into());
+                    /* 上游停了边缘信封时，信封这条路会返回「接口已停用」；
+                       虽然 net.rs 里已有自动直连兜底，探活这里再兜一层，避免因为
+                       envelope/缓存状态差异把一条真能用的镜像判死。 */
+                    match crate::net::probe_direct(&origin).await {
+                        Ok(true) => {
+                            hit.ok = true;
+                        }
+                        Ok(false) => hit.error = Some("接口未返回有效视频列表数据".into()),
+                        Err(error) => hit.error = Some(error),
+                    }
                 }
                 break;
             }
@@ -1182,6 +1191,7 @@ pub async fn failover(exclude: &str) -> Value {
 
     let (winner, mut hits) = race_candidates(candidates, FAILOVER_PROBE).await;
     if let Some(hit) = winner {
+        crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
         return json!({
             "base": hit.url, "tier": "failover", "ms": hit.ms,
             "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
@@ -1206,6 +1216,7 @@ pub async fn failover(exclude: &str) -> Value {
         let (winner, more) = race_candidates(fresh, FAILOVER_PROBE).await;
         hits.extend(more);
         if let Some(hit) = winner {
+            crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
             return json!({
                 "base": hit.url, "tier": "failover", "ms": hit.ms,
                 "reason": "failover-published", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
@@ -1213,6 +1224,7 @@ pub async fn failover(exclude: &str) -> Value {
         }
     }
 
+    crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
     json!({
         "base": "", "tier": "none", "ms": 0, "reason": "all-down",
         "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),

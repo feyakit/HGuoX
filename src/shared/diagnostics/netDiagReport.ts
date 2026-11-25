@@ -80,6 +80,21 @@ export function formatNetDiag(raw: Json): string {
     lines.push("");
   }
 
+  /* ── 最近一次换线尝试的候选明细（3.0.14）：放在最前面，一眼能看出哪家探不通 ── */
+  const probes = arr(raw.failover_probe).map(obj);
+  if (probes.length) {
+    lines.push("── 换线候选 ──────────────────────");
+    for (const row of probes.slice(0, 10)) {
+      const host = String(str(row.url) ?? "").replace(/^https:\/\//, "");
+      const ok = row.ok === true;
+      const tail = ok
+        ? `${num(row.ms) ?? 0}ms`
+        : `失败：${str(row.error) ?? "未知"}`.replace(/\s+/g, " ").slice(0, 60);
+      lines.push(`${pad(String(str(row.tier) ?? ""))}${host} · ${tail}`);
+    }
+    lines.push("");
+  }
+
   /* ── 线路健康（3.0.14）：最近可用线路 + 被判死的线路 ── */
   const health = obj(raw.line_health);
   const blocked = arr(health.blacklist).map(obj);

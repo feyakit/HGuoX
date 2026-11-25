@@ -1411,6 +1411,7 @@ pub async fn diagnose() -> Value {
         "doh": doh,
         "connect": resolution_source(&host),
         "line_health": crate::line_health::snapshot(),
+        "failover_probe": crate::line_health::probe_log(),
         "tcp": tcp,
         "http": http,
         "env": {
@@ -1768,6 +1769,30 @@ fn mark_envelope_disabled() {
         .unwrap_or(0)
         + 10 * 60;
     ENVELOPE_OFF_UNTIL.store(until, Ordering::Relaxed);
+}
+
+/// 探活用：绕过信封，直接打 REST 看这家镜像到底有没有真数据。
+/// 返回 Ok(true) 表示拿到了有效的视频列表（items + pagination）。
+pub async fn probe_direct(origin: &str) -> Result<bool, String> {
+    let url = format!("{}/api/videos?page=1&size=1", origin.trim_end_matches('/'));
+    let (target, http) = client_for(&url).await?;
+    let response = http
+        .get(target)
+        .header("Accept", "application/json")
+        .header("Referer", format!("{}/", origin.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|error| err_text(&error))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    let text = response.text().await.map_err(|error| err_text(&error))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("返回的不是 JSON（{} 字节）", text.len()))?;
+    let data = value.get("data").cloned().unwrap_or(value);
+    Ok(data.get("items").and_then(Value::as_array).is_some_and(|items| !items.is_empty())
+        && data.get("pagination").and_then(Value::as_object).is_some())
 }
 
 /// 直连 REST：与信封拿的是同一个 `path`，只是不再套 `/api/edge/request`。

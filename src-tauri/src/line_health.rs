@@ -31,6 +31,19 @@ struct Entry {
 }
 
 static STATE: RwLock<Option<HashMap<String, Entry>>> = RwLock::new(None);
+
+/// 最近一次换线尝试的候选明细（诊断报告里读，只在内存里留一份）。
+static PROBE_LOG: RwLock<Vec<serde_json::Value>> = RwLock::new(Vec::new());
+
+pub fn record_probe(rows: Vec<serde_json::Value>) {
+    if let Ok(mut log) = PROBE_LOG.write() {
+        *log = rows;
+    }
+}
+
+pub fn probe_log() -> Vec<serde_json::Value> {
+    PROBE_LOG.read().map(|log| log.clone()).unwrap_or_default()
+}
 static DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 fn with_state<R>(f: impl FnOnce(&mut HashMap<String, Entry>) -> R) -> R {
