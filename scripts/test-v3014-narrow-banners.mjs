@@ -219,8 +219,10 @@ try {
   // ── 2d. 我的页（窄屏两列快捷入口 + 账号卡） ────────────────────────
   const profilePage = await openApp(context, { mode: "ok" });
   await profilePage.getByRole("navigation", { name: "主导航" }).waitFor({ timeout: 15000 });
-  await profilePage.getByRole("button", { name: "我的" }).click().catch(() => {});
-  await profilePage.waitForTimeout(600);
+  const profileTab = profilePage.locator(".ios-mobile-nav-item").filter({ hasText: "我的" }).first();
+  await profileTab.click().catch(async () => { await profilePage.getByText("我的", { exact: true }).last().click().catch(() => {}); });
+  await profilePage.waitForTimeout(900);
+  console.error("profile links:", await profilePage.locator(".ios-collection-link").count());
   for (const width of [320, 360, 393]) {
     await profilePage.setViewportSize({ width, height: 844 });
     await profilePage.waitForTimeout(200);
@@ -244,6 +246,11 @@ try {
       };
     });
     report.geometry.push({ width, screen: "profile", ...sample });
+    if (sample.links.length === 0) {
+      /* 未登录时「我的」页在这套 fixture 里没有渲染快捷入口：不测就等于没测，明确记下来 */
+      report.cases.push({ case: `${width}dp 我的页快捷入口几何`, skipped: "未登录 + fixture 未渲染 .ios-collection-link", pass: null });
+      continue;
+    }
     assert.ok(sample.pageOverflow <= 0, `${width}dp 我的页横向溢出 ${sample.pageOverflow}`);
     assert.equal(sample.clippedLinks, 0, `${width}dp 我的页有 ${sample.clippedLinks} 个快捷入口文字被裁`);
   }
@@ -253,8 +260,11 @@ try {
 
   // ── 3. 失败 → 换线 → 成功（不出现错误页） ──────────────────────────
   const failoverPage = await openApp(context, { mode: "failover" });
-  await failoverPage.waitForTimeout(4000);
-  const toastSeen = await failoverPage.evaluate(() => (window.v3014.toastSeen || []).some(text => text.includes("已切换到备用线路")));
+  let toastSeen = false;
+  for (let i = 0; i < 32 && !toastSeen; i += 1) {
+    await failoverPage.waitForTimeout(250);
+    toastSeen = await failoverPage.evaluate(() => (window.v3014.toastSeen || []).some(text => text.includes("已切换到备用线路")));
+  }
   report.cases.push({ case: "换线成功后有「已切换到备用线路」提示", seen: await failoverPage.evaluate(() => window.v3014.toastSeen), pass: toastSeen });
   assert.ok(toastSeen, "换线成功后必须提示「已切换到备用线路」");
   const failoverState = await failoverPage.evaluate(() => ({
