@@ -30,8 +30,9 @@ const RECOMMENDED_MAX: usize = 20;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PUBLISH_BYTES: usize = 512 * 1024;
 const AUTO_PROBE_PATH: &str = "/api/videos?page=1&size=1";
-/// 国内实测镜像探活 1.13–2.75s，3 秒预算最慢一条已用掉 92%。
-const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 国内实测镜像探活 1.13–2.75s；3.0.14 真机再加一条：TLS 握手可能被概率性 RST，
+/// 一次成功要 1.5–3s，所以预算放宽到 8 秒（内含最多 3 次尝试）。
+const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const AUTO_MIRROR_MAX: usize = 10;
 const MIRROR_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAIN_HEAD_START: Duration = Duration::from_millis(1000);
@@ -831,28 +832,49 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
     };
     hit.url = origin.clone();
     let started = Instant::now();
-    // edge_once sends the upstream's real envelope without retry backoff.
-    // This total deadline covers DNS, TLS, and the response body.
-    match tokio::time::timeout(
-        timeout,
-        crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
-    )
-    .await
-    {
-        Ok(Ok(data)) => {
-            hit.reachable = true;
-            hit.status = Some(200);
-            hit.ok = healthy_video_data(&data);
-            if !hit.ok {
-                hit.error = Some("接口未返回有效视频列表数据".into());
+    /* 3.0.14 真机结论：这类网络对 TLS 握手是**概率性**阻断 —— 同一域名同一条线路
+       一次 curl 三分之一的尝试 TLS 能过（实测 3 次里 1 次 200）。探活只打一枪的话，
+       一条其实能用的镜像会被判死，用户看到的就是「线路全部不可用」。
+       所以探活在总预算内重试到成功（或预算用尽），不再单发一次定生死。 */
+    let deadline = started + timeout;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            hit.error.get_or_insert_with(|| format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
+            break;
+        }
+        match tokio::time::timeout(
+            remaining,
+            crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
+        )
+        .await
+        {
+            Ok(Ok(data)) => {
+                hit.reachable = true;
+                hit.status = Some(200);
+                hit.ok = healthy_video_data(&data);
+                if !hit.ok {
+                    hit.error = Some("接口未返回有效视频列表数据".into());
+                }
+                break;
+            }
+            Ok(Err(error)) => {
+                hit.error = Some(error);
+                /* 只有链路层失败值得再试；403/401/业务错误重试没意义 */
+                if crate::line_health::fault_kind(hit.error.as_deref().unwrap_or("")).is_none() {
+                    break;
+                }
+            }
+            Err(_) => {
+                hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
             }
         }
-        Ok(Err(error)) => {
-            hit.error = Some(error);
+        if attempt >= 3 {
+            break;
         }
-        Err(_) => {
-            hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
-        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
     hit.ms = started.elapsed().as_millis() as u64;
     hit
@@ -1100,7 +1122,8 @@ async fn auto_pick_full(
 /// 候选顺序：上次可用（磁盘 line-health.json）→ 发布页缓存 → 内置种子；
 /// 黑名单里的（刚失败过）与 `exclude` 本身直接跳过。
 pub async fn failover(exclude: &str) -> Value {
-    const FAILOVER_PROBE: Duration = Duration::from_secs(4);
+    /* 4s → 7s：概率性 TLS 阻断下，4 秒常常连一次成功握手都赶不上 */
+    const FAILOVER_PROBE: Duration = Duration::from_secs(7);
     const FAILOVER_MAX: usize = 8;
 
     let excluded = crate::net::normalize_base(exclude).unwrap_or_default();
