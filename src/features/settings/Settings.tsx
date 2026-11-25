@@ -213,12 +213,15 @@ export default function Settings({ onBack }: { onBack: () => void; wide: boolean
                     connect_ip: (connect.addrs ?? []).join(",") || null, connect_source: connect.source ?? null,
                   });
                   const report = formatNetDiag(diag);
+                  /* 3.0.14：报告永远显示出来（不只是复制）。
+                     被污染的网络里「系统解析 / DoH 解析 / 实际连接」必须能当场看见，
+                     否则用户只知道「已复制」，看不到到底卡在哪一层。 */
+                  setDiagReport(report);
                   try {
                     await copyText(report);
                     toast(`诊断已复制 · ${shortVerdict(diag)}`, "ok");
                   } catch {
-                    setDiagReport(report);
-                    toast("诊断已完成，复制失败，可在报告中重试", "info");
+                    toast("诊断已完成，可在报告里手动复制", "info");
                   }
                 } catch (e) {
                   const detail = e instanceof Error ? e.message : typeof e === "string" ? e : "请稍后重试";

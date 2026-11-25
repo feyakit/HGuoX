@@ -46,12 +46,13 @@ const SEED_MIN: usize = 3;
 /// 3.0.14：`huang-guo.pages.dev/publish.js` 现在给的是 `aqkmowihz.cc` / `xxslfswu.cc`
 /// 两族（子域是 19 所高校前缀随机拼）。旧族 dvygahpw/zuxszoix 已经探不通，
 /// 保留两条旧族当「上游又换回来」的兜底，但新族排在前面。
-const SEED_MIRRORS: [&str; 8] = [
+const SEED_MIRRORS: [&str; 9] = [
+    "https://thu.wsaditmwl.cc",
+    "https://pku.wsaditmwl.cc",
+    "https://zju.wsaditmwl.cc",
     "https://thu.aqkmowihz.cc",
     "https://pku.aqkmowihz.cc",
-    "https://zju.aqkmowihz.cc",
     "https://thu.xxslfswu.cc",
-    "https://pku.xxslfswu.cc",
     "https://thu.dvygahpw.cc",
     "https://pku.dvygahpw.cc",
     "https://thu.zuxszoix.cc",
@@ -1121,6 +1122,27 @@ async fn auto_pick_full(
 /// 故意**不抓发布页**：发布页一次要 2–12 秒（还可能同样被墙），首屏等不起。
 /// 候选顺序：上次可用（磁盘 line-health.json）→ 发布页缓存 → 内置种子；
 /// 黑名单里的（刚失败过）与 `exclude` 本身直接跳过。
+/// 并发探一批候选，第一个真的能用的就返回（其余立刻取消）。
+async fn race_candidates(candidates: Vec<(String, &'static str)>, budget: Duration) -> (Option<Hit>, Vec<Hit>) {
+    let mut set = tokio::task::JoinSet::new();
+    for (origin, tier) in candidates {
+        set.spawn(async move { probe_hit_with(tier, &origin, budget).await });
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(hit) = joined {
+            let ok = hit.ok;
+            hits.push(hit);
+            if ok {
+                set.abort_all();
+                let winner = hits.last().cloned();
+                return (winner, hits);
+            }
+        }
+    }
+    (None, hits)
+}
+
 pub async fn failover(exclude: &str) -> Value {
     /* 4s → 7s：概率性 TLS 阻断下，4 秒常常连一次成功握手都赶不上 */
     const FAILOVER_PROBE: Duration = Duration::from_secs(7);
@@ -1131,10 +1153,7 @@ pub async fn failover(exclude: &str) -> Value {
     seen.insert(excluded);
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
 
-    let mut push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>| {
-        if candidates.len() >= FAILOVER_MAX {
-            return;
-        }
+    let mut push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>, seen: &mut HashSet<String>| {
         let Some(origin) = crate::net::normalize_base(&raw) else { return };
         if is_fixed(&origin) || crate::line_health::blacklisted(&origin) || !seen.insert(origin.clone()) {
             return;
@@ -1143,39 +1162,51 @@ pub async fn failover(exclude: &str) -> Value {
     };
 
     if let Some(good) = crate::line_health::last_good() {
-        push(good, "last-good", &mut candidates);
+        push(good, "last-good", &mut candidates, &mut seen);
     }
     if let Some(listing) = load_mirrors_cache() {
         for item in listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            if candidates.len() >= FAILOVER_MAX { break; }
             if let Some(url) = item.get("url").and_then(Value::as_str) {
-                push(url.to_string(), "mirror", &mut candidates);
+                push(url.to_string(), "mirror", &mut candidates, &mut seen);
             }
         }
     }
     for origin in SEED_MIRRORS {
-        push(origin.to_string(), "seed", &mut candidates);
+        if candidates.len() >= FAILOVER_MAX { break; }
+        push(origin.to_string(), "seed", &mut candidates, &mut seen);
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for (origin, tier) in candidates {
-        let origin = origin.clone();
-        set.spawn(async move { probe_hit_with(tier, &origin, FAILOVER_PROBE).await });
+    let (winner, mut hits) = race_candidates(candidates, FAILOVER_PROBE).await;
+    if let Some(hit) = winner {
+        return json!({
+            "base": hit.url, "tier": "failover", "ms": hit.ms,
+            "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+        });
     }
-    let mut hits: Vec<Hit> = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(hit) = joined {
-            let ok = hit.ok;
-            let url = hit.url.clone();
-            hits.push(hit);
-            if ok {
-                set.abort_all();
-                return json!({
-                    "base": url, "tier": "failover", "ms": hits.last().map(|hit| hit.ms).unwrap_or(0),
-                    "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
-                });
+
+    /* 第二阶段：磁盘缓存 + 内置种子全挂 → 抓一次发布页再试。
+       真机教训：上游换族很勤（这次实测发布页已经给出 wsaditmwl.cc，而种子还是上一族），
+       只靠内置种子必然追不上。这里多花几秒，但换来「被墙网络里还有路可走」。 */
+    if let Ok(listing) = mirrors_cached().await {
+        let items = listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let mut fresh: Vec<(String, &'static str)> = Vec::new();
+        for item in items {
+            if fresh.len() >= FAILOVER_MAX { break; }
+            if let Some(url) = item.get("url").and_then(Value::as_str) {
+                push(url.to_string(), "published", &mut fresh, &mut seen);
             }
         }
+        let (winner, more) = race_candidates(fresh, FAILOVER_PROBE).await;
+        hits.extend(more);
+        if let Some(hit) = winner {
+            return json!({
+                "base": hit.url, "tier": "failover", "ms": hit.ms,
+                "reason": "failover-published", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+            });
+        }
     }
+
     json!({
         "base": "", "tier": "none", "ms": 0, "reason": "all-down",
         "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),

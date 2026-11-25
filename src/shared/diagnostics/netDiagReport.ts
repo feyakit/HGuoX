@@ -80,6 +80,18 @@ export function formatNetDiag(raw: Json): string {
     lines.push("");
   }
 
+  /* ── 线路健康（3.0.14）：最近可用线路 + 被判死的线路 ── */
+  const health = obj(raw.line_health);
+  const blocked = arr(health.blacklist).map(obj);
+  if (blocked.length || str(health.last_good)) {
+    lines.push("── 线路健康 ──────────────────────");
+    if (str(health.last_good)) lines.push(`${pad("上次可用")}${str(health.last_good)}`);
+    for (const row of blocked.slice(0, 6)) {
+      lines.push(`${pad("判死")}${str(row.origin)}（${num(row.fails) ?? "?"} 次失败，剩 ${num(row.ttl_left_s) ?? "?"}s）`);
+    }
+    lines.push("");
+  }
+
   /* ── DNS ── */
   lines.push("── DNS ───────────────────────────");
   if (str(dns.error)) {
