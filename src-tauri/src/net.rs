@@ -1514,6 +1514,9 @@ fn edge_redirect_target(
     network_policy::redirect_target(current, location)
 }
 
+/// 链路层失败的统一前缀。前端看到它就换线重试；`HTTP 4xx/5xx` 与业务错误不带。
+pub const NETWORK_ERROR_PREFIX: &str = "NET:";
+
 /// 业务请求：走边缘信封。
 pub async fn edge(
     origin: &str,
@@ -1677,19 +1680,27 @@ async fn edge_inner(
 
     /* 线路健康（3.0.14 A 节）：只有链路层硬错误才计数/进黑名单；HTTP 与业务错误不算。
        失败样本除了黑名单，还写一行 playback.log，便于用「origin + 错误类型」复盘。 */
-    match &value {
-        Ok(_) => crate::line_health::note_success(&cur),
-        Err(error) => {
-            if let Some(kind) = crate::line_health::note_failure(&cur, error) {
+    let value = match value {
+        Ok(value) => {
+            crate::line_health::note_success(&cur);
+            value
+        }
+        Err(error) => match crate::line_health::note_failure(&cur, &error) {
+            Some(kind) => {
                 crate::playback_log::record(
                     "line.fault",
                     json!({ "line_host": line_host, "kind": kind, "operation": operation,
                         "blacklisted": crate::line_health::blacklisted(&cur) }),
                 );
+                /* 类型化返回（3.0.14 A 节真机补丁）：前端只看文案猜「这是不是网络层失败」
+                   会漏 —— 真机上 `tcp connect error` / `deadline has elapsed` 都没命中
+                   前端那份正则，于是既没换线、也把英文原文直接甩给用户。
+                   这里用后端同一套判定加前缀，前端按前缀处理，不再猜。 */
+                return Err(format!("{NETWORK_ERROR_PREFIX}{kind} · {}", error.trim()));
             }
-        }
-    }
-    let value = value?;
+            None => return Err(error),
+        },
+    };
 
     if value.is_null() {
         return Ok(Value::Null);

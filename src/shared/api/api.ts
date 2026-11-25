@@ -236,46 +236,62 @@ export function failoverOnce(): Promise<boolean> {
  *  3.0.14：链路层硬错误（TLS 阻断 / 连接重置 / DNS 污染）不再是「等 1.2 秒原地重试」——
  *  那 1.2 秒里线路根本没变，重试必然再挂，用户看到的还是「加载失败」。
  *  现在先让后端换一次镜像（磁盘缓存 + 种子，4 秒上限），换了就立刻重试；没换成才短暂等待。 */
+/** 后端给链路层失败打的类型化前缀（`NET:tls · ...`）。
+ *  真机教训：靠前端正则猜「是不是网络层失败」会漏 —— `tcp connect error`、
+ *  `deadline has elapsed` 都不在那份正则里，结果既不换线、还把英文原文甩给用户。 */
+const NET_PREFIX = "NET:";
+const isNetworkMessage = (msg: string) => msg.startsWith(NET_PREFIX) || (!/^HTTP (\d{3})\b/.test(msg) && NET_FAIL.test(msg));
+const stripNetPrefix = (msg: string) => (msg.startsWith(NET_PREFIX) ? msg.slice(NET_PREFIX.length).trim() : msg);
+
+/** 一次真正的请求：链路层失败 → 换线 → 重试（最多两轮换线）。
+ *
+ *  为什么是两轮：真机上第一条镜像可能「探活通、真请求又超时」（4s 探活 vs 10s 请求）。
+ *  只换一次就放弃的话，用户看到的还是错误页；第二轮会把刚失败的那条拉黑、换下一条。 */
 async function request<T>(cmd: string, args: Record<string, unknown> | undefined, key: string, ttl: number): Promise<T> {
   const once = () => invoke(cmd, args) as Promise<T>;
-  try {
-    const r = await once();
+  const succeed = (value: T) => {
     notifyNet({ ok: true, cmd });
-    remember(key, ttl, r);
-    publishData(cmd, key, r);
-    return r;
+    remember(key, ttl, value);
+    publishData(cmd, key, value);
+    return value;
+  };
+  let last = { msg: "", raw: "", networkish: false, switched: false };
+  try {
+    return succeed(await once());
   } catch (e) {
     const msg = typeof e === "string" ? e : "请求失败，请检查网络";
     const status = /^HTTP (\d{3})\b/.exec(msg)?.[1];
-    const networkish = !status && NET_FAIL.test(msg);
-    // 落盘完整错误链（dns error / connection refused / 证书错误…），toast 只显示截断版
+    const networkish = !status && isNetworkMessage(msg);
     logLine(`[api] ${cmd} → ${msg}`);
     tracePlayback("api.fail", { cmd, err: msg, status: status ?? null, networkish });
     notifyNet({ ok: false, cmd, msg, networkish });
-    if (networkish && READ_ONLY.has(cmd)) {
-      const switched = await failoverOnce();
-      logLine(`[api] ${cmd} 链路异常，${switched ? "已换线，立刻重试" : "1.2s 后原地重试一次"}`);
-      tracePlayback("api.retry", { cmd, err: msg, switched });
-      if (!switched) await new Promise((r) => setTimeout(r, 1200));
-      try {
-        const r = await once();
-        logLine(`[api] ${cmd} 重试成功${switched ? "（换线后）" : ""}`);
-        tracePlayback("api.retry_ok", { cmd, switched });
-        notifyNet({ ok: true, cmd });
-        remember(key, ttl, r);
-        publishData(cmd, key, r);
-        return r;
-      } catch (e2) {
-        const again = typeof e2 === "string" ? e2 : msg;
-        const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
-        const againNetworkish = !againStatus && NET_FAIL.test(again);
-        logLine(`[api] ${cmd} 重试仍失败 → ${again}`);
-        tracePlayback("api.retry_failed", { cmd, err: again, status: againStatus ?? null });
-        throw new ApiError(againNetworkish ? NETWORK_FAIL_TEXT : failMessage(again, againStatus), again, againNetworkish, switched);
-      }
-    }
-    throw new ApiError(failMessage(msg, status), msg, networkish, false);
+    last = { msg, raw: stripNetPrefix(msg), networkish, switched: false };
+    if (!networkish || !READ_ONLY.has(cmd)) throw new ApiError(failMessage(msg, status), stripNetPrefix(msg), networkish, false);
   }
+
+  const rounds = 2;
+  for (let round = 0; round < rounds; round += 1) {
+    const switched = await failoverOnce();
+    last.switched = last.switched || switched;
+    logLine(`[api] ${cmd} 链路异常，${switched ? `已换线（第 ${round + 1} 轮），立刻重试` : "1.2s 后原地重试一次"}`);
+    tracePlayback("api.retry", { cmd, err: last.msg, round, switched });
+    if (!switched) await new Promise((r) => setTimeout(r, 1200));
+    try {
+      const value = await once();
+      logLine(`[api] ${cmd} 重试成功${switched ? "（换线后）" : ""}`);
+      tracePlayback("api.retry_ok", { cmd, round, switched });
+      return succeed(value);
+    } catch (e2) {
+      const again = typeof e2 === "string" ? e2 : last.msg;
+      const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
+      const againNetworkish = !againStatus && isNetworkMessage(again);
+      last = { msg: again, raw: stripNetPrefix(again), networkish: againNetworkish, switched: last.switched };
+      logLine(`[api] ${cmd} 第 ${round + 1} 轮重试仍失败 → ${again}`);
+      tracePlayback("api.retry_failed", { cmd, err: again, round, status: againStatus ?? null });
+      if (!againNetworkish) throw new ApiError(failMessage(again, againStatus), stripNetPrefix(again), false, last.switched);
+    }
+  }
+  throw new ApiError(last.networkish ? NETWORK_FAIL_TEXT : failMessage(last.msg), last.raw, last.networkish, last.switched);
 }
 
 /** 后台静默刷新：同一个 key 只跑一次，失败不弹任何东西（下次进来还是旧值兜底）。 */

@@ -52,7 +52,7 @@ async function openApp(context, { mode }) {
     });
     const banners_ = banners.map((banner, index) => ({ ...banner, id: 28 + index }));
     localStorage.setItem("hguox_usage_agreement", JSON.stringify({ version: "2026-11-15-v1", accepted: true, acceptedAt: "2026-11-15T00:00:00.000Z" }));
-    window.v3014 = { calls, feedFails: mode === "failover" ? 1 : mode === "ok" ? 0 : 99, switched: false, banners: banners_, events: [] };
+    window.v3014 = { calls, feedFails: mode === "ok" ? 0 : mode === "failover" ? 1 : mode === "two-hop" ? 2 : 99, switched: false, banners: banners_, events: [] };
     ["hg:line-failover", "hg:line-changed"].forEach(name => window.addEventListener(name, () => window.v3014.events.push(name)));
     /* toast 只活 3.6s，靠轮询会错过：MutationObserver 全程记下来 */
     window.v3014.toastSeen = [];
@@ -77,13 +77,14 @@ async function openApp(context, { mode }) {
           case "line_failover": {
             /* manual：模拟用户手动选了线路，后端拒绝自动换（硬约束） */
             if (mode === "manual-down") return Promise.resolve({ previous: "https://thu.dvygahpw.cc", base: "https://thu.dvygahpw.cc", switched: false, reason: "manual", ms: 0, pick: null });
-            const canSwitch = mode === "failover";
+            const canSwitch = mode === "failover" || mode === "two-hop";
             window.v3014.switched = canSwitch;
             return Promise.resolve({ previous: "https://huangguoai.com", base: canSwitch ? "https://thu.dvygahpw.cc" : "https://huangguoai.com", switched: canSwitch, reason: canSwitch ? "failover-ok" : "all-down", ms: 12 });
           }
           case "api_home": return Promise.resolve({ banners: banners_, source: "api/home" });
           case "api_feed": {
-            if (window.v3014.feedFails > 0) { window.v3014.feedFails -= 1; return Promise.reject("error sending request ← client error (SendRequest) ← tls handshake eof"); }
+            /* 真机原文（小米九实测）：后端现在会加 NET: 前缀，前端不许再靠正则猜 */
+            if (window.v3014.feedFails > 0) { window.v3014.feedFails -= 1; return Promise.reject("NET:tcp · error sending request for url (https://huangguoai.com/api/edge/request) ← client error (Connect) ← tcp connect error ← deadline has elapsed"); }
             return Promise.resolve(feedPage(args.page || 1));
           }
           case "api_rank": return Promise.resolve({ type: args.kind, items: titles.map((title, index) => ({ rank: index + 1, video_id: 500 + index, title, cover: "https://pic.example.invalid/r.jpg", score: 9, metric_value: 1000, metric_label: "播放" })) });
@@ -285,6 +286,23 @@ try {
   await failoverPage.screenshot({ path: join(output, "home-failover-ok.png") });
   await failoverPage.close();
 
+  // ── 3a. 第一条镜像也是死的：第二轮换线后必须能恢复（真机场景） ─────
+  const twoHopPage = await openApp(context, { mode: "two-hop" });
+  let twoHopOk = false;
+  for (let i = 0; i < 40 && !twoHopOk; i += 1) {
+    await twoHopPage.waitForTimeout(250);
+    twoHopOk = await twoHopPage.evaluate(() => !document.querySelector('[role="alert"]') && (document.querySelectorAll(".hg-spotlight").length + document.querySelectorAll(".hg-poster-name").length) > 0);
+  }
+  const twoHopState = await twoHopPage.evaluate(() => ({
+    failovers: window.v3014.calls.filter(c => c.cmd === "line_failover").length,
+    feedAttempts: window.v3014.calls.filter(c => c.cmd === "api_feed").length,
+    alert: !!document.querySelector('[role="alert"]'),
+  }));
+  report.cases.push({ case: "换线两轮后才通：首页能恢复、不出错误页", ...twoHopState, pass: twoHopOk && twoHopState.failovers >= 2 });
+  assert.ok(twoHopOk && twoHopState.failovers >= 2, "第一条镜像死掉时必须再换一轮，而不是直接报错");
+  await twoHopPage.screenshot({ path: join(output, "home-two-hop.png") });
+  await twoHopPage.close();
+
   // ── 3b. 手动选定的线路不可用时：不许自动换，只提示 ────────────────
   const manualPage = await openApp(context, { mode: "manual-down" });
   await manualPage.waitForSelector('[role="alert"]', { timeout: 15000 });
@@ -318,8 +336,9 @@ try {
   assert.ok(bothButtons, "错误页必须有「重试」「换个线路」两个按钮");
   await downPage.locator('[role="alert"] button', { hasText: /^详情$/ }).click();
   const rawAfter = await downPage.evaluate(() => document.querySelector('[role="alert"] pre')?.textContent || "");
-  report.cases.push({ case: "点开「详情」能看到原始错误", raw: rawAfter, pass: /tls handshake eof/.test(rawAfter) });
-  assert.ok(/tls handshake eof/.test(rawAfter), "折叠打开后应看到原始错误");
+  report.cases.push({ case: "点开「详情」能看到原始错误", raw: rawAfter, pass: /tcp connect error/.test(rawAfter) && !/^NET:/.test(rawAfter) });
+  assert.ok(/tcp connect error/.test(rawAfter), "折叠打开后应看到原始错误（且不带 NET: 前缀）");
+  assert.ok(!/^NET:/.test(rawAfter), "原始错误里不该残留 NET: 前缀");
   await downPage.screenshot({ path: join(output, "home-error-all-down.png") });
   await downPage.getByRole("button", { name: "换个线路" }).click();
   const picker = await downPage.waitForSelector('[role="dialog"]', { timeout: 4000 }).then(() => true).catch(() => false);
