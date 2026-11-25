@@ -1703,6 +1703,13 @@ async fn edge_inner(
             crate::line_health::note_success(&cur);
             value
         }
+        /* 上游停用信封时回的是 HTTP 503/404 + body「接口已停用」，走的是错误分支，
+           以前在这里直接返回，永远轮不到下面的 JSON 判定 —— 真机上就是卡在这。 */
+        Err(error) if error.contains("停用") || error.contains("禁用") || error.contains("下线") => {
+            mark_envelope_disabled();
+            crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
+            return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+        }
         Err(error) => match crate::line_health::note_failure(&cur, &error) {
             Some(kind) => {
                 crate::playback_log::record(
