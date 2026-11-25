@@ -73,14 +73,19 @@ pub fn fault_kind(message: &str) -> Option<&'static str> {
         Some("dns")
     } else if has(&["tls", "ssl", "handshake", "certificate", "证书"]) {
         Some("tls")
-    } else if has(&["reset", "eof", "broken pipe", "connection aborted", "连接被重置"]) {
+    } else if has(&["reset", "eof", "broken pipe", "connection aborted", "connection closed", "连接被重置"]) {
         Some("reset")
     } else if has(&["refused", "拒绝连接"]) {
         Some("refused")
-    } else if has(&["unreachable", "network is down", "网络不可达"]) {
+    } else if has(&["unreachable", "no route to host", "network is down", "网络不可达"]) {
         Some("unreachable")
-    } else if has(&["timeout", "timed out", "超时"]) {
+    } else if has(&["timeout", "timed out", "deadline", "超时"]) {
         Some("timeout")
+    } else if has(&["connect error", "connection error", "sendrequest", "send request"]) {
+        /* reqwest 在系统级 RST 上给的原文就是 `client error (Connect) ← tcp connect error
+           ← deadline has elapsed`：既没有 "timeout" 也没有 "reset" 字样。
+           真机首轮就是因为漏了这条，明明被拦却当成普通业务失败（不换线、甩英文）。 */
+        Some("connect")
     } else {
         None
     }
@@ -202,6 +207,10 @@ mod tests {
             ("error sending request ← connection refused", "refused"),
             ("请求超时", "timeout"),
             ("operation timed out", "timeout"),
+            /* 小米九真机原文（2026-11-25）：系统 DNS 指到死地址时就是这个链条 */
+            ("error sending request for url (https://pku.zekpkeusp.cc/api/edge/request) ← client error (Connect) ← tcp connect error ← deadline has elapsed", "timeout"),
+            ("error sending request for url (https://x/api/edge/request) ← client error (Connect) ← tcp connect error", "connect"),
+            ("error sending request for url (https://x/) ← client error (SendRequest) ← connection closed before message completed", "reset"),
         ] {
             assert_eq!(fault_kind(message), Some(kind), "{message}");
         }
