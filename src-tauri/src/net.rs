@@ -1565,6 +1565,10 @@ async fn edge_inner(
             return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路或重新加载发布页验证镜像".into());
         }
     }
+    /* 已经知道信封停了（10 分钟内）：直接走 REST，别再每个请求都撞一次。 */
+    if envelope_disabled() {
+        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+    }
     let (encoded, ctype) = match &body {
         Some(v) => (
             B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
@@ -1719,13 +1723,106 @@ async fn edge_inner(
         return Ok(Value::Null);
     }
 
-    if value.get("status").and_then(|v| v.as_i64()) == Some(1) {
+    let business_status = value.get("status").and_then(|v| v.as_i64());
+    let message = value
+        .get("msg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if business_status == Some(1) {
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+    }
+    /* 上游 2026-11-25 起把边缘信封 `/api/edge/request` 停了（返回「接口已停用」），
+       而 App 所有接口都走它 —— 于是「网络明明是通的也打不开首页」。
+       这里认出这句话就整体切到直连 REST（同一个 path 直接请求），并记住一段时间，
+       别每个请求都先撞一次信封。 */
+    if envelope_disabled_message(&message) {
+        mark_envelope_disabled();
+        crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
+        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+    }
+    Err(if message.is_empty() { "接口返回失败".to_string() } else { message })
+}
+
+/// 信封被停用的几种说法（都见过）。
+fn envelope_disabled_message(message: &str) -> bool {
+    ["停用", "禁用", "下线", "deprecated", "disabled", "not found"]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
+static ENVELOPE_OFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn envelope_disabled() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    ENVELOPE_OFF_UNTIL.load(Ordering::Relaxed) > now
+}
+
+fn mark_envelope_disabled() {
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+        + 10 * 60;
+    ENVELOPE_OFF_UNTIL.store(until, Ordering::Relaxed);
+}
+
+/// 直连 REST：与信封拿的是同一个 `path`，只是不再套 `/api/edge/request`。
+/// 返回结构与信封一致（`{status, data, msg}`），所以上层解析不用改。
+async fn direct_rest(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value, String> {
+    let url = format!("{}{}", origin.trim_end_matches('/'), path);
+    let referer = format!("{origin}/");
+    let (target, http) = client_for(&url).await?;
+    let mut request = match method.to_ascii_uppercase().as_str() {
+        "POST" => http.post(target.clone()),
+        "PUT" => http.put(target.clone()),
+        "DELETE" => http.delete(target.clone()),
+        _ => http.get(target.clone()),
+    }
+    .header("Accept", "application/json")
+    .header("Referer", &referer);
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = match body {
+        Some(body) if !body.is_null() => request.json(body),
+        _ => request,
+    }
+    .send()
+    .await
+    .map_err(|error| err_text(&error))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| err_text(&error))?;
+    if status.as_u16() == 401 {
+        return Err("401".into());
+    }
+    if status.as_u16() == 403 {
+        return Err("403".into());
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", text.chars().take(160).collect::<String>()));
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{error}: {}", text.chars().take(160).collect::<String>()))?;
+    if value.get("status").and_then(Value::as_i64) == Some(1) {
         Ok(value.get("data").cloned().unwrap_or(Value::Null))
     } else {
         Err(value
             .get("msg")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
             .unwrap_or("接口返回失败")
             .to_string())
     }

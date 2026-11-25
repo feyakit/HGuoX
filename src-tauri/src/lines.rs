@@ -1153,7 +1153,7 @@ pub async fn failover(exclude: &str) -> Value {
     seen.insert(excluded);
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
 
-    let mut push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>, seen: &mut HashSet<String>| {
+    let push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>, seen: &mut HashSet<String>| {
         let Some(origin) = crate::net::normalize_base(&raw) else { return };
         if is_fixed(&origin) || crate::line_health::blacklisted(&origin) || !seen.insert(origin.clone()) {
             return;
