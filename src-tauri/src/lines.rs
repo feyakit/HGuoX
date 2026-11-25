@@ -42,13 +42,18 @@ const MIRROR_GRACE: Duration = Duration::from_millis(2000);
 const SEED_MIN: usize = 3;
 /// 内置兜底：已知可用族的前缀。上游换族会失效，所以只当「发布页拉不到」时的最后一道兜底，
 /// 且**不授予凭据信任**（不进 `TRUSTED_MIRRORS`）。
-const SEED_MIRRORS: [&str; 6] = [
+/// 3.0.14：`huang-guo.pages.dev/publish.js` 现在给的是 `aqkmowihz.cc` / `xxslfswu.cc`
+/// 两族（子域是 19 所高校前缀随机拼）。旧族 dvygahpw/zuxszoix 已经探不通，
+/// 保留两条旧族当「上游又换回来」的兜底，但新族排在前面。
+const SEED_MIRRORS: [&str; 8] = [
+    "https://thu.aqkmowihz.cc",
+    "https://pku.aqkmowihz.cc",
+    "https://zju.aqkmowihz.cc",
+    "https://thu.xxslfswu.cc",
+    "https://pku.xxslfswu.cc",
     "https://thu.dvygahpw.cc",
     "https://pku.dvygahpw.cc",
-    "https://zju.dvygahpw.cc",
     "https://thu.zuxszoix.cc",
-    "https://pku.zuxszoix.cc",
-    "https://sysu.zuxszoix.cc",
 ];
 const MIRROR_CACHE_FILE: &str = "lines-cache.json";
 

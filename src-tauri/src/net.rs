@@ -38,19 +38,23 @@ use std::time::{Duration, Instant};
 /// 默认上游（固定线路 1）。
 pub const DEFAULT_BASE: &str = "https://huangguoai.com";
 
-/// 国内实测这几个域名被 DNS 污染到**公网** Facebook 段（157.240.1.50 / 2a03:2880:...:face:b00c），
+/// 国内实测这几个域名被 DNS 污染到**公网** Facebook/Dropbox 段（157.240.x / 108.160.x / 154.83.x），
 /// 不是 127.0.0.1 也不是私网，所以旧的「私网才回退 DoH」判断救不到：TCP 会一直挂到超时。
 /// 这几个域名把解析顺序反过来——先 DoH，失败再退回系统 DNS。
+#[allow(dead_code)] // 保留：发布页/主站的「已知被污染」清单，诊断与说明用
 const DOH_FIRST_HOSTS: [&str; 3] = [
     "huangguoai.com",
     "huangguoai.pages.dev",
     "huang-guo.pages.dev",
 ];
 
-fn doh_first(host: &str) -> bool {
-    DOH_FIRST_HOSTS
-        .iter()
-        .any(|known| host == *known || host.ends_with(&format!(".{known}")))
+/// 3.0.14 真机结论（小米九 / 用户家宽带）：**镜像域名同样被污染**。
+/// `thu.aqkmowihz.cc` 系统解析给 108.160.163.106（Dropbox 段）→ TCP 连不上；
+/// 用 DoH 拿到真实 CloudFront IP（18.238.96.x）后同一个域名 TLS 通、接口 200。
+/// 所以「先 DoH」不能只给三个固定域名开：默认所有域名都先 DoH，DoH 全挂才退回系统 DNS。
+/// 代价是一次 DoH（缓存 5 分钟）+ 首次解析几十毫秒；收益是被污染网络里镜像真的能用。
+fn doh_first(_host: &str) -> bool {
+    true
 }
 
 /// 当前上游基址（不带结尾斜杠）。可在设置里切到固定线路 2 或镜像线路，运行时立即生效。
@@ -654,7 +658,8 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
         (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source)
     } else if strict {
         if doh_first(host) {
-            // 先 DoH：被污染的域名拿到真地址，才不会在 TCP 上白等一整份超时。
+            /* 先 DoH：小米九实测，镜像域名被污染到 Dropbox 段时，只有 DoH 才拿得到
+               CloudFront 真地址；拿到真地址后同一个域名是通的。 */
             match resolve_doh_fallback(host, port, &route, strict).await {
                 Ok((resolution, source)) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source),
                 Err(_) => match network_policy::resolve_target(&target, strict).await {
