@@ -1594,7 +1594,11 @@ async fn edge_inner(
     let mut attempt = 0;
     let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
     let can_retry = allow_retry && method.eq_ignore_ascii_case("GET") && body.is_none();
-    let value = with_retry(can_retry, || {
+    /* 总预算（3.0.14 真机）：被墙的 IP 常常是「黑洞丢包」而不是 RST —— 一次尝试会一直
+       挂到客户端的 20 秒超时，3 次重试就是 60 秒，首页 50 秒还在转圈。
+       这里给整个逻辑请求封顶，超时按链路层失败返回，让前端立刻换线重试。 */
+    let budget = Duration::from_secs(12);
+    let value = match tokio::time::timeout(budget, with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
         let envelope = envelope.clone();
@@ -1680,8 +1684,12 @@ async fn edge_inner(
             }));
             result
         }
-    })
-    .await;
+    }))
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => Err(format!("deadline has elapsed（请求总时长超过 {} 秒）", budget.as_secs())),
+    };
 
     /* 线路健康（3.0.14 A 节）：只有链路层硬错误才计数/进黑名单；HTTP 与业务错误不算。
        失败样本除了黑名单，还写一行 playback.log，便于用「origin + 错误类型」复盘。 */
