@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { api, platform as envPlatform } from "../api/api";
+import { api, platform as envPlatform, takeFailoverNotice } from "../api/api";
 import { isStrictSecurity, setSiteOrigin, setStrictSecurity as setHtmlStrictSecurity } from "../lib/html";
 import type { User } from "../api/types";
 import { readStorage, STORAGE_KEYS } from "../storage/storage";
@@ -203,6 +203,32 @@ type Store = {
 const Ctx = createContext<Store>(null as unknown as Store);
 export const useStore = () => useContext(Ctx);
 let seq = 0;
+/** 换线提示的投递器：由 AppProvider 在挂载时注入最新的 `show`。
+ *  等待启动动画退场的间隔放在模块作用域 —— 组件重挂载不会把它清掉。 */
+let failoverNotifier: ((host: string) => void) | null = null;
+let splashWait: number | undefined;
+let queuedFailoverHost = "";
+
+function announceFailover(host: string) {
+  if (!host) return;
+  queuedFailoverHost = host;
+  if (!document.querySelector(".hg-launch")) {
+    flushFailoverToast();
+    return;
+  }
+  window.clearInterval(splashWait);
+  splashWait = window.setInterval(flushFailoverToast, 250);
+}
+
+function flushFailoverToast() {
+  if (!queuedFailoverHost || !failoverNotifier) return;
+  if (document.querySelector(".hg-launch")) return;
+  const host = queuedFailoverHost;
+  queuedFailoverHost = "";
+  window.clearInterval(splashWait);
+  splashWait = undefined;
+  failoverNotifier(host);
+}
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [p, setP] = useState<Persist>(loadPersist);
@@ -375,6 +401,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
     window.addEventListener("hg:line-auto-switched", onSwitched);
     return () => window.removeEventListener("hg:line-auto-switched", onSwitched);
+  }, []);
+  /** 主域被网络层拦住、紧急换到备用线路（3.0.14 G 节）：
+   *  用户必须知道「刚才那一下不卡是因为替你换了条路」，否则下次换不了会以为坏了。
+   *
+   *  这里踩过两个坑：
+   *   ① 冷启动时请求比本 effect 先跑完 → 事件发在空处。所以除了监听，挂载时再向
+   *      api 层「补拿」一次最近一次换线结果；
+   *   ② 启动动画（.hg-launch 全屏遮罩）盖着时弹 toast 等于没弹。等待遮罩退场的定时器
+   *      放在模块作用域（announceFailover），**不**归 effect 清理 —— 否则 provider 一
+   *      重挂载/重跑就把定时器清掉，提示永远不出来。
+   */
+  useEffect(() => {
+    const show = (host: string) => {
+      const id = ++toastSeq.current;
+      setToasts((t) => [...t.slice(-2), { id, msg: `已切换到备用线路：${host}`, icon: "info" }]);
+      window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
+    };
+    failoverNotifier = show;
+    const onFailover = (e: Event) => {
+      takeFailoverNotice(); /* 事件已经送到，别让「补拿」那条再来一次 */
+      announceFailover((e as CustomEvent<{ host?: string }>).detail?.host ?? "");
+    };
+    window.addEventListener("hg:line-failover", onFailover);
+    const pending = takeFailoverNotice();
+    if (pending) announceFailover(pending);
+    return () => {
+      window.removeEventListener("hg:line-failover", onFailover);
+      if (failoverNotifier === show) failoverNotifier = null;
+    };
   }, []);
   /** 线路真的换了（自动、手切都算）：
    *

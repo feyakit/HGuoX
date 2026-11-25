@@ -124,7 +124,10 @@ export async function pickLine(reason: string, force = false, preferredDown = fa
     });
     let base = result.base;
     if (plan.target && plan.target !== result.base) {
-      base = await api.lineSet(plan.target);
+      /* 偏好线路（用户手动选的）用 line_set 落成「手动线路」——它以后不许被自动换掉；
+         让位给别的线路时用 line_set_auto，否则一次让位就把自动选线永久锁死在临时线路上了。 */
+      const keepingPreferred = !!preferred && sameBase(plan.target, preferred);
+      base = keepingPreferred ? await api.lineSet(plan.target) : await api.lineSetAuto(plan.target);
       logLine(`[line] auto(${reason}) prefer ${hostOf(base)} over ${hostOf(result.base)}`);
     }
     const switched = plan.changed || base !== result.previous;
