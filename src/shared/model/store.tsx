@@ -465,7 +465,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (pg.kind === "channel" && top.kind === "channel" && top.cate === pg.cate) return s;
         if (pg.kind === "tags" || pg.kind === "ranks" || pg.kind === "history" || pg.kind === "favorites" || pg.kind === "settings" || pg.kind === "settings-tags") return s;
       }
-      return [...s, { ...pg, key: `p${++seq}` } as Page];
+      const next = [...s, { ...pg, key: `p${++seq}` } as Page];
+      return next.length > 8 ? next.slice(next.length - 8) : next;
     });
   }, []);
   /* 返回/退出动画：真正出栈由 pageTransition 在动画结束后执行（减少动效/低端机直接切） */

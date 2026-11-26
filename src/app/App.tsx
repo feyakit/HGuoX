@@ -1,8 +1,9 @@
 import { LiquidIndicator, Loader } from "../shared/ui/ios/effects";
 import { Button } from "../shared/ui/ios/controls";
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import SeriesDetail from "../features/feed/SeriesDetail";
 import { useStore, type Page, type Tab } from "../shared/model/store";
+import { PageCoveredContext } from "../shared/model/pageVisibility";
 import { accentTokens, FALLBACK_SCHEME } from "../shared/ui/accent";
 import { isMobile, selfTest } from "../shared/api/api";
 import { addPluginListener, invoke } from "@tauri-apps/api/core";
@@ -113,8 +114,97 @@ function StackPageContent({ page, onBack, wide, top, bottomInset, loginOpen }: {
   return null;
 }
 
+/** Hide covered pages from the compositor while keeping React state and scroll offsets intact. */
+function LayerBox({
+  hidden, inert, ariaHidden, className, enterClass, style, children,
+}: {
+  hidden: boolean;
+  inert: boolean;
+  ariaHidden: boolean;
+  className: string;
+  enterClass?: string;
+  style?: CSSProperties;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const scrollOffsetsRef = useRef<Map<HTMLElement, number>>(new Map());
+  const hadHiddenRef = useRef(hidden);
+  const hiddenRef = useRef(hidden);
+  hiddenRef.current = hidden;
+  if (hidden) hadHiddenRef.current = true;
+  const [hasPip, setHasPip] = useState(false);
+  const [entering, setEntering] = useState(Boolean(enterClass && !hidden));
+
+  useEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+    const onScroll = (e: Event) => {
+      if (hiddenRef.current) return;
+      const target = e.target;
+      if (target instanceof HTMLElement && root.contains(target)) {
+        scrollOffsetsRef.current.set(target, target.scrollTop);
+      }
+    };
+    const syncPip = () => {
+      const pip = document.pictureInPictureElement;
+      setHasPip(!!pip && root.contains(pip));
+    };
+    root.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    root.addEventListener("enterpictureinpicture", syncPip, true);
+    root.addEventListener("leavepictureinpicture", syncPip, true);
+    syncPip();
+    return () => {
+      root.removeEventListener("scroll", onScroll, true);
+      root.removeEventListener("enterpictureinpicture", syncPip, true);
+      root.removeEventListener("leavepictureinpicture", syncPip, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!entering || hidden) return;
+    // Ensure the enter animation class is stripped even when reduced-motion disables animations.
+    const timer = window.setTimeout(() => setEntering(false), 450);
+    return () => window.clearTimeout(timer);
+  }, [entering, hidden]);
+
+  useLayoutEffect(() => {
+    if (hidden) return;
+    const saved = scrollOffsetsRef.current;
+    if (!saved.size) return;
+    for (const [el, top] of Array.from(saved.entries())) {
+      if (!el.isConnected) {
+        saved.delete(el);
+        continue;
+      }
+      if (Math.abs(el.scrollTop - top) > 1) el.scrollTop = top;
+    }
+  }, [hidden]);
+
+  const boxStyle: CSSProperties | undefined = hidden && hasPip
+    ? { ...style, visibility: "hidden", pointerEvents: "none" }
+    : style;
+  const boxClass = hidden
+    ? (hasPip ? `${className} pointer-events-none` : `${className} hidden pointer-events-none`)
+    : `${className}${entering && enterClass && !hadHiddenRef.current ? ` ${enterClass}` : ""}`;
+
+  return (
+    <PageCoveredContext.Provider value={hidden}>
+      <div
+        ref={ref}
+        inert={inert}
+        aria-hidden={ariaHidden}
+        className={boxClass}
+        style={boxStyle}
+        onAnimationEnd={(e) => { if (e.target === ref.current) setEntering(false); }}
+      >
+        {children}
+      </div>
+    </PageCoveredContext.Provider>
+  );
+}
+
 /* ============ 一级常驻底栏模块（仅挂载 4 个真实主模块） ============ */
-function MainTabs({ wide, pageActive, bottomInset }: { wide: boolean; pageActive: boolean; bottomInset: number }) {
+function MainTabs({ wide, pageActive, covered, bottomInset }: { wide: boolean; pageActive: boolean; covered: boolean; bottomInset: number }) {
   const { tab } = useStore();
   const [visited, setVisited] = useState<ReadonlySet<Tab>>(() => new Set());
   useEffect(() => {
@@ -123,12 +213,14 @@ function MainTabs({ wide, pageActive, bottomInset }: { wide: boolean; pageActive
   const mounted = (key: Tab) => visited.has(key) || (pageActive && tab === key);
   const visible = (key: Tab) => tab === key ? `absolute inset-0 ${key === "home" ? "" : "ios-tab-active"}` : "absolute inset-0 hidden pointer-events-none";
   // First visits mount on demand; subsequent switches preserve queries, scroll and playback state.
-  return <>
-    <div className={visible("home")} inert={!pageActive || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{mounted("home") && <Home active={pageActive && tab === "home"} bottomInset={bottomInset} />}</div>
-    <div className={visible("posts")} inert={!pageActive || tab !== "posts"} aria-hidden={!pageActive || tab !== "posts"}>{mounted("posts") && <Suspense fallback={<PageLoading />}><PostsPage wide={wide} embedded active={pageActive && tab === "posts"} /></Suspense>}</div>
-    <div className={visible("category")} inert={!pageActive || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{mounted("category") && <Suspense fallback={<PageLoading />}><Category wide={wide} active={pageActive && tab === "category"} /></Suspense>}</div>
-    <div className={visible("profile")} inert={!pageActive || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{mounted("profile") && <Suspense fallback={<PageLoading />}><Profile wide={wide} /></Suspense>}</div>
-  </>;
+  return (
+    <LayerBox hidden={covered} inert={covered} ariaHidden={covered} className="absolute inset-0">
+      <div className={visible("home")} inert={!pageActive || tab !== "home"} aria-hidden={!pageActive || tab !== "home"}>{mounted("home") && <Home active={pageActive && tab === "home"} bottomInset={bottomInset} />}</div>
+      <div className={visible("posts")} inert={!pageActive || tab !== "posts"} aria-hidden={!pageActive || tab !== "posts"}>{mounted("posts") && <Suspense fallback={<PageLoading />}><PostsPage wide={wide} embedded active={pageActive && tab === "posts"} /></Suspense>}</div>
+      <div className={visible("category")} inert={!pageActive || tab !== "category"} aria-hidden={!pageActive || tab !== "category"}>{mounted("category") && <Suspense fallback={<PageLoading />}><Category wide={wide} active={pageActive && tab === "category"} /></Suspense>}</div>
+      <div className={visible("profile")} inert={!pageActive || tab !== "profile"} aria-hidden={!pageActive || tab !== "profile"}>{mounted("profile") && <Suspense fallback={<PageLoading />}><Profile wide={wide} /></Suspense>}</div>
+    </LayerBox>
+  );
 }
 
 function AppBody() {
@@ -181,13 +273,24 @@ function AppBody() {
       {/* data-stack=1 表示正在看栈页（详情/播放器）：横屏的 440 限宽不能套在播放器上，
           否则全屏层会被压成手机宽度、右边留黑（真机 iOS 横屏只占左半边）。 */}
       <div ref={mainRef} data-stack={stack.length ? "1" : "0"} className="relative flex-1 min-w-0 overflow-hidden win-main">
-        <MainTabs wide={wide} pageActive={pageActive} bottomInset={bottomInset} />
+        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0} bottomInset={bottomInset} />
 
-        {stack.map((p, i) => (
-          <div key={p.key} inert={i !== stack.length - 1 || loginOpen} aria-hidden={i !== stack.length - 1 || loginOpen} className="absolute inset-0 z-30 bg-bg a-page-in" style={{ boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }}>
-            <StackPage page={p} onBack={pop} wide={wide} top={i === stack.length - 1} bottomInset={stackInset} loginOpen={loginOpen} />
-          </div>
-        ))}
+        {stack.map((p, i) => {
+          const top = i === stack.length - 1;
+          return (
+            <LayerBox
+              key={p.key}
+              hidden={!top}
+              inert={!top || loginOpen}
+              ariaHidden={!top || loginOpen}
+              className="absolute inset-0 bg-bg isolate"
+              enterClass={platform === "android" && p.kind === "feed" ? undefined : "a-page-in"}
+              style={{ zIndex: 30 + i }}
+            >
+              <StackPage page={p} onBack={pop} wide={wide} top={top} bottomInset={stackInset} loginOpen={loginOpen} />
+            </LayerBox>
+          );
+        })}
 
         {isMobile && !fs && !clean && stack.length === 0 && <TabBar />}
       </div>
@@ -261,12 +364,23 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
     <div className={`absolute inset-0 flex bg-canvas plat-${platform}`}>
       {!theater && <DesktopRail collapsed={collapsed} />}
       <div ref={mainRef} className={`relative flex-1 min-w-0 overflow-hidden win-main ${theater ? "is-theater-main" : ""}`}>
-        <MainTabs wide={wide} pageActive={pageActive} bottomInset={14} />
-        {stack.map((p, i) => (
-          <div key={p.key} inert={i !== stack.length - 1 || loginOpen} aria-hidden={i !== stack.length - 1 || loginOpen} className="absolute inset-0 z-30 bg-bg win-page-in" style={{ boxShadow: "-18px 0 40px rgba(0,0,0,.5)" }}>
-            <StackPage page={p} onBack={pop} wide={wide} top={i === stack.length - 1} bottomInset={14} loginOpen={loginOpen} />
-          </div>
-        ))}
+        <MainTabs wide={wide} pageActive={pageActive} covered={stack.length > 0} bottomInset={14} />
+        {stack.map((p, i) => {
+          const top = i === stack.length - 1;
+          return (
+            <LayerBox
+              key={p.key}
+              hidden={!top}
+              inert={!top || loginOpen}
+              ariaHidden={!top || loginOpen}
+              className="absolute inset-0 bg-bg isolate"
+              enterClass="win-page-in"
+              style={{ zIndex: 30 + i }}
+            >
+              <StackPage page={p} onBack={pop} wide={wide} top={top} bottomInset={14} loginOpen={loginOpen} />
+            </LayerBox>
+          );
+        })}
       </div>
     </div>
   );
