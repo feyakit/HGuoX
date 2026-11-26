@@ -115,23 +115,26 @@ export function ToastHost() {
 }
 
 /* ——— 图片（骨架 + 渐显，自动走本地解密协议） ——— */
-export function Img({ src, alt = "", className = "", eager = false, raw = false, loadingIndicator = false, w, h }: {
+export function Img({ src, alt = "", className = "", eager = false, raw = false, loadingIndicator = false, w, h, onDimensions }: {
   src: string; alt?: string; className?: string; eager?: boolean; raw?: boolean; loadingIndicator?: boolean;
   /** 输出像素上限（按 cssWidth × dpr 传），透传给本地图片代理做解码后缩略 */
   w?: number; h?: number;
+  /** 图片加载完成后的自然宽高回调 */
+  onDimensions?: (width: number, height: number) => void;
 }) {
   const url = raw ? src : cover(src, w, h);
   // 每个地址独立持有状态，避免换图后的 effect 把缓存命中的 onLoad 重置掉。
   /* key 用稳定的原始 src（不能是可变的派生 url）；同一条目重新渲染不会再挂载新组件 */
-  return <ImageLoad key={src || alt} url={url} alt={alt} className={className} eager={eager} raw={raw} loadingIndicator={loadingIndicator} />;
+  return <ImageLoad key={src || alt} url={url} alt={alt} className={className} eager={eager} raw={raw} loadingIndicator={loadingIndicator} onDimensions={onDimensions} />;
 }
 
 /* 本进程内已经成功加载过的图：命中就别再放 shimmer、也别再做淡入。
    滚动中"闪一下白"就是 shimmer 重播造成的，这个集合直接从源头掐掉。 */
 const LOADED_IMAGES = new Set<string>();
 
-function ImageLoad({ url, alt, className, eager, raw, loadingIndicator }: {
+function ImageLoad({ url, alt, className, eager, raw, loadingIndicator, onDimensions }: {
   url: string; alt: string; className: string; eager: boolean; raw: boolean; loadingIndicator: boolean;
+  onDimensions?: (width: number, height: number) => void;
 }) {
   const [ok, setOk] = useState(() => !!url && LOADED_IMAGES.has(url));
   const [err, setErr] = useState(false);
@@ -153,6 +156,9 @@ function ImageLoad({ url, alt, className, eager, raw, loadingIndicator }: {
           /* 预热：onLoad 只保证字节到了，解码（尤其长图）可能留到首次绘制才做。
              这里主动 decode 一次，把解码成本挪到滚动之前。 */
           const node = e.currentTarget;
+          if (node.naturalWidth > 0 && node.naturalHeight > 0) {
+            onDimensions?.(node.naturalWidth, node.naturalHeight);
+          }
           node.decode?.().catch(() => {});
         }}
         onError={() => {

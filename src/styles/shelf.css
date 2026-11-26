@@ -1380,15 +1380,18 @@
   background: #161829;
   border: 1px solid rgba(255, 255, 255, 0.12);
 }
-.ios-button.hg-spotlight::before { content: ""; display: block; padding-top: 64%; }
+.ios-button.hg-spotlight::before { content: ""; display: block; padding-top: var(--hg-hero-ratio, 56.25%); }
 @media (min-width: 720px) {
-  .ios-button.hg-spotlight::before { padding-top: 38%; }
+  .ios-button.hg-spotlight::before { padding-top: var(--hg-hero-ratio-lg, 38%); }
 }
 .ios-button.hg-spotlight > img,
 .ios-button.hg-spotlight > .ios-image { position: absolute; inset: 0; width: 100%; height: 100%; }
 .ios-button.hg-spotlight > .ios-image > img {
-  width: 100%; height: 100%; object-fit: cover;
+  width: 100%; height: 100%; object-fit: cover; object-position: center center;
   transition: transform 0.65s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.45s ease;
+}
+.ios-button.hg-spotlight.is-portrait > .ios-image > img {
+  object-position: center 22%;
 }
 .hg-spotlight-slide[data-active="false"] .ios-button.hg-spotlight > .ios-image > img {
   transform: scale(1.04);
