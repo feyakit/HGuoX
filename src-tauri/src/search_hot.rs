@@ -188,11 +188,7 @@ async fn fetch_page(url: &str, page_label: &str, timeout_message: &str) -> Resul
 }
 
 async fn fetch_html() -> Result<String, String> {
-    let url = format!(
-        "{}/search/?_hguox_hot={}",
-        crate::net::base(),
-        cache_bust_value()
-    );
+    let url = format!("{}/search/", crate::net::base().trim_end_matches('/'));
     fetch_page(&url, "官网搜索页", "获取官网热搜超时（12 秒）").await
 }
 

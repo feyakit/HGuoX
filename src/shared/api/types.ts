@@ -50,6 +50,8 @@ export type Detail = {
   video_type?: number;
   duration?: number;
   created_at?: string;
+  updated_at?: string | number;
+  last_ep_at?: string | number;
 };
 
 export type PlayInfo = {
