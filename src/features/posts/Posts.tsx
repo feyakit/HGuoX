@@ -3,7 +3,7 @@ import { Loader } from "../../shared/ui/ios/effects";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { api, cover, fmt, isMobile } from "../../shared/api/api";
 import type { Post } from "../../shared/api/types";
-import { useStore } from "../../shared/model/store";
+import { ACTION_TOAST_SLOT, useStore } from "../../shared/model/store";
 import { markScrolling } from "../../shared/lib/scrollFx";
 import { copyText } from "../../shared/lib/clipboard";
 import { Empty, Img, Sheet } from "../../shared/ui/ui";
@@ -737,7 +737,7 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
                 if (favBusy) return;
                 const next = !faved;
                 void setCollected("post", id, next).then(() => {
-                  toast(next ? "已收藏帖子" : "已取消收藏", next ? "star" : "info");
+                  toast(next ? "已收藏帖子" : "已取消收藏", next ? "star" : "info", ACTION_TOAST_SLOT);
                 }).catch((e) => toast((e as Error)?.message || "收藏失败", "info"));
               }}>
               {faved ? <IStarF size={16} /> : <IStar size={16} />}

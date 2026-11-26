@@ -1,11 +1,12 @@
 import { Button, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { prefetchDetails } from "../../shared/api/detailFast";
 import { api, fmt, isMobile } from "../../shared/api/api";
 import type { VideoCard } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
 import { Masonry } from "../../shared/ui/cards";
+import { VIDEO_SORT_OPTIONS, sortVideosByMetric, type VideoSortDirection, type VideoSortMetric } from "../../shared/model/videoSort";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
 import { InplaceSearch } from "../search/InplaceSearch";
 import { Empty, Img } from "../../shared/ui/ui";
@@ -402,8 +403,15 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
   const [searching, setSearching] = useState(false);
   const [serverSort, setServerSort] = useState<(typeof CHANNEL_SORTS)[number]["value"]>("latest");
   const [originalCate, setOriginalCate] = useState<(typeof CHANNEL_ORIGINAL_CATES)[number]["value"]>("all");
+  const [metricSort, setMetricSort] = useState<VideoSortMetric>("default");
+  const [metricDir, setMetricDir] = useState<VideoSortDirection>("desc");
+  const toggleMetricSort = (key: VideoSortMetric) => {
+    if (key === metricSort && key !== "default") setMetricDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setMetricSort(key); setMetricDir("desc"); }
+  };
   const [pageItems, setPageItems] = useState<VideoCard[][]>([]);
   const items = pageItems.flat();
+  const displayItems = useMemo(() => sortVideosByMetric(items, metricSort, metricDir), [items, metricSort, metricDir]);
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
   const [loading, setLoading] = useState(true);
@@ -584,7 +592,19 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
         {items.length > 0 && err && <div role="status" className="mb-3 flex flex-wrap items-center gap-2 text-[12px] text-mut"><span>{err}</span><Button className="px-3 text-primary" onClick={() => void loadMore(replacing)}>重试</Button></div>}
         {items.length ? (
           <div inert={replacing || undefined} className={replacing ? "opacity-60" : undefined}>
-            <Masonry videos={items} scopeKey={filterKey(serverSort, originalCate)} wide={wide} onOpen={(v) => { if (!replacing) push({ kind: "series", id: v.id }); }} />
+            <div className="mb-3 flex flex-wrap items-center gap-1.5" aria-label="指标排序">
+              {VIDEO_SORT_OPTIONS.map((opt) => {
+                const active = metricSort === opt.key;
+                return (
+                  <Button key={opt.key} card aria-pressed={active}
+                    onClick={() => toggleMetricSort(opt.key)}
+                    className={`hg-tag-pill${active ? " is-on" : ""}`}>
+                    {opt.label}{active && opt.key !== "default" ? (metricDir === "desc" ? " ↓" : " ↑") : ""}
+                  </Button>
+                );
+              })}
+            </div>
+            <Masonry videos={displayItems} scopeKey={`${filterKey(serverSort, originalCate)}:${metricSort}:${metricDir}`} wide={wide} onOpen={(v) => { if (!replacing) push({ kind: "series", id: v.id }); }} />
           </div>
         ) : err ? (
           <Empty icon={<IGrid size={26} />} title="加载失败" sub={err} action="重试" onAction={() => void loadMore(true)} />
