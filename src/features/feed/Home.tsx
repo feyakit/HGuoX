@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { prefetchDetails } from "../../shared/api/detailFast";
 import { useTabSwipe } from "./useTabSwipe";
 import { ApiError, api, fmt, hostOf, isMobile, logLine } from "../../shared/api/api";
@@ -156,6 +156,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const bannersAt = useRef(0);
   const [heroIndex, setHeroIndex] = useState(0);
   const [heroDragX, setHeroDragX] = useState(0);
+  const [heroRatios, setHeroRatios] = useState<Record<number, number>>({});
   const heroTouch = useRef<{ x: number; y: number } | null>(null);
   const [continueCard, setContinueCard] = useState<{ detail: Detail; ep: number; t: number; dur: number; at: number } | null>(null);
   const [dismissedContinue, setDismissedContinue] = useState(0);
@@ -823,17 +824,38 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
                 }}
                 onTouchCancel={() => { heroTouch.current = null; setHeroDragX(0); }}
               >
-                <div className="hg-spotlight-viewport">
+                <div className="hg-spotlight-viewport" style={(() => {
+                  const usingBanners = bannerHeroes.length > 0;
+                  const measured = hero ? heroRatios[hero.id] : undefined;
+                  /* 官网宽幅 banner 允许 40%–64%（约 2.5:1 到 16:10），默认 56.25%（16:9）；
+                     回落竖版封面固定 64% 并偏上对齐，防止人物头部被裁切。 */
+                  const ratio = usingBanners
+                    ? (measured ? Math.max(0.4, Math.min(0.64, measured)) : 0.5625)
+                    : 0.64;
+                  const ratioLg = usingBanners
+                    ? (measured ? Math.max(0.34, Math.min(0.48, measured)) : 0.42)
+                    : 0.38;
+                  return {
+                    "--hg-hero-ratio": `${(ratio * 100).toFixed(2)}%`,
+                    "--hg-hero-ratio-lg": `${(ratioLg * 100).toFixed(2)}%`,
+                  } as CSSProperties;
+                })()}>
                   <div
                     className={`hg-spotlight-track${heroDragX !== 0 ? " is-dragging" : ""}`}
                     style={{ transform: `translate3d(calc(${-safeHeroIdx * 100}% + ${heroDragX}px), 0, 0)` }}
                   >
-                    {heroes.map((h, i) => (
+                    {heroes.map((h, i) => {
+                      const measured = heroRatios[h.id];
+                      const isPortrait = measured !== undefined ? measured > 0.85 : bannerHeroes.length === 0;
+                      return (
                       <div key={h.id} className="hg-spotlight-slide" data-active={String(i === safeHeroIdx)}>
-                        <Button card className="hg-spotlight" aria-label={`${h.title} 详情`}
+                        <Button card className={`hg-spotlight${isPortrait ? " is-portrait" : ""}`} aria-label={`${h.title} 详情`}
                           tabIndex={i === safeHeroIdx ? 0 : -1}
                           onClick={() => openSeries(h.id)}>
-                          <Img src={h.cover} eager alt="" />
+                          <Img src={h.cover} eager alt="" onDimensions={(w, ht) => {
+                            const r = ht / w;
+                            setHeroRatios(prev => (prev[h.id] && Math.abs(prev[h.id] - r) < 0.01 ? prev : { ...prev, [h.id]: r }));
+                          }} />
                           <span className="hg-spotlight-veil" aria-hidden="true" />
                           <span className="hg-spotlight-top">
                             <span className="hg-spotlight-kicker">
@@ -858,7 +880,8 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
                           </span>
                         </Button>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
                 {heroes.length > 1 && (
