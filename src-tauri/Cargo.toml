@@ -1,6 +1,6 @@
 [package]
 name = "huangguo-client"
-version = "3.0.13"
+version = "3.0.14"
 description = "HGuoX · 跨平台短剧/漫剧客户端（iOS / Android / Windows / macOS / Linux）"
 authors = ["HGuoX"]
 license = "PolyForm-Noncommercial-1.0.0"
