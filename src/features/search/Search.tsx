@@ -9,6 +9,7 @@ import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { Empty, Img } from "../../shared/ui/ui";
 import { useSearchResults } from "./useSearchResults";
 import { useRankSwipe } from "./useRankSwipe";
+import { SearchHistory } from "./SearchHistory";
 import { useTabSwipe } from "../../shared/lib/useTabSwipe";
 import { useApiRefresh, useForegroundRefresh, useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { PullIndicator, usePullToRefresh } from "../../shared/lib/usePullToRefresh";
@@ -26,7 +27,7 @@ export default function Search({
   initialTab?: "video" | "post";
   onBack?: () => void;
 }) {
-  const { push, toast, searchHist, addSearch, clearSearchHist, lineEpoch, accountScope } = useStore();
+  const { push, toast, searchHist, addSearch, removeSearch, clearSearchHist, lineEpoch, accountScope } = useStore();
   const [q, setQ] = useState("");
   const [submitted, setSubmitted] = useState("");
   const [tab, setTab] = useState<"video" | "post">(initialTab);
@@ -168,19 +169,12 @@ export default function Search({
       <div ref={scrollRef} {...tabSwipe} style={{ touchAction: "pan-y", paddingBottom: "calc(32px + var(--sab, 0px))" }} className="flex-1 scroll-y hg-page-x pt-1 relative z-10">
         {!querying ? (
           <>
-            {searchHist.length > 0 && (
-              <div className="mb-4 a-rise">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-[13px] font-bold text-on">最近搜索</span>
-                  <Button onClick={clearSearchHist} className="text-[12px] text-dim pressable">清空</Button>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {searchHist.map((h) => (
-                    <Button key={h} card onClick={() => { setQ(h); submit(h); }} className="hg-tag-pill">{h}</Button>
-                  ))}
-                </div>
-              </div>
-            )}
+            <SearchHistory
+              items={searchHist}
+              onPick={(h) => { setQ(h); submit(h); }}
+              onRemove={removeSearch}
+              onClear={clearSearchHist}
+            />
 
             <Surface role="region" aria-label="热搜榜" className="mt-1 rounded-[16px] p-3.5 a-rise"
               style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}>

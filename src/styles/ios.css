@@ -749,3 +749,23 @@ html[data-fx="low"] .plat-ios .a-page-out { animation: none; }
 html[data-fx="low"] .a-page-under,
 html[data-fx="low"] .hg-stagger > *,
 html[data-fx="low"] .ios-empty { animation: none; }
+
+/* 搜索历史长按批量删除（上游 #184） */
+.ios-history-actions { display:flex; align-items:center; gap:2px; margin-right:-8px; }
+.ios-history-action { min-height:32px; height:32px; padding:0 6px; border:0; background:transparent; box-shadow:none; color:var(--p-mut); font-size:12px; }
+.ios-history-action:active { color:var(--p-on); }
+.ios-history-done { color:var(--p-primary); font-weight:600; }
+.ios-history-separator { color:var(--p-dim); font-size:12px; line-height:1; }
+.ios-history-chip { position:relative; display:inline-flex; align-items:center; min-width:0; max-width:100%; height:36px; min-height:36px; padding:7px 14px; border:1px solid var(--ios-edge); border-radius:999px; background:var(--p-s3); color:var(--p-on); }
+.ios-history-chip-label { min-width:0; overflow-wrap:anywhere; color:rgba(255,255,255,.88); font-size:13px; font-weight:600; line-height:1.35; }
+.ios-history-chip-remove { position:absolute; top:-7px; right:-7px; display:grid; place-items:center; width:22px; min-width:22px; height:22px; min-height:22px; padding:0; border:1px solid var(--ios-edge); border-radius:50%; background:var(--p-s2); color:var(--p-mut); box-shadow:0 2px 6px rgba(0,0,0,.22); }
+.ios-history-chip-remove:active { background:var(--p-s4); color:var(--p-on); }
+
+/* 标签长按置顶与详情页图钉（上游 #252） */
+.tag-pin-pill { touch-action:manipulation; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+.tag-pin-pill[data-pressing="true"] { transform:scale(.96); border-color:var(--p-primary); }
+.tag-pin-pill[data-pinned="true"][data-pin-surface="group"] { border-color:var(--p-primary); background:rgba(124,92,255,.16); }
+.tag-page-pin.hg-sub-btn { color:var(--p-mut); }
+.tag-page-pin.hg-sub-btn[aria-pressed="true"] { background:rgba(124,92,255,.22); border-color:rgba(124,92,255,.45); color:#c4b5fd; }
+.tag-page-pin-icon { transform:rotate(0deg); transition:transform 180ms cubic-bezier(.2,.8,.2,1); }
+.tag-page-pin.hg-sub-btn[aria-pressed="true"] .tag-page-pin-icon { transform:rotate(-45deg); }
