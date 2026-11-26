@@ -71,9 +71,9 @@ export default function GuestMergePrompt() {
   };
 
   return (
-    <Modal label="同步本机数据" open={open} onClose={close} width={330}>
-      <div className="px-1 py-1">
-        <div className="text-[15px] font-bold text-on">发现本机有数据</div>
+    <Modal label="同步本机数据" open={open} onClose={close} width={360}>
+      <div className="p-5">
+        <div className="text-[16px] font-bold text-on">发现本机有数据</div>
         <p className="mt-2 text-[13px] leading-[1.6] text-on/70">
           本机有 <span className="font-semibold text-on">{offer.favs}</span> 项收藏、
           <span className="font-semibold text-on">{offer.history}</span> 条观看记录。
