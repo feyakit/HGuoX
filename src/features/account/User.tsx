@@ -1,6 +1,6 @@
-import { Button } from "../../shared/ui/ios/controls";
+import { Button, Surface } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, fmt } from "../../shared/api/api";
 import type { Paged, UserProfile, VideoCard } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
@@ -95,34 +95,91 @@ export function FollowingPage({ onBack, wide }: { onBack: () => void; wide: bool
 }
 
 function FollowingContent({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { push, user, setLoginOpen, setTab, accountScope } = useStore();
+  const { push, user, follows, accountSync, setLoginOpen, setTab, accountScope } = useStore();
   const [searching, setSearching] = useState(false);
+  const [creators, setCreators] = useState<Record<number, UserProfile>>({});
+  const followSlice = useMemo(() => follows.slice(0, 24), [follows]);
+  const followSet = useMemo(() => new Set(follows), [follows]);
+  const followsKey = followSlice.join(",");
+  const confirmedEmptyFollows = !!user && accountSync.favoritesKnown && follows.length === 0;
+
+  useEffect(() => {
+    if (!user || !followSlice.length) return;
+    let alive = true;
+    const missing = followSlice.filter(uid => !creators[uid]);
+    if (!missing.length) return;
+    void Promise.allSettled(missing.map(uid => api.user(uid).then(profile => ({ uid, profile })))).then(results => {
+      if (!alive) return;
+      const next: Record<number, UserProfile> = {};
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value.profile) {
+          next[result.value.uid] = result.value.profile;
+        }
+      }
+      if (Object.keys(next).length) setCreators(prev => ({ ...prev, ...next }));
+    });
+    return () => { alive = false; };
+  }, [user, followsKey]);
+
   // Identity belongs in the dependency list: switching accounts discards the previous feed.
   const request = useCallback((page: number) => api.following(page, 20), [accountScope]);
-  const state = useUserVideos(!!user, request);
+  const state = useUserVideos(!!user && !confirmedEmptyFollows, request);
+  /* 兜底校验：若接口返回了非已关注作者的视频（如站点回落全站流），前端按 follows 过滤。 */
+  const visibleItems = useMemo(() => {
+    if (!follows.length) return confirmedEmptyFollows ? [] : state.items;
+    return state.items.filter(item => !item.author?.id || followSet.has(item.author.id));
+  }, [state.items, follows.length, confirmedEmptyFollows, followSet]);
+
   return <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
     <span className="hg-aura" aria-hidden="true" />
     <header className="shrink-0 hg-subpage-bar relative z-10">
       <Button card aria-label="返回" onClick={onBack} className="hg-sub-btn"><IBack size={19} /></Button>
       <div className="hg-sub-titles">
         <h1 className="hg-sub-title">关注</h1>
-        {user && <p className="hg-sub-meta" role="status">{countLabel(state)}</p>}
+        {user && <p className="hg-sub-meta" role="status">{follows.length > 0 ? `已关注 ${follows.length} 人 · ` : ""}{countLabel({ ...state, items: visibleItems, total: visibleItems.length === state.items.length ? state.total : null })}</p>}
       </div>
-      {user && state.items.length > 0 && (
+      {user && visibleItems.length > 0 && (
         <Button card className="hg-quick-action"
-          onClick={() => push({ kind: "feed", videoIds: state.items.map(item => item.id), index: 0, title: "关注" })}>
+          onClick={() => push({ kind: "feed", videoIds: visibleItems.map(item => item.id), index: 0, title: "关注" })}>
           <IBoltF size={13} /><span>连刷关注</span>
         </Button>
       )}
       <Button card onClick={() => setSearching(true)} aria-label="搜索短剧" className="hg-sub-btn"><ISearch size={17} /></Button>
     </header>
     <div ref={state.scroller} className="flex-1 scroll-y hg-page-x pt-3 pb-8 relative z-10">
-      {!user ? <Empty icon={<IUser size={26} />} title="登录后查看关注流" sub="关注喜欢的作者，第一时间看到他们的新作品" action="去登录" onAction={() => setLoginOpen(true)} />
-        : state.loading && !state.items.length ? <div className="flex justify-center py-12"><Loader /></div>
-        : state.err && !state.items.length ? <Empty icon={<IGrid size={26} />} title="关注流加载失败" sub={state.err} action="重试" onAction={() => void state.loadMore()} />
-        : state.items.length ? <Masonry videos={state.items} scopeKey={`following:${accountScope}`} wide={wide} onOpen={video => push({ kind: "series", id: video.id })} />
-        : <Empty icon={<IGrid size={26} />} title="还没有关注内容" sub="在首页、分类或吃瓜中发现内容，关注喜欢的作者。" action="去分类看看" onAction={() => { onBack(); setTab("category"); }} />}
-      {user && <PaginationFeedback state={state} />}
+      {!user ? <Empty icon={<IUser size={26} />} title="登录后查看关注流" sub="关注喜欢的作者，第一时间看到他们的新作品" action="去登录" onAction={() => setLoginOpen(true)} /> : <>
+        {followSlice.length > 0 && (
+          <Surface role="region" aria-label="已关注创作者" className="mb-4 rounded-(--r-md) bg-s1 p-3.5">
+            <div className="flex items-center justify-between mb-2.5">
+              <h2 className="text-[13px] font-semibold text-on/90">已关注创作者</h2>
+              <span className="text-[12px] text-mut">共 {follows.length} 位</span>
+            </div>
+            <div className="scroll-x flex gap-3 snap-x">
+              {followSlice.map(uid => {
+                const info = creators[uid];
+                const label = info?.nickname || `用户 ${uid}`;
+                return (
+                  <Button key={uid} onClick={() => push({ kind: "user", id: uid, name: info?.nickname })}
+                    className="w-[68px] shrink-0 flex flex-col items-center gap-1.5 snap-start pressable"
+                    aria-label={`进入 ${label} 主页`}>
+                    <Avatar size={48} name={label} hue={(uid * 47) % 360} ring />
+                    <span className="w-full text-[12px] text-on/85 text-center truncate">{label}</span>
+                  </Button>
+                );
+              })}
+            </div>
+          </Surface>
+        )}
+        {state.loading && !visibleItems.length ? <div className="flex justify-center py-12"><Loader /></div>
+          : state.err && !visibleItems.length ? <Empty icon={<IGrid size={26} />} title="关注流加载失败" sub={state.err} action="重试" onAction={() => void state.loadMore()} />
+          : visibleItems.length ? <>
+            {followSlice.length > 0 && <h2 className="mb-2.5 text-[14px] font-bold text-on">最新动态</h2>}
+            <Masonry videos={visibleItems} scopeKey={`following:${accountScope}`} wide={wide} onOpen={video => push({ kind: "series", id: video.id })} />
+          </>
+          : follows.length > 0 ? <Empty icon={<IGrid size={26} />} title="关注的创作者暂未发布新剧" sub="可点击上方头像进入创作者主页查看，或去分类发现更多作品。" action="去分类看看" onAction={() => { onBack(); setTab("category"); }} />
+          : <Empty icon={<IGrid size={26} />} title="还没有关注内容" sub="在首页、分类或吃瓜中发现内容，关注喜欢的作者。" action="去分类看看" onAction={() => { onBack(); setTab("category"); }} />}
+        {!confirmedEmptyFollows && <PaginationFeedback state={state} />}
+      </>}
     </div>
     {searching && <InplaceSearch kind="video" wide={wide} onClose={() => setSearching(false)} onOpenVideo={(v) => push({ kind: "series", id: v.id })} />}
   </div>;
