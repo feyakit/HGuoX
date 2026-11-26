@@ -1,8 +1,8 @@
-import { Button, Surface, TextArea } from "../../shared/ui/ios/controls";
+import { Button, SegmentedControl, Surface, TextArea } from "../../shared/ui/ios/controls";
 import { useEffect, useRef, useState } from "react";
 import { api, APP_VERSION, hostOf, isMobile, logLine, type UpdateInfo } from "../../shared/api/api";
 import { isBalanceVolumeSupported } from "../playback/balanceVolume";
-import { useStore } from "../../shared/model/store";
+import { useStore, type Tab } from "../../shared/model/store";
 import { middleEllipsis } from "../../shared/lib/textFit";
 import { Modal } from "../../shared/ui/ui";
 import { clearDetailCache } from "../../shared/api/detailFast";
@@ -15,7 +15,7 @@ import { useContentPreferences } from "../../shared/model/contentPreferences";
 import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, tracePlayback, usePlaybackLog } from "../../shared/diagnostics/playbackDiagnostics";
 import { formatNetDiag, shortVerdict } from "../../shared/diagnostics/netDiagReport";
 import { copyText } from "../../shared/lib/clipboard";
-import { IBack, IBoltF, IBroom, IClapper, IFileText, IInfo, ILockF, IList, ILink, ILogout, IRefresh, ISparkF, ISun, IVolMute, IVol } from "../../shared/ui/icons";
+import { IBack, IBoltF, IBroom, IClapper, IFileText, IHome, IInfo, ILockF, IList, ILink, ILogout, IRefresh, ISparkF, ISun, IVolMute, IVol } from "../../shared/ui/icons";
 
 /* 设置页：7 组平铺（播放 / 内容偏好 / 网络 / 本地数据 / 播放诊断 / 账号 / 关于）
  *
@@ -25,7 +25,7 @@ import { IBack, IBoltF, IBroom, IClapper, IFileText, IInfo, ILockF, IList, ILink
  *
  * 入口：Windows 侧栏「设置」、Android / iOS「我的」右上角齿轮 */
 export default function Settings({ onBack }: { onBack: () => void; wide: boolean }) {
-  const { user, logout, muteOnStartup, setMuteOnStartup, ambientGlow, setAmbientGlow, balanceVolume, setBalanceVolume, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast, push } = useStore();
+  const { user, logout, muteOnStartup, setMuteOnStartup, ambientGlow, setAmbientGlow, balanceVolume, setBalanceVolume, startupTab, setStartupTab, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast, push } = useStore();
   const { preferences: contentPrefs } = useContentPreferences();
   const [about, setAbout] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
@@ -133,6 +133,18 @@ export default function Settings({ onBack }: { onBack: () => void; wide: boolean
           </p>
 
           <SettingsGroup title="播放">
+            <div className="ios-settings-row flex-wrap">
+              <span className="ios-setting-icon"><IHome size={16} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[14px] text-on">启动时打开的页面</div>
+                <div className="text-[12px] text-mut">下次启动生效；可设为直接进吃瓜、分类或我的</div>
+              </div>
+              <SegmentedControl className="w-full" aria-label="启动时打开的页面" activeIndex={(["home", "posts", "category", "profile"] as Tab[]).indexOf(startupTab)}>
+                {([["home", "首页"], ["posts", "吃瓜"], ["category", "分类"], ["profile", "我的"]] as const).map(([value, label]) => (
+                  <Button key={value} type="button" aria-pressed={startupTab === value} onClick={() => setStartupTab(value)}>{label}</Button>
+                ))}
+              </SegmentedControl>
+            </div>
             <SettingsRow icon={<IVolMute size={16} />} title="启动时静音" sub="关闭后沿用上次音量"
               right={{ kind: "switch", on: muteOnStartup, onChange: setMuteOnStartup, label: "启动时静音" }} />
             <SettingsRow icon={<IBoltF size={16} />} title="播放源" sub="手动选线只作优先"

@@ -225,9 +225,9 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
 
         <div className="mt-3.5 pt-3 flex flex-wrap items-center justify-between gap-3" style={{ borderTop: "1px solid rgba(255,255,255,0.08)" }}>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-mut" aria-busy={infoLoading}>
-            <span>作品 <b className="text-on text-[14px]">{stat(stats?.video_count)}</b></span>
-            <span>粉丝 <b className="text-on text-[14px]">{stat(stats?.followers)}</b></span>
-            <span>获赞 <b className="text-on text-[14px]">{stat(stats?.like_count)}</b></span>
+            <span className="whitespace-nowrap">作品 <b className="text-on text-[14px]">{stat(stats?.video_count)}</b></span>
+            <span className="whitespace-nowrap">粉丝 <b className="text-on text-[14px]">{stat(stats?.followers)}</b></span>
+            <span className="whitespace-nowrap">获赞 <b className="text-on text-[14px]">{stat(stats?.like_count)}</b></span>
           </div>
           {state.items.length > 0 && (
             <Button card className="hg-quick-action"

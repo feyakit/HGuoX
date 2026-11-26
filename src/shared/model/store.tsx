@@ -76,6 +76,9 @@ export type Toast = {
   tag?: string;
 };
 
+/** 动作确认与播放提示共用单槽，快速连点原地替换不堆叠（上游 #260） */
+export const ACTION_TOAST_SLOT = "playback-hint";
+
 /** 观看记录：看到第几集、第几秒（`dur` 用来判断是否已看完） */
 export type WatchProgress = { id: number; ep: number; t: number; dur: number; at: number };
 
@@ -92,14 +95,18 @@ type Persist = GuestData & {
   ambientGlow: boolean;
   /** 平衡音量（POC）：默认关闭，只在移动端出现设置项 */
   balanceVolume: boolean;
+  /** 启动时打开的页面：默认首页（上游 #185） */
+  startupTab: Tab;
 };
 
 const LS = STORAGE_KEYS.app;
 /* 「我的」里给本机游客数据标来源用 */
 const GUEST_KEPT_KEY = "hguox_guest_kept_v1";
+const STARTUP_TABS: readonly Tab[] = ["home", "posts", "category", "profile"];
 const DEFAULTS: Persist = {
   likes: [], favs: [], postFavs: [], history: [], follows: [],
   muted: true, muteOnStartup: true, volume: 0.7, searchHist: [], swipeEp: true, preferHevc: true, ambientGlow: true, balanceVolume: false,
+  startupTab: "home",
 };
 
 /** 旧版本 history 是 number[]，读出来时升级成带进度的结构 */
@@ -139,7 +146,8 @@ function loadPersist(): Persist {
     /* 旧配置没有这个概念，按「默认开」处理（只有显式 false 才关） */
     const ambientGlow = p.ambientGlow !== false;
     const balanceVolume = p.balanceVolume === true;
-    return { ...p, swipeEp, muteOnStartup, muted: muteOnStartup || p.muted === true, ambientGlow, balanceVolume, history: normalizeHistory(p.history) };
+    const startupTab: Tab = STARTUP_TABS.includes(p.startupTab) ? p.startupTab : "home";
+    return { ...p, swipeEp, muteOnStartup, muted: muteOnStartup || p.muted === true, ambientGlow, balanceVolume, startupTab, history: normalizeHistory(p.history) };
   } catch {
     return DEFAULTS;
   }
@@ -181,6 +189,7 @@ type Store = {
   preferHevc: boolean; setPreferHevc: (on: boolean) => void;
   ambientGlow: boolean; setAmbientGlow: (on: boolean) => void;
   balanceVolume: boolean; setBalanceVolume: (on: boolean) => void;
+  startupTab: Tab; setStartupTab: (t: Tab) => void;
   volume: number; setVolume: (v: number) => void;
   searchHist: string[]; addSearch: (q: string) => void; removeSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
@@ -232,7 +241,7 @@ function flushFailoverToast() {
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [p, setP] = useState<Persist>(loadPersist);
-  const [tab, setTabRaw] = useState<Tab>("home");
+  const [tab, setTabRaw] = useState<Tab>(p.startupTab);
   const [stack, setStack] = useState<Page[]>([]);
   const stackRef = useRef<Page[]>(stack);
   stackRef.current = stack;
@@ -529,6 +538,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setBalanceVolume = useCallback((on: boolean) => {
     setP((s) => ({ ...s, balanceVolume: on }));
   }, []);
+  const setStartupTab = useCallback((t: Tab) => {
+    setP((s) => ({ ...s, startupTab: STARTUP_TABS.includes(t) ? t : "home" }));
+  }, []);
   const setVolume = useCallback((v: number) => {
     const volume = Math.max(0, Math.min(1, v));
     setP((s) => ({ ...s, volume, muted: volume === 0 }));
@@ -551,6 +563,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     preferHevc: p.preferHevc, setPreferHevc,
     ambientGlow: p.ambientGlow, setAmbientGlow,
     balanceVolume: p.balanceVolume, setBalanceVolume,
+    startupTab: p.startupTab, setStartupTab,
     searchHist: p.searchHist, addSearch, removeSearch, clearSearchHist,
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     accent, setAccent: setAccentState,
@@ -560,7 +573,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }), [tab, setTab, stack, push, pop, user, loginOpen, logout,
     mergeOffer, beginGuestMerge, acceptMerge, declineMerge, guestKept,
     p, account,
-    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setAmbientGlow, setVolume, addSearch, removeSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setAmbientGlow, setBalanceVolume, setStartupTab, setVolume, addSearch, removeSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     accent, setAccentState,
     toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean]);
 

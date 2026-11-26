@@ -1,10 +1,19 @@
 import { Button, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
-import { Fragment, useCallback, useEffect, useId, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api, fmt } from "../../shared/api/api";
 import type { Post, TopicCard, TopicDetail, VideoCard } from "../../shared/api/types";
-import { useStore } from "../../shared/model/store";
+import { ACTION_TOAST_SLOT, useStore } from "../../shared/model/store";
 import { MAX_BLOCKED_TAGS, MAX_PINNED_TAGS, MAX_TAG_LENGTH, useContentPreferences } from "../../shared/model/contentPreferences";
+import {
+  SERIALIZATION_FILTER_OPTIONS,
+  VIDEO_SORT_OPTIONS,
+  filterVideosByStatus,
+  sortVideosByMetric,
+  type SerializationStatusFilter,
+  type VideoSortDirection,
+  type VideoSortMetric,
+} from "../../shared/model/videoSort";
 import { Masonry, MediaCard } from "../../shared/ui/cards";
 import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { InplaceSearch } from "../search/InplaceSearch";
@@ -485,17 +494,26 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
   const { preferences, isTagPinned, togglePinnedTag } = useContentPreferences();
   const [searching, setSearching] = useState(false);
   const { data, loading, err, load } = useDiscoveryData(`tags:${lineEpoch}`, api.tags);
-  const groups = data?.categories ?? [];
+  const rawGroups = data?.categories ?? [];
+  const groups = useMemo(
+    () => rawGroups
+      .map((g) => ({
+        ...g,
+        tags: (g.tags ?? []).filter((t) => !(typeof t.video_count === "number" && Number.isFinite(t.video_count) && t.video_count <= 0)),
+      }))
+      .filter((g) => g.tags.length > 0),
+    [rawGroups],
+  );
   const pinnedTags = preferences.pinnedTags;
 
   const togglePin = useCallback((name: string) => {
     const currentlyPinned = isTagPinned(name);
     if (!currentlyPinned && pinnedTags.length >= MAX_PINNED_TAGS) {
-      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info");
+      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info", ACTION_TOAST_SLOT);
       return;
     }
     togglePinnedTag(name);
-    toast(currentlyPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, currentlyPinned ? "info" : "ok");
+    toast(currentlyPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, currentlyPinned ? "info" : "ok", ACTION_TOAST_SLOT);
   }, [isTagPinned, pinnedTags.length, toast, togglePinnedTag]);
 
   return (
@@ -570,12 +588,19 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
   const tagPinned = isTagPinned(name);
   const togglePin = useCallback(() => {
     if (!tagPinned && preferences.pinnedTags.length >= MAX_PINNED_TAGS) {
-      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info");
+      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info", ACTION_TOAST_SLOT);
       return;
     }
     togglePinnedTag(name);
-    toast(tagPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, tagPinned ? "info" : "ok");
+    toast(tagPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, tagPinned ? "info" : "ok", ACTION_TOAST_SLOT);
   }, [name, preferences.pinnedTags.length, tagPinned, toast, togglePinnedTag]);
+  const [statusFilter, setStatusFilter] = useState<SerializationStatusFilter>("all");
+  const [metricSort, setMetricSort] = useState<VideoSortMetric>("default");
+  const [metricDir, setMetricDir] = useState<VideoSortDirection>("desc");
+  const toggleMetricSort = (key: VideoSortMetric) => {
+    if (key === metricSort && key !== "default") setMetricDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setMetricSort(key); setMetricDir("desc"); }
+  };
   const cannotAdd = !name.trim() || name.trim().length > MAX_TAG_LENGTH || preferences.blockedTags.length >= MAX_BLOCKED_TAGS;
   const [searching, setSearching] = useState(false);
   const [tabChoice, setTabChoice] = useState<"auto" | "video" | "post">("auto");
@@ -730,11 +755,40 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
 
         {activeTab === "video" ? (
           <>
+            {visibleVideos.length > 0 && (
+              <div className="mb-3 flex flex-wrap items-center gap-1.5" aria-label="筛选与排序">
+                {SERIALIZATION_FILTER_OPTIONS.map((opt) => (
+                  <Button key={opt.key} card aria-pressed={statusFilter === opt.key}
+                    onClick={() => setStatusFilter(opt.key)}
+                    className={`hg-tag-pill${statusFilter === opt.key ? " is-on" : ""}`}>
+                    {opt.label}
+                  </Button>
+                ))}
+                <span aria-hidden="true" className="mx-0.5 text-dim text-[12px]">|</span>
+                {VIDEO_SORT_OPTIONS.map((opt) => {
+                  const active = metricSort === opt.key;
+                  return (
+                    <Button key={opt.key} card aria-pressed={active}
+                      onClick={() => toggleMetricSort(opt.key)}
+                      className={`hg-tag-pill${active ? " is-on" : ""}`}>
+                      {opt.label}{active && opt.key !== "default" ? (metricDir === "desc" ? " ↓" : " ↑") : ""}
+                    </Button>
+                  );
+                })}
+              </div>
+            )}
             {videoLoading && !visibleVideos.length && <div className="flex justify-center py-8"><Loader className="w-7 h-7 spinner" /></div>}
             {videoErr && !visibleVideos.length && <Empty icon={<TagIcon size={26} />} title="短剧加载失败" sub={videoErr} action="重试" onAction={() => void load("video", 1, true)} />}
-            {visibleVideos.length > 0 && (
-              <Masonry videos={visibleVideos} scopeKey={`tag-video:${tag}`} wide={wide} onOpen={(v) => push({ kind: "series", id: v.id })} />
-            )}
+            {(() => {
+              const displayVideos = sortVideosByMetric(filterVideosByStatus(visibleVideos, statusFilter), metricSort, metricDir);
+              if (displayVideos.length > 0) {
+                return <Masonry videos={displayVideos} scopeKey={`tag-video:${tag}:${statusFilter}:${metricSort}:${metricDir}`} wide={wide} onOpen={(v) => push({ kind: "series", id: v.id })} />;
+              }
+              if (visibleVideos.length > 0) {
+                return <Empty icon={<TagIcon size={26} />} title="当前连载状态下暂无短剧" sub="可切换为「全部」查看全部结果" action="查看全部" onAction={() => setStatusFilter("all")} />;
+              }
+              return null;
+            })()}
             <div ref={videoSentinel} className="h-2" />
             {videoErr && visibleVideos.length > 0 && <div role="status" className="flex flex-wrap items-center justify-center gap-2 py-2 text-[12px] text-mut"><span>短剧加载失败：{videoErr}</span><Button onClick={() => void load("video", videoPage + 1)} className="px-3 text-primary">重试</Button></div>}
             {videoLoading && visibleVideos.length > 0 && <div className="flex justify-center py-3"><Loader className="w-6 h-6 spinner" /></div>}
