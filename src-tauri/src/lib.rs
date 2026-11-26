@@ -4,6 +4,7 @@ mod apple_proxy;
 mod blog;
 mod cache;
 mod channel_page;
+mod edge_crypto;
 mod env;
 #[cfg(target_os = "ios")]
 mod ios_layout;

@@ -34,3 +34,12 @@
   .mobile-video-action-rail>.ios-button { width:44px; height:44px; min-height:44px; justify-content:center; gap:0; border-radius:16px; background:rgba(12,15,22,.28); }
   .mobile-video-action-rail>.ios-button>span:last-child { display:none; }
 }
+/* Android WebView (Skia/Viz) flickers or drops tiles when backdrop-filter reads back
+   live hardware <video> surfaces (#240). */
+.plat-android .player-root .backdrop-blur-md,
+.plat-android .player-root .backdrop-blur-xl,
+.plat-android .player-root .backdrop-blur-sm,
+.plat-android .post-player .backdrop-blur-sm {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}

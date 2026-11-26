@@ -182,7 +182,7 @@ type Store = {
   ambientGlow: boolean; setAmbientGlow: (on: boolean) => void;
   balanceVolume: boolean; setBalanceVolume: (on: boolean) => void;
   volume: number; setVolume: (v: number) => void;
-  searchHist: string[]; addSearch: (q: string) => void; clearSearchHist: () => void;
+  searchHist: string[]; addSearch: (q: string) => void; removeSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
   toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"], tag?: string, ms?: number) => void;
   /** 线路切换计数：变了就让列表页重挂载，重新拉一遍数据 */
@@ -465,7 +465,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (pg.kind === "channel" && top.kind === "channel" && top.cate === pg.cate) return s;
         if (pg.kind === "tags" || pg.kind === "ranks" || pg.kind === "history" || pg.kind === "favorites" || pg.kind === "settings" || pg.kind === "settings-tags") return s;
       }
-      return [...s, { ...pg, key: `p${++seq}` } as Page];
+      const next = [...s, { ...pg, key: `p${++seq}` } as Page];
+      return next.length > 8 ? next.slice(next.length - 8) : next;
     });
   }, []);
   /* 返回/退出动画：真正出栈由 pageTransition 在动画结束后执行（减少动效/低端机直接切） */
@@ -483,6 +484,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const t = q.trim();
     if (!t) return;
     setP((s) => ({ ...s, searchHist: [t, ...s.searchHist.filter((x) => x !== t)].slice(0, 12) }));
+  }, []);
+  const removeSearch = useCallback((q: string) => {
+    const t = q.trim();
+    if (!t) return;
+    setP((s) => ({ ...s, searchHist: s.searchHist.filter((x) => x !== t) }));
   }, []);
   const clearSearchHist = useCallback(() => setP((s) => ({ ...s, searchHist: [] })), []);
 
@@ -545,7 +551,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     preferHevc: p.preferHevc, setPreferHevc,
     ambientGlow: p.ambientGlow, setAmbientGlow,
     balanceVolume: p.balanceVolume, setBalanceVolume,
-    searchHist: p.searchHist, addSearch, clearSearchHist,
+    searchHist: p.searchHist, addSearch, removeSearch, clearSearchHist,
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     accent, setAccent: setAccentState,
     toasts, toast, lineEpoch,
@@ -554,7 +560,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }), [tab, setTab, stack, push, pop, user, loginOpen, logout,
     mergeOffer, beginGuestMerge, acceptMerge, declineMerge, guestKept,
     p, account,
-    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setAmbientGlow, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+    setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setAmbientGlow, setVolume, addSearch, removeSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     accent, setAccentState,
     toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean]);
 

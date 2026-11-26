@@ -2128,7 +2128,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   zIndex: 1,
                   /* 横屏左 1/3 上下滑调的就是这一层（CSS filter），控件与字幕不受影响 */
                   filter: brightness !== 1 ? `brightness(${brightness.toFixed(2)})` : undefined,
-                  transform: isDesktop ? undefined : `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s * epScale})`,
+                  transform: isDesktop || (zoom.s === 1 && zoom.x === 0 && zoom.y === 0 && epScale === 1)
+                    ? undefined
+                    : `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s * epScale})`,
                   opacity: 1,
                   transformOrigin: "center center",
                   transition: isDesktop || zoom.g || !epSlide.animate
