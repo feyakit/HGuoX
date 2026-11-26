@@ -1,15 +1,15 @@
 import { Button, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
-import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api, fmt } from "../../shared/api/api";
 import type { Post, TopicCard, TopicDetail, VideoCard } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
-import { MAX_BLOCKED_TAGS, MAX_TAG_LENGTH, useContentPreferences } from "../../shared/model/contentPreferences";
+import { MAX_BLOCKED_TAGS, MAX_PINNED_TAGS, MAX_TAG_LENGTH, useContentPreferences } from "../../shared/model/contentPreferences";
 import { Masonry, MediaCard } from "../../shared/ui/cards";
 import { FilteredContent } from "../../shared/ui/FilteredContent";
 import { InplaceSearch } from "../search/InplaceSearch";
 import { Empty, Img } from "../../shared/ui/ui";
-import { IBack, IBoltF, IGrid, IGlobe, IPlayF, IRefresh, ISearch } from "../../shared/ui/icons";
+import { IBack, IBoltF, IGrid, IGlobe, IPin, IPinF, IPlayF, IRefresh, ISearch } from "../../shared/ui/icons";
 
 const TopicIcon = IGrid;
 const TagIcon = IGlobe;
@@ -401,11 +401,102 @@ export function TagsSection({ wide }: { wide: boolean }) {
   );
 }
 
+const TAG_PIN_HOLD_MS = 600;
+const TAG_PIN_MOVE_SLOP = 10;
+
+function TagPinChip({ name, hotScore, isHot, pinned, board = false, onOpen, onTogglePin }: {
+  name: string;
+  hotScore?: number;
+  isHot?: boolean;
+  pinned: boolean;
+  board?: boolean;
+  onOpen: () => void;
+  onTogglePin: (name: string) => void;
+}) {
+  const [pressing, setPressing] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  const originRef = useRef<{ x: number; y: number } | null>(null);
+  const firedRef = useRef(false);
+
+  const cancel = useCallback(() => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    timerRef.current = null;
+    originRef.current = null;
+    setPressing(false);
+  }, []);
+
+  useEffect(() => () => cancel(), [cancel]);
+
+  const onPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    cancel();
+    originRef.current = { x: event.clientX, y: event.clientY };
+    setPressing(true);
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      firedRef.current = true;
+      setPressing(false);
+      onTogglePin(name);
+    }, TAG_PIN_HOLD_MS);
+  };
+
+  const onPointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const origin = originRef.current;
+    if (!origin) return;
+    if (Math.abs(event.clientX - origin.x) > TAG_PIN_MOVE_SLOP || Math.abs(event.clientY - origin.y) > TAG_PIN_MOVE_SLOP) {
+      cancel();
+    }
+  };
+
+  const onClick = () => {
+    if (firedRef.current) {
+      firedRef.current = false;
+      return;
+    }
+    onOpen();
+  };
+
+  return (
+    <Button
+      card
+      data-tag-pin-chip
+      data-pinned={pinned ? "true" : "false"}
+      data-pin-surface={board ? "board" : "group"}
+      data-pressing={pressing ? "true" : "false"}
+      onClick={onClick}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={cancel}
+      onPointerCancel={cancel}
+      onPointerLeave={cancel}
+      onContextMenu={(event) => { event.preventDefault(); cancel(); onTogglePin(name); }}
+      title={pinned ? "长按或右键取消置顶" : "长按或右键置顶标签"}
+      className={`hg-tag-pill tag-pin-pill max-w-full min-w-0 text-left${isHot ? " is-hot" : ""}`}
+    >
+      <span className="hg-tag-hash">#</span>
+      <span className="min-w-0 whitespace-normal break-all">{name}</span>
+      {!!hotScore && <span aria-label={`热度 ${fmt(hotScore)}`} className="shrink-0 text-[11px] text-dim">{fmt(hotScore)}</span>}
+    </Button>
+  );
+}
+
 export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { push, lineEpoch } = useStore();
+  const { push, lineEpoch, toast } = useStore();
+  const { preferences, isTagPinned, togglePinnedTag } = useContentPreferences();
   const [searching, setSearching] = useState(false);
   const { data, loading, err, load } = useDiscoveryData(`tags:${lineEpoch}`, api.tags);
   const groups = data?.categories ?? [];
+  const pinnedTags = preferences.pinnedTags;
+
+  const togglePin = useCallback((name: string) => {
+    const currentlyPinned = isTagPinned(name);
+    if (!currentlyPinned && pinnedTags.length >= MAX_PINNED_TAGS) {
+      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info");
+      return;
+    }
+    togglePinnedTag(name);
+    toast(currentlyPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, currentlyPinned ? "info" : "ok");
+  }, [isTagPinned, pinnedTags.length, toast, togglePinnedTag]);
 
   return (
     <div className="ios-page hg-canvas absolute inset-0 flex flex-col">
@@ -424,6 +515,23 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
 
       <div className="flex-1 scroll-y hg-page-x pt-3 pb-8 relative" aria-busy={loading}>
         {groups.length > 0 && <RefreshStatus loading={loading} error={err} onRetry={() => void load()} />}
+        {groups.length > 0 && (
+          <section data-pin-board className="mb-4 rounded-[16px] p-3.5 a-rise" aria-label="置顶标签"
+            style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}>
+            <div className="flex items-baseline justify-between gap-2">
+              <h2 className="flex items-center gap-1.5 text-[14px] font-bold text-on"><IPin size={14} className="text-primary" />置顶标签</h2>
+              <span className="text-[12px] text-dim tabular-nums" aria-live="polite">{pinnedTags.length} 个</span>
+            </div>
+            <p className="mt-1 text-[12px] leading-relaxed text-mut">{pinnedTags.length ? "长按标签置顶，再长按取消" : "长按下方标签可置顶"}</p>
+            {pinnedTags.length > 0 && (
+              <div className="mt-2.5 flex flex-wrap gap-2">
+                {pinnedTags.map(name => (
+                  <TagPinChip key={name} name={name} pinned board onOpen={() => push({ kind: "tag", tag: name, name })} onTogglePin={togglePin} />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
         {loading && !groups.length ? (
           <div className="flex justify-center py-12"><Loader className="w-8 h-8 spinner" /></div>
         ) : err && !groups.length ? (
@@ -437,12 +545,8 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
               </div>
               <div className="flex flex-wrap gap-2">
                 {g.tags.map((t) => (
-                  <Button card key={t.id} onClick={() => push({ kind: "tag", tag: t.name, name: t.name })}
-                    className={`hg-tag-pill max-w-full min-w-0 text-left${t.is_hot ? " is-hot" : ""}`}>
-                    <span className="hg-tag-hash">#</span>
-                    <span className="min-w-0 whitespace-normal break-all">{t.name}</span>
-                    {!!t.hot_score && <span aria-label={`热度 ${fmt(t.hot_score)}`} className="shrink-0 text-[11px] text-dim">{fmt(t.hot_score)}</span>}
-                  </Button>
+                  <TagPinChip key={`${g.name}:${t.id}`} name={t.name} hotScore={t.hot_score} isHot={!!t.is_hot}
+                    pinned={isTagPinned(t.name)} onOpen={() => push({ kind: "tag", tag: t.name, name: t.name })} onTogglePin={togglePin} />
                 ))}
               </div>
             </section>
@@ -459,10 +563,19 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
 
 /* ================= 标签详情页（#标签铭牌 + 短剧/吃瓜一体玻璃滑块） ================= */
 export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string; onBack: () => void; wide: boolean }) {
-  const { push, lineEpoch } = useStore();
-  const { preferences, storageError, isTagBlocked, blockTags, unblockTag } = useContentPreferences();
+  const { push, lineEpoch, toast } = useStore();
+  const { preferences, storageError, isTagBlocked, blockTags, unblockTag, isTagPinned, togglePinnedTag } = useContentPreferences();
   const filtering = !preferences.paused && (preferences.blockedTags.length > 0 || preferences.hideUntagged);
   const tagBlocked = isTagBlocked(name);
+  const tagPinned = isTagPinned(name);
+  const togglePin = useCallback(() => {
+    if (!tagPinned && preferences.pinnedTags.length >= MAX_PINNED_TAGS) {
+      toast(`最多置顶 ${MAX_PINNED_TAGS} 个标签`, "info");
+      return;
+    }
+    togglePinnedTag(name);
+    toast(tagPinned ? `已取消置顶：${name}` : `已置顶标签：${name}`, tagPinned ? "info" : "ok");
+  }, [name, preferences.pinnedTags.length, tagPinned, toast, togglePinnedTag]);
   const cannotAdd = !name.trim() || name.trim().length > MAX_TAG_LENGTH || preferences.blockedTags.length >= MAX_BLOCKED_TAGS;
   const [searching, setSearching] = useState(false);
   const [tabChoice, setTabChoice] = useState<"auto" | "video" | "post">("auto");
@@ -578,6 +691,12 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
             <IBoltF size={13} /><span>连刷</span>
           </Button>
         )}
+        <Button card onClick={togglePin} aria-pressed={tagPinned}
+          aria-label={tagPinned ? "取消置顶此标签" : "置顶此标签"}
+          title={tagPinned ? "取消置顶此标签" : "置顶此标签"}
+          className="hg-sub-btn tag-page-pin">
+          <IPinF size={17} className="tag-page-pin-icon" />
+        </Button>
         <Button card onClick={() => setSearching(true)} aria-label="搜索短剧" className="hg-sub-btn"><ISearch size={17} /></Button>
       </header>
 
