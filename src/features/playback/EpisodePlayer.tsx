@@ -2,6 +2,7 @@ import { Button, Image, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, cover, fmt, fmtTime, hostOf, isMobile, logLine, platform, playlist } from "../../shared/api/api";
 import type { Detail, Episode, PlayInfo, Post, VideoCard } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
@@ -16,12 +17,11 @@ import { tracePlayback } from "../../shared/diagnostics/playbackDiagnostics";
 import { createPlaybackClock } from "./playbackClock";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
 import { TagBlockMenu } from "../../shared/ui/TagBlockMenu";
-import { markDisliked } from "../feed/feedPrefs";
 import VideoDetailsPanel from "../feed/VideoDetailsPanel";
 import { PanelSwipeArea } from "../feed/PanelSwipeArea";
 import { PreferenceStorageNotice } from "../../shared/ui/PreferenceStorageNotice";
 import LineQuickSwitch from "./LineQuickSwitch";
-import { getHoldZone, HOLD_DELAY_MS, type HoldZone } from "../feed/mobileHold";
+import { HOLD_DELAY_MS } from "../feed/mobileHold";
 import { playEnter, playExit, originFromPoint } from "./fsTransition";
 import { useFadeMount } from "../../shared/lib/useFadeMount";
 import {
@@ -30,7 +30,7 @@ import {
   lockAxis, relativeSeek, rotationLocked, seekDeltaSeconds, snapSeek, tapVerdict, type Axis,
 } from "./playerGestures";
 import {
-  IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, IExpand, IFileText, IGlobe, IHeart, IHeartF, IMore,
+  IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, IExpand, IFileText, IGlobe, IHeart, IHeartF,
   IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVertSwap, IVol, IVolMute } from "../../shared/ui/icons";
 import { EndCard } from "./EndCard";
 import { SeekHint } from "./SeekHint";
@@ -106,7 +106,7 @@ export type EpisodePlayerProps = {
 /** 详情 / 选集的左右页签顺序：左滑去下一页，右滑回上一页。 */
 const DRAWER_PAGES = ["detail", "episodes"] as const;
 
-export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, onActiveIndex, endless = false, onBlocked, startEp, startTime, onDislike }: EpisodePlayerProps) {
+export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, onActiveIndex, endless = false, onBlocked, startEp, startTime }: EpisodePlayerProps) {
   const store = useStore();
   const { isLiked, isFav, setLiked, setCollected, setFollowing, actionPending, accountScope, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen, swipeEp, setSwipeEp, preferHevc, setPreferHevc, ambientGlow, balanceVolume } = store;
   const isDesktop = !isMobile;
@@ -300,7 +300,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     x: number; y: number; startY: number; t: number; timer: number | null;
     mode: "idle" | "hold" | "scrub" | "pan" | "enterSeries" | "edgeBack";
     base: number; width: number; playing: boolean;
-    zone: HoldZone; hiddenAtDown: boolean;
+    hiddenAtDown: boolean;
     /* 方向锁：定下方向后同一次手势内不再改判（见 playerGestures.lockAxis） */
     axis: Axis;
     /* 从舞台左缘 24px 内起手 = 边缘返回优先 */
@@ -790,7 +790,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   const actionRail = useFadeMount(!fs && !clean && !isDesktop);
   /* 右侧竖排的热区高 44、间距 14（横屏 10）：整组高度 = n×44 + (n-1)×gap，
      锚点 58% 要的是「整组中心」，所以往上挪半高（见下面 top 的注释）。 */
-  const railItems = (kind === "video" ? 1 : 0) + 2 + (active ? 1 : 0);
+  const railItems = (kind === "video" ? 1 : 0) + 2;
   const railGap = vpLandscape ? 10 : 14;
   const railCenterOffset = (railItems * 44 + Math.max(0, railItems - 1) * railGap) / 2;
   const portraitVideo = videoSize.w > 0 && videoSize.h > 0 && videoSize.w <= videoSize.h;
@@ -958,17 +958,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     showControls();
   }, [end, showControls]);
 
-
-  /* 「不感兴趣」（v3.0.6 #5）：刷剧流里点了必须立刻换片，不能只是弹个标签面板。
-     三件事——① 本地黑名单记账（30 天 / 200 条，见 feedPrefs.ts，下次取数不再给）
-     ② 立刻跳到下一条 ③ 给一句明确反馈。剧场模式仍走标签偏好面板。 */
-  const dislikeCurrent = useCallback(() => {
-    if (!endless || !onDislike || !curId) { openTagMenu(); return; }
-    markDisliked(curId);
-    onDislike(curId);
-    go(1);
-    toast("已跳过，这类内容会变少", "info");
-  }, [endless, onDislike, curId, go, openTagMenu, toast]);
 
   /* 统一的上下切换：swipeEp 开启且为多集视频时优先切集，否则切剧。
      桌面端键盘 ↑↓ 与右侧按钮都走这里，和移动端上下划手势保持一致。 */
@@ -1198,6 +1187,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       const t = e.target as HTMLElement;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       if (panel) { if (e.key === "Escape") setPanel(null); return; }
+      if (e.key === "Escape" && fullscreen && preferWinFs) { toggleFull(); return; }
       switch (e.key) {
         case "ArrowDown": e.preventDefault(); stepDir(1); break;
         case "ArrowUp": e.preventDefault(); stepDir(-1); break;
@@ -1248,10 +1238,32 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
 
+  const preferWinFs = isDesktop && platform === "windows" && typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+  useEffect(() => {
+    if (!preferWinFs) return;
+    if (fullscreen) document.documentElement.dataset.desktopFs = "true";
+    else delete document.documentElement.dataset.desktopFs;
+  }, [preferWinFs, fullscreen]);
+
+  useEffect(() => {
+    if (!preferWinFs) return;
+    return () => {
+      delete document.documentElement.dataset.desktopFs;
+      void getCurrentWindow().setFullscreen(false).catch(() => {});
+    };
+  }, [preferWinFs]);
+
   const toggleFull = () => {
     /* 移动端（安卓/iOS WebView）一律不走 Fullscreen API：会重建视图、可能丢进度。
        移动端的全屏入口统一是 enterFs/exitFs（纯 CSS + set_orientation）。 */
     if (!isDesktop) return;
+    if (preferWinFs) {
+      const next = !fullscreen;
+      setFullscreen(next);
+      void getCurrentWindow().setFullscreen(next).catch(() => {});
+      return;
+    }
     const el = boxRef.current?.parentElement;
     if (!el) return;
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -1301,8 +1313,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (onControl) { cancelPendingTap(); gesture.current = null; return; }
     const sx = e.clientX;
     const sy = e.clientY;
-    // 按视觉矩形求真正的正方形（长按菜单热区）
-    const zone = getHoldZone(e.clientX - rect.left, e.clientY - rect.top, rect.width, rect.height);
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     armAutoHide();
     /* 左缘返回：只在**非全屏的竖屏播放页**启用。
@@ -1317,7 +1327,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       axis: "none" as Axis,
       edge: edgeStart,
       mode: "idle" as "idle" | "hold" | "scrub" | "pan",
-      zone,
       /* 按下这一刻控件是不是收起的：全屏态的 pointerdown 会先 wake() 把 idle 清掉，
          所以不能在 onUp 里读当前值，否则「点一下唤回」会被当成「点一下暂停」（P1-1）。 */
       hiddenAtDown: clean || (!isDesktop && fs && idle),
@@ -1330,13 +1339,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         const cur = gesture.current;
         if (!cur || cur.mode !== "idle") return;
         cur.mode = "hold";
-        if (cur.zone === "menu") {
-          holdRef.current = false;
-          openTagMenu();
-        } else {
-          holdRef.current = true;
-          setHoldSpeed(true);
-        }
+        holdRef.current = true;
+        setHoldSpeed(true);
         try { navigator.vibrate?.(25); } catch { /* ignore */ }
       }, HOLD_DELAY_MS) as unknown as number,
     };
@@ -2322,12 +2326,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     <ICommentF size={24} className="hg-ink hg-ov-shadow" />
                     <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums leading-none">{fmt(meta.comment)}</span>
                   </Button>
-                  {isActive && (
-                    <Button aria-label={endless ? "不感兴趣，跳过这条" : "不感兴趣"} title={endless ? "不感兴趣 · 立即跳过" : "不感兴趣 / 内容偏好"}
-                      onClick={dislikeCurrent} className="video-preference-trigger">
-                      <IMore size={24} aria-hidden="true" />
-                    </Button>
-                  )}
                 </div>
               )}
 
@@ -2396,8 +2394,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   <Button aria-label="详情与标签" onClick={() => setPanel("detail")} className="min-h-11 px-4 rounded-full hg-chip text-[12px] inline-flex items-center gap-1">
                     详情与标签<IChevR size={13} />
                   </Button>
-                  {isActive && <Button aria-label={endless ? "不感兴趣，跳过这条" : "不感兴趣"} title={endless ? "不感兴趣 · 立即跳过" : "不感兴趣 / 内容偏好"} onClick={dislikeCurrent}
-                    className="video-preference-trigger"><IMore size={19} aria-hidden="true" /></Button>}
                 </div>
               </div>
               )}

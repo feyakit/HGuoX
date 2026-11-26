@@ -7,7 +7,7 @@ import { useStore } from "../../shared/model/store";
 import { Empty, Img, Modal } from "../../shared/ui/ui";
 import { MediaCard } from "../../shared/ui/cards";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
-import { detailEpisodeCount, formatWatchProgress, unwatchedNewEpisodes } from "../../shared/model/favoriteProgress";
+import { detailEpisodeCount, filterFavoriteVideoIds, formatWatchProgress, unwatchedEpisodeCount, unwatchedNewEpisodes, type FavoriteFilter } from "../../shared/model/favoriteProgress";
 import { IBack, IBoltF, ICheck, IChevR, IClock, IMenuFollow, IMenuHistory, IMenuLikes, IPlayF, ISettings, IStar } from "../../shared/ui/icons";
 import { useVisibilityRefresh } from "../../shared/lib/dataFreshness";
 import { useLongPress } from "../../shared/lib/useLongPress";
@@ -598,6 +598,7 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const { blockReason } = useContentPreferences();
   const { user, favs, postFavs, history, favEpCounts, seedFavoriteEpisodes, ackFavoriteEpisodes, push, setTab, accountSync, syncAccount, setCollected, toast } = useStore();
   const [favTab, setFavTab] = useState<"video" | "post">(initialTab);
+  const [favFilter, setFavFilter] = useState<FavoriteFilter>("all");
   const [cache, setCache] = useState<Record<number, Detail>>({});
   const cacheRef = useRef(cache);
   cacheRef.current = cache;
@@ -623,10 +624,19 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
-  const visibleIds = favs.slice(0, limits.video);
+  const progressById = useMemo(() => new Map(history.map(item => [item.id, item])), [history]);
+  const filteredFavIds = useMemo(() => filterFavoriteVideoIds(
+    favs,
+    cache,
+    favFilter,
+    (id, detail) => unwatchedEpisodeCount(detail, progressById.get(id)) > 0,
+  ), [favs, cache, favFilter, progressById]);
+
+  const fetchTargetIds = favFilter === "all" ? favs.slice(0, limits.video) : favs;
+  const visibleIds = filteredFavIds.slice(0, limits.video);
   const cards = visibleIds.map(id => cache[id]).filter((card): card is Detail => !!card);
-  const failed = failedIds.filter(id => visibleIds.includes(id));
-  const idsKey = visibleIds.join(",");
+  const failed = failedIds.filter(id => fetchTargetIds.includes(id));
+  const idsKey = fetchTargetIds.join(",");
 
   const visiblePostIds = postFavs.slice(0, limits.post);
   const postCards = visiblePostIds.map(id => postCache[id]).filter((p): p is Post => !!p);
@@ -634,12 +644,12 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const postIdsKey = visiblePostIds.join(",");
 
   /* 上游 #169（46e2936）：滚到底自动加批，不再点「加载更多」。 */
-  const favoriteHasMore = favTab === "post" ? visiblePostIds.length < postFavs.length : visibleIds.length < favs.length;
+  const favoriteHasMore = favTab === "post" ? visiblePostIds.length < postFavs.length : visibleIds.length < filteredFavIds.length;
   const { scrollerRef: favoriteScrollRef, sentinelRef: favoriteSentinelRef, supported: autoLoadSupported } = useAutoLoadMore({
     hasMore: favoriteHasMore,
     busy: favTab === "post" ? postLoading : loading,
     count: favTab === "post" ? postCards.length : cards.length,
-    resetKey: favTab,
+    resetKey: `${favTab}:${favFilter}`,
     onMore: () => setLimits(prev => ({ ...prev, [favTab]: prev[favTab] + 12 })),
   });
 
@@ -649,7 +659,7 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
   const clearSelection = () => { setSelectedIds([]); setRemoveError(""); };
   /* 上游 22399f8：全选覆盖当前 Tab 的全量记录（含尚未滚动加载的分页），移除时逐 id 处理，
      不依赖卡片是否已上屏。 */
-  const allFavIds = favTab === "post" ? postFavs : favs;
+  const allFavIds = favTab === "post" ? postFavs : filteredFavIds;
   const allSelected = allFavIds.length > 0 && allFavIds.every(id => selectedIds.includes(id));
   const selectAll = () => setSelectedIds([...allFavIds]);
   /* 上游 29e273a：收藏页「短剧 / 吃瓜」左右滑切，切 tab 沿用原有的「清空选择」行为。
@@ -716,7 +726,7 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
     if (favTab !== "video") return;
     if (!active) { refreshedFavorites.current.clear(); return; }
     let alive = true;
-    const missing = visibleIds.filter(id => !cacheRef.current[id] || !refreshedFavorites.current.has(id));
+    const missing = fetchTargetIds.filter(id => !cacheRef.current[id] || !refreshedFavorites.current.has(id));
     setFailedIds([]);
     if (!missing.length) { setLoading(false); return; }
     /* 已有卡片时不要整屏转圈：保留旧卡，后台换新。 */
@@ -781,10 +791,10 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
           <h1 className="hg-sub-title">我的收藏</h1>
           <p className="hg-sub-meta">短剧 {favs.length} 部 · 吃瓜 {postFavs.length} 篇</p>
         </div>
-        {favTab === "video" && favs.length > 0 && (
+        {favTab === "video" && filteredFavIds.length > 0 && (
           <Button card className="hg-quick-action"
             onClick={() => {
-              const bingeIds = favs.filter(id => !cache[id] || !blockReason(cache[id].tags));
+              const bingeIds = filteredFavIds.filter(id => !cache[id] || !blockReason(cache[id].tags));
               if (bingeIds.length) push({ kind: "feed", videoIds: bingeIds, index: 0, title: "我的收藏" });
             }}>
             <IBoltF size={13} /><span>连刷收藏</span>
@@ -799,6 +809,22 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
           <Button role="tab" aria-selected={favTab === "post"} className="ios-segmented-item"
             onClick={() => { setFavTab("post"); clearSelection(); }}>吃瓜 ({postFavs.length})</Button>
         </SegmentedControl>
+        {favTab === "video" && favs.length > 0 && (
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5" role="group" aria-label="收藏状态筛选">
+            {([
+              ["all", "全部"],
+              ["unwatched", "未看完"],
+              ["ongoing", "连载中"],
+              ["finished", "已完结"],
+            ] as const).map(([key, label]) => (
+              <Button key={key} card aria-pressed={favFilter === key}
+                className={`hg-tag-pill ${favFilter === key ? "is-active" : ""}`}
+                onClick={() => { setFavFilter(key); clearSelection(); }}>
+                {label}
+              </Button>
+            ))}
+          </div>
+        )}
       </div>
 
       {selectionMode && (
@@ -886,6 +912,10 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
             ) : failed.length ? (
               <Empty icon={<IStar size={24} />} title="收藏加载失败"
                 sub="记录仍在，重试后继续浏览。" action="重试" onAction={() => setReload(n => n + 1)} />
+            ) : favs.length > 0 && favFilter !== "all" ? (
+              <Empty icon={<IStar size={24} />} title="当前筛选下暂无短剧"
+                sub="切换其他状态或查看全部收藏"
+                action="查看全部" onAction={() => setFavFilter("all")} />
             ) : (
               <Empty icon={<IStar size={24} />} title="还没有喜欢的内容"
                 sub="在剧集详情页点收藏，之后就能在这里找到"

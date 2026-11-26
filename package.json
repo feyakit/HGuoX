@@ -2,7 +2,7 @@
   "name": "huangguo-client",
   "description": "HGuoX · 跨平台短剧/漫剧客户端（iOS / Android / Windows / macOS / Linux · Rust + Tauri 2 + React 19）",
   "private": true,
-  "version": "3.0.14",
+  "version": "3.0.15",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
