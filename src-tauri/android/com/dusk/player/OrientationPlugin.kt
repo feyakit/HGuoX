@@ -31,13 +31,27 @@ class SetOrientationArgs {
 
 @TauriPlugin
 class OrientationPlugin(private val activity: Activity) : Plugin(activity) {
-    init {
-        /* 顺带把「底部安全区 → CSS --sab」的桥装起来（同一个已注册插件，
-           不再加一个 Rust 端注册点）。失败不抛，见 SafeArea 里的注释。 */
+    /**
+     * 插件被装进 WebView 时调用（Tauri 的官方初始化钩子）：
+     * 在这里装「底部安全区 → CSS --sab」的桥，**WebView 已经就绪**，
+     * 不会出现「写到一个还不存在的文档上」那种静默丢失。
+     * 同一个已注册插件里做，不再加一个 Rust 端注册点。
+     */
+    override fun load(webView: android.webkit.WebView) {
+        super.load(webView)
         try {
-            SafeArea.install(activity)
+            SafeArea.install(activity, webView)
         } catch (error: Throwable) {
             System.err.println("[safe-area] 安装失败：" + (error.message ?: ""))
+        }
+    }
+
+    init {
+        /* 早一步先挂上 insets 监听（此时 WebView 可能还没挂载，SafeArea 会自己补重试）。 */
+        try {
+            SafeArea.install(activity, null)
+        } catch (error: Throwable) {
+            System.err.println("[safe-area] 预安装失败：" + (error.message ?: ""))
         }
     }
 

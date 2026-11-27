@@ -16,6 +16,14 @@ installFxLevel();
 installViewportVars();
 installPlaybackPageEvents();
 void initPlaybackLog();
+/* 安卓安全区桥（src-tauri/android/.../SafeArea.kt）写 --sab 时顺带打点：
+   真机核验在 debug.log 里搜 `[safearea]`，应看到 inset_px=44 css=16 mode=gesture。
+   这里只是接收方 —— 值由 Kotlin 写入 :root，前端不再自己算 --sab。 */
+(window as unknown as { __hgSafeAreaLog?: (px: number, css: number, mode: string) => void }).__hgSafeAreaLog =
+  (px, css, mode) => {
+    const applied = getComputedStyle(document.documentElement).getPropertyValue("--sab").trim();
+    logLine(`[safearea] inset_px=${px} css=${css} mode=${mode} applied=${applied || "(空)"}`);
+  };
 /* 环境指纹：写进始终记录的 debug.log。用户复制诊断时不用再自报版本、平台、内核版本 */
 const hlsOk = mseHlsSupported();
 logLine(
