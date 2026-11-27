@@ -107,6 +107,24 @@ pub async fn debug_log(app: tauri::AppHandle, msg: String) -> Result<(), String>
     crate::logging::append_debug(&dir, &msg)
 }
 
+/// 前端网络取证：一行进 logcat（tag `hguox-net`），release 包不可调试也能用
+/// `adb logcat -s hguox-net` 直接读到。只接受单行、截断到 400 字，避免刷屏。
+#[tauri::command]
+pub fn net_log(msg: String) -> Result<(), String> {
+    let line: String = msg.chars().take(400).collect();
+    crate::netlog::net(&line);
+    Ok(())
+}
+
+/// 冷启动首屏请求预算（3.0.20，毫秒）：`0` = 恢复常规 12 秒。
+///
+/// 冷启动头几秒把单次请求压到 4.5 秒，被墙的线路尽快露馅、交给换线重试；
+/// 真实内容出现后前端立刻调 `net_boot_budget(0)` 放开，弱网下的慢请求不会被误杀。
+#[tauri::command]
+pub fn net_boot_budget(ms: u64) -> Result<u64, String> {
+    Ok(crate::net::set_boot_budget(ms))
+}
+
 /// 网络自检：系统代理 / DNS / 连通性快照，用于远程定位「打不开」。
 #[tauri::command]
 pub async fn net_diag() -> Result<Value, String> {
@@ -155,7 +173,7 @@ fn trusted_line_origin(origin: &str) -> bool {
 /// 3.0.14 起标成「手动线路」：之后自动换线不得再动它（硬约束）。
 #[tauri::command]
 pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, String> {
-    apply_line(&state, &url, true)
+    apply_line(&state, &url, true, "manual")
 }
 
 /// 自动选线用：应用一条**没有**被用户手动指定的线路（偏好让位 / 恢复回切）。
@@ -164,10 +182,10 @@ pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, Stri
 /// 而自动选出来的线路下次还得能被自动改，否则一次让位就永久锁死。
 #[tauri::command]
 pub async fn line_set_auto(state: State<'_, Api>, url: String) -> Result<String, String> {
-    apply_line(&state, &url, false)
+    apply_line(&state, &url, false, "auto-prefer")
 }
 
-fn apply_line(state: &State<'_, Api>, url: &str, manual: bool) -> Result<String, String> {
+fn apply_line(state: &State<'_, Api>, url: &str, manual: bool, reason: &str) -> Result<String, String> {
     let mut generation = LINE_SELECTION.lock().map_err(|_| "线路选择锁失败")?;
     *generation = generation.wrapping_add(1);
     let previous = base();
@@ -180,7 +198,19 @@ fn apply_line(state: &State<'_, Api>, url: &str, manual: bool) -> Result<String,
     if previous != applied && !state.session.rebase_if_trusted(&applied, trusted_line_origin) {
         state.session.clear();
     }
+    if previous != applied {
+        /* 真机取证：`adb logcat -s hguox-net` 里每换一次线就有一行，reason 说明是谁换的 */
+        crate::netlog::switched(&host_of(&applied), reason);
+    }
     Ok(applied)
+}
+
+/// `https://a.b/c` → `a.b`（日志用，失败就原样返回）。
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.trim_start_matches("https://").to_string())
 }
 
 #[tauri::command]
@@ -197,7 +227,7 @@ pub async fn line_custom_set(state: State<'_, Api>, url: String) -> Result<Value
 #[tauri::command]
 pub async fn line_reset(state: State<'_, Api>) -> Result<Value, String> {
     /* 回到默认主站 = 取消所有手动指定，自动选线重新接管。 */
-    let base = apply_line(&state, crate::net::DEFAULT_BASE, false)?;
+    let base = apply_line(&state, crate::net::DEFAULT_BASE, false, "reset")?;
     Ok(json!({ "base": base, "custom": false }))
 }
 
@@ -267,6 +297,14 @@ pub async fn line_auto(state: State<'_, Api>) -> Result<Value, String> {
         if switched && !state.session.rebase_if_trusted(&next, trusted_line_origin) {
             state.session.clear();
         }
+        if switched {
+            /* 冷启动换线也要能取证：reason 直接给后端这一轮的选择原因
+               （last-good-first / last-good-keep / main-ok / mirror-ok / seed-ok …） */
+            crate::netlog::switched(
+                &host_of(&next),
+                pick.get("reason").and_then(Value::as_str).unwrap_or("auto"),
+            );
+        }
     }
     Ok(json!({
         "previous": previous,
@@ -298,6 +336,9 @@ pub async fn line_try_main(state: State<'_, Api>) -> Result<Value, String> {
             if switched && !state.session.rebase_if_trusted(&next, trusted_line_origin) {
                 state.session.clear();
             }
+            if switched {
+                crate::netlog::switched(&host_of(&next), "try-main-ok");
+            }
         }
     }
     Ok(json!({
@@ -317,6 +358,30 @@ pub async fn line_try_main(state: State<'_, Api>) -> Result<Value, String> {
 /// 只把 `reason: "manual"` 交回前端去提示 —— 自动流程不许动用户的选择。
 #[tauri::command]
 pub async fn line_failover(state: State<'_, Api>) -> Result<Value, String> {
+    do_failover(&state, "failover", &[]).await
+}
+
+/// 首屏自动重试专用（3.0.20）：换到一条**还没试过**的候选线路。
+///
+/// `exclude` 是这一轮已经失败过的 origin 列表（前端累积），`reason` 是这次失败的类型
+/// （dns/tls/reset/timeout…，只进日志，用来在真机上对齐「哪一次为什么换线」）。
+#[tauri::command]
+pub async fn line_failover_next(
+    state: State<'_, Api>,
+    reason: Option<String>,
+    exclude: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let reason: String = reason
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(16)
+        .collect();
+    let reason = if reason.is_empty() { "retry".to_string() } else { reason };
+    do_failover(&state, &reason, exclude.as_deref().unwrap_or(&[])).await
+}
+
+async fn do_failover(state: &State<'_, Api>, reason: &str, exclude: &[String]) -> Result<Value, String> {
     let selection = begin_line_selection()?;
     let previous = base();
     if crate::net::is_manual_line() {
@@ -329,7 +394,7 @@ pub async fn line_failover(state: State<'_, Api>) -> Result<Value, String> {
     /* 刚失败的那条立刻判死，别在候选里再把时间浪费一遍 */
     crate::line_health::penalize(&previous);
     crate::net::refresh_client();
-    let pick = crate::lines::failover(&previous).await;
+    let pick = crate::lines::failover_excluding(exclude).await;
     let chosen = pick.get("base").and_then(Value::as_str).unwrap_or_default().to_string();
     let mut switched = false;
     let generation = LINE_SELECTION.lock().map_err(|_| "线路选择锁失败")?;
@@ -339,6 +404,10 @@ pub async fn line_failover(state: State<'_, Api>) -> Result<Value, String> {
         switched = next != previous;
         if switched && !state.session.rebase_if_trusted(&next, trusted_line_origin) {
             state.session.clear();
+        }
+        if switched {
+            /* `[net] switch line=<host> reason=tls`：真机上这一行就是「为什么换了线」 */
+            crate::netlog::switched(&host_of(&next), reason);
         }
     }
     let outcome = json!({
@@ -941,10 +1010,10 @@ pub async fn api_original_videos(
 
 /// 官网首页横幅（3.0.14 C 节）：`GET /api/home` 里的 `banners`，**保持官网返回顺序**。
 ///
-/// 字段只透出 `id` / `video_id` / `image` / `score` / `desc`（已确认没有广告位），
-/// 另外把每条对应的剧目信息（标题 / 标签 / 集数）补上 —— 官网接口只给图片和文案，
-/// 而首页 hero 要显示剧名，让前端再为 8 条 banner 各发一次请求更慢。
-/// 单条补全失败不影响这一条：它还是一条可点的横幅，只是没有剧名。
+/// 3.0.20 起这里**只发一次请求、不做详情补全**：官网接口只给 `video_id` + 图片 + 文案，
+/// 剧名/标签/集数以前是逐条补 `/api/videos/{id}`（真机上那批补全要 6+8 秒两轮），
+/// 首页 hero 因此常常只剩一张卡。现在补全挪到 [`api_home_details`]：首屏先把 banner
+/// 画出来（封面 + 分数），内容出现后再补文字 —— 首屏少一个串行依赖。
 #[tauri::command]
 pub async fn api_home(state: State<'_, Api>) -> Result<Value, String> {
     let value = state.get("/api/home").await?;
@@ -953,81 +1022,23 @@ pub async fn api_home(state: State<'_, Api>) -> Result<Value, String> {
         .and_then(Value::as_array)
         .map(|items| items.iter().filter(|item| item.is_object()).cloned().collect())
         .unwrap_or_default();
-    let origin = crate::net::base();
-
-    /* 官网 banner 只给 video_id 和 desc，标题/集数/评分都得逐条补详情。
-       真机上这份补齐曾经只活下来一条 —— 4 秒的预算在被墙网络里太紧，
-       于是首页 hero 只剩一张卡。这里给 6 秒，没回来的再补一轮 8 秒。 */
-    let mut enriched: std::collections::HashMap<usize, Value> = std::collections::HashMap::new();
-    let mut pending: Vec<(usize, i64)> = banners
-        .iter()
-        .enumerate()
-        .filter_map(|(index, banner)| {
-            banner
-                .get("video_id")
-                .and_then(Value::as_i64)
-                .filter(|id| *id > 0)
-                .map(|id| (index, id))
-        })
-        .collect();
-    for budget in [6u64, 8u64] {
-        if pending.is_empty() {
-            break;
-        }
-        let mut set = tokio::task::JoinSet::new();
-        for (index, video_id) in pending.drain(..) {
-            let origin = origin.clone();
-            set.spawn(async move {
-                let path = format!("/api/videos/{video_id}");
-                let detail = tokio::time::timeout(
-                    std::time::Duration::from_secs(budget),
-                    crate::net::edge_once(&origin, "GET", &path, None, None),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
-                (index, video_id, detail)
-            });
-        }
-        while let Some(joined) = set.join_next().await {
-            if let Ok((index, video_id, detail)) = joined {
-                match detail {
-                    Some(detail) => {
-                        enriched.insert(index, detail);
-                    }
-                    None => pending.push((index, video_id)),
-                }
-            }
-        }
-    }
-
 
     let items: Vec<Value> = banners
         .iter()
-        .enumerate()
-        .filter_map(|(index, banner)| {
+        .filter_map(|banner| {
             let video_id = banner.get("video_id").and_then(Value::as_i64).unwrap_or(0);
             if video_id <= 0 {
                 return None;
             }
             let raw_image = banner.get("image").and_then(Value::as_str).unwrap_or("");
-            let detail = enriched.get(&index);
             /* 官网 banner 的 image 是站内相对路径（/upload_01/...），实际文件在图片 CDN 上；
-               剧目详情里的 cover 是带签名的完整地址，优先用它，失败再退回 CDN 前缀。 */
-            let image = detail
-                .and_then(|detail| detail.get("cover"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .filter(|cover| !cover.trim().is_empty())
-                .or_else(|| {
-                    (!raw_image.trim().is_empty())
-                        .then(|| format!("https://pic.qnlycc.cn{}", raw_image.trim()))
-                })
+               详情里的 cover 是带签名的完整地址，补全回来后再优先用它。 */
+            let image = (!raw_image.trim().is_empty())
+                .then(|| format!("https://pic.qnlycc.cn{}", raw_image.trim()))
                 .unwrap_or_default();
             if image.is_empty() {
                 return None;
             }
-            let field = |key: &str| detail.and_then(|detail| detail.get(key)).cloned().unwrap_or(Value::Null);
             Some(json!({
                 "id": banner.get("id").cloned().unwrap_or(Value::Null),
                 "video_id": video_id,
@@ -1035,15 +1046,55 @@ pub async fn api_home(state: State<'_, Api>) -> Result<Value, String> {
                 "image_url": image,
                 "score": banner.get("score").cloned().unwrap_or(Value::Null),
                 "desc": banner.get("desc").and_then(Value::as_str).unwrap_or(""),
-                "title": field("title"),
-                "tags": field("tags"),
-                "episode_count": field("episode_count"),
-                "total_episodes": field("total_episodes"),
-                "is_finished": field("is_finished"),
+                "title": Value::Null,
+                "tags": Value::Null,
+                "episode_count": Value::Null,
+                "total_episodes": Value::Null,
+                "is_finished": Value::Null,
             }))
         })
         .collect();
     Ok(json!({ "banners": items, "source": "api/home" }))
+}
+
+/// 首页 hero 的详情补全（3.0.20，阶段二）：只补首页 banner 要的文字字段。
+///
+/// 和 [`api_home`] 拆开的原因：首屏只等「feed 第 1 页 + banners 列表」两条请求，
+/// 逐条 `/api/videos/{id}` 的补全放在内容出现之后并行做，单条 4 秒上限、失败就少一条
+/// （banner 仍有封面和分数可点），不再把整块 hero 拖到 6~14 秒。
+#[tauri::command]
+pub async fn api_home_details(ids: Vec<i64>) -> Result<Value, String> {
+    let origin = crate::net::base();
+    let mut set = tokio::task::JoinSet::new();
+    for video_id in ids.into_iter().filter(|id| *id > 0).take(10) {
+        let origin = origin.clone();
+        set.spawn(async move {
+            let path = format!("/api/videos/{video_id}");
+            let detail = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                crate::net::edge_once(&origin, "GET", &path, None, None),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            (video_id, detail)
+        });
+    }
+    let mut items = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let Ok((video_id, Some(detail))) = joined else { continue };
+        let field = |key: &str| detail.get(key).cloned().unwrap_or(Value::Null);
+        items.push(json!({
+            "video_id": video_id,
+            "title": field("title"),
+            "tags": field("tags"),
+            "episode_count": field("episode_count"),
+            "total_episodes": field("total_episodes"),
+            "is_finished": field("is_finished"),
+            "cover": field("cover"),
+        }));
+    }
+    Ok(json!({ "items": items }))
 }
 
 /* ───────────────────────── 专题 / 标签 ───────────────────────── */

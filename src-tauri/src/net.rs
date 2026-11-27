@@ -1524,6 +1524,109 @@ fn edge_redirect_target(
 /// 链路层失败的统一前缀。前端看到它就换线重试；`HTTP 4xx/5xx` 与业务错误不带。
 pub const NETWORK_ERROR_PREFIX: &str = "NET:";
 
+/* ── 冷启动首屏预算（3.0.20） ─────────────────────────────
+ *
+ * 真机事实（小米九 / 被墙网络）：首页请求打在被墙的主域上时，一次逻辑请求的 12 秒
+ * 预算是「白白等满 12 秒」，而这段时间里用户只看到骨架 —— 5 次冷启动里有 4 次
+ * 是靠后面的换线才拿到内容。
+ *
+ * 所以冷启动头几秒把单次请求的预算收紧（默认 4.5 秒）：被墙的线路尽快露馅，
+ * 由前端「换线重试一次」接手；真实内容出现后前端立刻放开，恢复平时的 12 秒，
+ * 免得 4G/弱网下单条慢请求被误判成线路挂了。
+ */
+static BOOT_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 平时（内容出现后）的单次逻辑请求预算。
+const NORMAL_BUDGET_MS: u64 = 12_000;
+
+/// 冷启动首屏预算（毫秒）；传 0 表示恢复常规预算。返回设置后的值。
+pub fn set_boot_budget(ms: u64) -> u64 {
+    BOOT_BUDGET_MS.store(ms.min(30_000), Ordering::Relaxed);
+    ms.min(30_000)
+}
+
+pub fn boot_budget_ms() -> u64 {
+    BOOT_BUDGET_MS.load(Ordering::Relaxed)
+}
+
+fn request_budget() -> Duration {
+    let ms = boot_budget_ms();
+    Duration::from_millis(if ms == 0 { NORMAL_BUDGET_MS } else { ms })
+}
+
+/// 日志里的 `cmd=`：与前端 invoke 的命令名对齐（真机取证时要能一眼对上代码）。
+/// 认不出的路径记 `other`；查询串不参与判断也不进日志（搜索词等隐私字段不外泄）。
+fn cmd_label(method: &str, path: &str) -> &'static str {
+    let p = path.split('?').next().unwrap_or("");
+    let get = method.eq_ignore_ascii_case("GET");
+    match p {
+        "/api/videos" if get => {
+            /* 探活打的也是这个路径（Auto probe = page=1&size=1），日志里单独标出来，
+               免得把探活流量算进「首屏 feed 打了几次」 */
+            if path.contains("is_original=1") {
+                "api_original_videos"
+            } else if path == "/api/videos?page=1&size=1" {
+                "probe"
+            } else {
+                "api_feed"
+            }
+        }
+        "/api/home" => "api_home",
+        "/api/topics" => "api_topics",
+        "/api/tags" => "api_tags",
+        "/api/posts" => "api_posts",
+        "/api/search" => "api_search",
+        "/api/account/me" => "api_me",
+        "/api/rank" | "/api/ranks" => "api_rank",
+        _ if p.starts_with("/api/videos/category/") => "api_category",
+        _ if p.starts_with("/api/videos/") && p.ends_with("/playback") => "api_play",
+        _ if p.starts_with("/api/videos/") && p.ends_with("/play") => "api_play",
+        _ if p.starts_with("/api/videos/") => "api_video",
+        _ if p.starts_with("/api/topics/") => "api_topic",
+        _ if p.starts_with("/api/posts/") => "api_post",
+        _ => "other",
+    }
+}
+
+/// 日志里的错误分类：链路层用 line_health 同一套判定，HTTP 用状态码，其余算业务错误。
+fn log_error_kind(error: &str) -> String {
+    if let Some(kind) = crate::line_health::fault_kind(error) {
+        return kind.to_string();
+    }
+    if let Some(kind) = error.strip_prefix(NETWORK_ERROR_PREFIX).and_then(|rest| rest.split('·').next()) {
+        let kind = kind.trim();
+        if !kind.is_empty() {
+            return kind.to_string();
+        }
+    }
+    if let Some(rest) = error.strip_prefix("HTTP ") {
+        let code = rest.split(':').next().unwrap_or("").trim();
+        return format!("http{code}");
+    }
+    if error == "401" || error == "403" {
+        return format!("http{error}");
+    }
+    "biz".to_string()
+}
+
+/// 一行 `[net] req …`（release 包也能在 logcat 里取到）。
+fn log_net_req(origin: &str, method: &str, full_path: &str, via: &str, ms: u128, result: &Result<Value, String>) {
+    let host = url::Url::parse(origin)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| origin.trim_start_matches("https://").to_string());
+    let path = full_path.split('?').next().unwrap_or(full_path);
+    let kind = result.as_ref().err().map(|e| log_error_kind(e)).unwrap_or_default();
+    crate::netlog::req(
+        cmd_label(method, full_path),
+        &host,
+        path,
+        via,
+        ms,
+        if result.is_ok() { None } else { Some(kind.as_str()) },
+    );
+}
+
+
 /// 业务请求：走边缘信封。
 pub async fn edge(
     origin: &str,
@@ -1554,7 +1657,26 @@ async fn edge_inner(
     token: Option<&str>,
     allow_retry: bool,
 ) -> Result<Value, String> {
-    let cur = normalize_base(origin).ok_or("业务请求必须使用安全 HTTPS 线路")?;
+    /* 一行 `[net] req …` 在这里收口：所有出口（信封 / 直连 / 登录策略拒绝）都过它，
+       真机上就能把「这次到底走了哪条路、花了多久」一次看清。 */
+    let started = Instant::now();
+    let (result, via) = edge_route(origin, method, path, body, token, allow_retry).await;
+    log_net_req(origin, method, path, via, started.elapsed().as_millis(), &result);
+    result
+}
+
+async fn edge_route(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    token: Option<&str>,
+    allow_retry: bool,
+) -> (Result<Value, String>, &'static str) {
+    let cur = match normalize_base(origin) {
+        Some(cur) => cur,
+        None => return (Err("业务请求必须使用安全 HTTPS 线路".into()), "envelope"),
+    };
     if network_policy::strict_security()
         && (token.is_some()
             || matches!(
@@ -1564,18 +1686,18 @@ async fn edge_inner(
         && !trusted_auth_origin(&cur)
     {
         if cur != base() || crate::lines::verify_published_origin(&cur).await.is_err() {
-            return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路或重新加载发布页验证镜像".into());
+            return (Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路或重新加载发布页验证镜像".into()), "envelope");
         }
     }
     /* 已经知道信封停了（10 分钟内）：直接走 REST，别再每个请求都撞一次。 */
     if envelope_disabled() {
-        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+        return (direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await, "direct");
     }
     let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
+        Some(v) => match serde_json::to_vec(v) {
+            Ok(bytes) => (B64.encode(bytes), "application/json"),
+            Err(e) => return (Err(e.to_string()), "envelope"),
+        },
         None => (String::new(), ""),
     };
     let envelope = json!({
@@ -1615,7 +1737,7 @@ async fn edge_inner(
     /* 总预算（3.0.14 真机）：被墙的 IP 常常是「黑洞丢包」而不是 RST —— 一次尝试会一直
        挂到客户端的 20 秒超时，3 次重试就是 60 秒，首页 50 秒还在转圈。
        这里给整个逻辑请求封顶，超时按链路层失败返回，让前端立刻换线重试。 */
-    let budget = Duration::from_secs(12);
+    let budget = request_budget();
     let value = match tokio::time::timeout(budget, with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
@@ -1718,7 +1840,7 @@ async fn edge_inner(
         Err(error) if error.contains("停用") || error.contains("禁用") || error.contains("下线") => {
             mark_envelope_disabled();
             crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
-            return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+            return (direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await, "direct");
         }
         Err(error) => match crate::line_health::note_failure(&cur, &error) {
             Some(kind) => {
@@ -1731,14 +1853,14 @@ async fn edge_inner(
                    会漏 —— 真机上 `tcp connect error` / `deadline has elapsed` 都没命中
                    前端那份正则，于是既没换线、也把英文原文直接甩给用户。
                    这里用后端同一套判定加前缀，前端按前缀处理，不再猜。 */
-                return Err(format!("{NETWORK_ERROR_PREFIX}{kind} · {}", error.trim()));
+                return (Err(format!("{NETWORK_ERROR_PREFIX}{kind} · {}", error.trim())), "envelope");
             }
-            None => return Err(error),
+            None => return (Err(error), "envelope"),
         },
     };
 
     if value.is_null() {
-        return Ok(Value::Null);
+        return (Ok(Value::Null), "envelope");
     }
 
     let business_status = value.get("status").and_then(|v| v.as_i64());
@@ -1748,7 +1870,7 @@ async fn edge_inner(
         .unwrap_or("")
         .to_string();
     if business_status == Some(1) {
-        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+        return (Ok(value.get("data").cloned().unwrap_or(Value::Null)), "envelope");
     }
     /* 上游 2026-11-25 起把边缘信封 `/api/edge/request` 停了（返回「接口已停用」），
        而 App 所有接口都走它 —— 于是「网络明明是通的也打不开首页」。
@@ -1757,9 +1879,12 @@ async fn edge_inner(
     if envelope_disabled_message(&message) {
         mark_envelope_disabled();
         crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
-        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+        return (direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await, "direct");
     }
-    Err(if message.is_empty() { "接口返回失败".to_string() } else { message })
+    (
+        Err(if message.is_empty() { "接口返回失败".to_string() } else { message }),
+        "envelope",
+    )
 }
 
 /// 信封被停用的几种说法（都见过）。

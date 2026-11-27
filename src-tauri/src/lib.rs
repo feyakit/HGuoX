@@ -23,6 +23,7 @@ mod media;
 mod media_dns;
 mod orientation;
 mod net;
+mod netlog;
 mod network_policy;
 mod playback_log;
 mod proxy;
@@ -228,6 +229,8 @@ pub fn run() {
             api::security_set,
             api::debug_log,
             api::net_diag,
+            api::net_log,
+            api::net_boot_budget,
             api::line_state,
             api::line_set,
             api::line_custom_set,
@@ -238,6 +241,7 @@ pub fn run() {
             api::line_auto,
             api::line_try_main,
             api::line_failover,
+            api::line_failover_next,
             api::line_set_auto,
             api::line_health,
             api::proxy_state,
@@ -256,6 +260,7 @@ pub fn run() {
             api::api_account_history_delete,
             api::api_feed,
             api::api_home,
+            api::api_home_details,
             api::api_original_videos,
             api::api_topics,
             api::api_topic,
