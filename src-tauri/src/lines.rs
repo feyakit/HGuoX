@@ -1480,8 +1480,10 @@ mod tests {
         stale.tier = "last-good-stale";
         let picked = pick_from_hits(&[stale.clone(), hit("https://pub.example", true, 900)]);
         assert_eq!(picked["base"], "https://pub.example");
-        let picked = pick_from_hits(&[stale, hit("https://seed.example", true, 10)]);
-        assert_eq!(picked["base"], "https://stale.example");
+        let mut seed = hit("https://seed.example", true, 10);
+        seed.tier = "seed";
+        let picked = pick_from_hits(&[stale, seed]);
+        assert_eq!(picked["base"], "https://stale.example", "过期的 last_good 仍比内置种子优先");
     }
 
     #[test]
