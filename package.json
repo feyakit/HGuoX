@@ -25,6 +25,7 @@
     "test:end-card-close": "node scripts/test-end-card-close.mjs",
     "test:player-modes": "node scripts/test-player-modes.mjs",
     "test:player-v3013": "node scripts/test-player-v3013.mjs",
+    "test:ep-next-load": "node scripts/test-ep-next-load.mjs",
     "test:seek-hint": "node scripts/shoot-seek-hint.mjs",
     "test:seek-symmetry": "node scripts/verify-seek-hint-symmetry.mjs",
     "test:fav-count": "node scripts/test-fav-count.mjs",
