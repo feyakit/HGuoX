@@ -516,13 +516,20 @@
   margin-top: 6px; font-size: 12px; line-height: 1.4; color: #8A8AA3;
 }
 
+/* 底栏与「继续观看」卡共用同一组几何：改一处就一起变，别各写一份。
+   --sab = 底部系统安全区（手势条/三键导航条高度，CSS px）：
+     iOS/桌面 = env(safe-area-inset-bottom)；
+     安卓 = Kotlin 运行时写入真实 WindowInsets（src-tauri/android/.../SafeArea.kt），
+            这里只留 env()/0 作兜底，不再写 24px 那种硬编码下限。 */
+:root { --hg-nav-h: 56px; --hg-nav-gap: 8px; --sab: env(safe-area-inset-bottom, 0px); }
+
 /* 底栏浮岛：半透明亮磨砂玻璃，对齐设计稿
    3.0.18：用户定的「B 尺寸 + C 透明度」——高 66→56、距底 36→8（去掉 --sab 的 24px 兜底）、
    玻璃不透明度 32%→10%（白膜 14%→6%，渐变 8/34%→1.6/6.9%），blur 28→24、saturate 140→160。
    度量口径与「为什么距底是 36 不是 12」见 skill 的 references/bottom-nav-metrics.md。 */
-.ios-mobile-nav { padding: 8px calc(16px + var(--sar, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) calc(16px + var(--sal, 0px)); }
+.ios-mobile-nav { bottom: calc(var(--sab) + var(--hg-nav-gap)); padding: 8px calc(16px + var(--sar, 0px)) 0 calc(16px + var(--sal, 0px)); }
 .ios-mobile-nav .hg-glass {
-  height: 56px; width: 100%; max-width: 360px; border-radius: 28px;
+  height: var(--hg-nav-h); width: 100%; max-width: 360px; border-radius: 28px;
   background-color: rgba(255, 255, 255, 0.06);
   background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.016), rgba(16, 18, 32, 0.069));
   border: 1px solid rgba(255, 255, 255, 0.22);
@@ -1028,55 +1035,59 @@
   padding: 10px 2px 0; border-radius: 0 0 10px 10px;
 }
 
-/* 继续观看悬浮卡：压在底栏之上 */
+/* 继续观看悬浮卡：压在底栏之上（3.0.18 随底栏一起缩小下沉：96→81 高，距底 112→72） */
 .hg-continue {
   position: absolute; z-index: 40;
   left: var(--space-page); right: var(--space-page);
-  bottom: calc(68px + 20px + var(--sab, 0px));
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 34px 12px 12px;
-  border-radius: 16px;
-  background: rgba(30, 30, 46, 0.92);
-  border: 1px solid #2A2A3E;
-  box-shadow: 0 8px 24px rgb(0 0 0 / .4);
-  -webkit-backdrop-filter: blur(22px); backdrop-filter: blur(22px);
+  /* 卡底 = 安全区 + 底栏高 + 底栏距底 + 8px 卡距；与底栏同一套变量 */
+  bottom: calc(var(--sab) + var(--hg-nav-h) + var(--hg-nav-gap) + 8px);
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 30px 10px 10px;
+  border-radius: 14px;
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.016), rgba(16, 18, 32, 0.069));
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: 0 8px 20px rgb(0 0 0 / .28);
+  -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%);
   overflow: hidden;
 }
 .hg-continue-art {
-  position: relative; flex: none; width: 52px;
-  border-radius: 8px; overflow: hidden; background: var(--p-s2);
+  position: relative; flex: none; width: 44px;
+  border-radius: 7px; overflow: hidden; background: var(--p-s2);
 }
-.hg-continue-art::before { content: ""; display: block; padding-top: 138.46%; } /* 52×72 */
-.hg-continue-art > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.hg-continue-art::before { content: ""; display: block; padding-top: 138.46%; } /* 44×61 */
+/* Img 组件渲染的是 .ios-image 包一层 img，写成 "> img" 永远不命中（原先就是这样，缩略图被放大裁切） */
+.hg-continue-art .ios-image { position: absolute; inset: 0; overflow: hidden; }
+.hg-continue-art .ios-image > img { object-fit: cover; width: 100%; height: 100%; position: absolute; inset: 0; }
 .hg-continue-copy { flex: 1; min-width: 0; }
 .hg-continue-title {
-  display: block; font-size: 14px; font-weight: 700; line-height: 1.3; color: #fff;
+  display: block; font-size: 13px; font-weight: 700; line-height: 1.3; color: #fff;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.hg-continue-sub { display: block; margin-top: 4px; font-size: 12px; color: #9CA3AF; }
+.hg-continue-sub { display: block; margin-top: 3px; font-size: 11px; color: #9CA3AF; }
 .hg-continue-play {
-  flex: none; width: 48px; height: 48px; border-radius: 999px;
+  flex: none; width: 40px; height: 40px; border-radius: 999px;
   display: inline-flex; align-items: center; justify-content: center;
   background: #7C5CFF; color: #fff;
 }
 .hg-continue-close {
-  position: absolute; right: 6px; top: 6px;
-  width: 22px; height: 22px; border-radius: 999px;
+  position: absolute; right: 5px; top: 5px;
+  width: 20px; height: 20px; border-radius: 999px;
   display: inline-flex; align-items: center; justify-content: center;
   background: none; border: 0; color: #9CA3AF;
 }
 .hg-continue-fill {
-  position: absolute; left: 0; bottom: 0; height: 3px;
+  position: absolute; left: 0; bottom: 0; height: 2px;
   background: #7C5CFF;
-  border-radius: 0 3px 3px 0;
+  border-radius: 0 2px 2px 0;
 }
 
 .ios-button.hg-hero { border-radius: 20px; }
 .ios-button.hg-pill { min-block-size: 0; min-inline-size: 0; height: 34px; border-radius: 999px; }
 .ios-button.hg-icon-plain { min-block-size: 0; min-inline-size: 0; width: 36px; height: 36px; border-radius: 50%; }
 .ios-button.hg-rail-card { min-block-size: 0; border-radius: 0; }
-.ios-button.hg-continue-play { min-block-size: 0; min-inline-size: 0; width: 48px; height: 48px; border-radius: 999px; }
-.ios-button.hg-continue-close { min-block-size: 0; min-inline-size: 0; width: 22px; height: 22px; border-radius: 999px; }
+.ios-button.hg-continue-play { min-block-size: 0; min-inline-size: 0; width: 40px; height: 40px; border-radius: 999px; }
+.ios-button.hg-continue-close { min-block-size: 0; min-inline-size: 0; width: 20px; height: 20px; border-radius: 999px; }
 
 /* S2/S3 顶栏：全宽胶囊搜索框 + 二级下划线筛选行 */
 .ios-button.hg-searchbar {

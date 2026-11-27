@@ -635,7 +635,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       </header>
 
       <div ref={scrollRef} className="flex-1 scroll-y hg-page-x relative z-10"
-        style={{ paddingBottom: `calc(${continueShown ? 190 : 110}px + var(--sab, 0px))`, touchAction: swipe.touchAction }}
+        style={{ paddingBottom: `calc(${continueShown ? 162 : 72}px + var(--sab, 0px))`, touchAction: swipe.touchAction }}
         onPointerDown={swipe.onPointerDown}
         onPointerMove={swipe.onPointerMove}
         onPointerUp={swipe.onPointerUp}
@@ -1040,9 +1040,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
             </span>
           </span>
           <Button card className="hg-continue-play" aria-label={`继续播放第 ${continueCard.ep} 集`}
-            onClick={() => play(continueCard.detail.id, continueCard.ep, continueCard.t)}><IPlayF size={18} /></Button>
+            onClick={() => play(continueCard.detail.id, continueCard.ep, continueCard.t)}><IPlayF size={16} /></Button>
           <Button card className="hg-continue-close" aria-label="隐藏继续观看"
-            onClick={() => setDismissedContinue(continueCard.at)}><IClose size={11} /></Button>
+            onClick={() => setDismissedContinue(continueCard.at)}><IClose size={10} /></Button>
           {continuePct > 0 && <span className="hg-continue-fill" style={{ width: `${continuePct}%` }} aria-hidden="true" />}
         </div>
       )}
