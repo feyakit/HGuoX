@@ -31,6 +31,16 @@ class SetOrientationArgs {
 
 @TauriPlugin
 class OrientationPlugin(private val activity: Activity) : Plugin(activity) {
+    init {
+        /* 顺带把「底部安全区 → CSS --sab」的桥装起来（同一个已注册插件，
+           不再加一个 Rust 端注册点）。失败不抛，见 SafeArea 里的注释。 */
+        try {
+            SafeArea.install(activity)
+        } catch (error: Throwable) {
+            System.err.println("[safe-area] 安装失败：" + (error.message ?: ""))
+        }
+    }
+
     /**
      * 从 Rust 侧调用：invoke('setOrientation', { landscape: true })，走
      * PluginHandle::run_mobile_plugin。

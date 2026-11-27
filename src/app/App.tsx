@@ -393,7 +393,9 @@ function MobileShell() {
     <div className={`absolute inset-0 flex flex-col bg-canvas plat-${platform}`}
       style={{
         "--sat": "max(env(safe-area-inset-top), 24px)",
-        "--sab": platform === "android" ? "max(env(safe-area-inset-bottom), 24px)" : "max(env(safe-area-inset-bottom), 16px)",
+        /* --sab 不在这里写死：iOS/桌面由 CSS 的 env(safe-area-inset-bottom) 给，
+           安卓由 Kotlin（src-tauri/android/.../SafeArea.kt）运行时把真实 WindowInsets
+           写进 :root 的 --sab。历史上的 max(env,24px) 兜底会把底栏顶高 8px（小米9 实测 16）。 */
         /* 横向安全区只在横屏/刘海屏才有值；竖屏恒为 0，所以不给下限，
            给下限会把竖屏两侧各推出几像素（上游 7ab0a51 的做法）。 */
         "--sar": "env(safe-area-inset-right, 0px)",
