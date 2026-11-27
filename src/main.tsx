@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import { initPlaybackLog, installPlaybackPageEvents, tracePlayback } from "./shared/diagnostics/playbackDiagnostics";
 import { initAutoLine } from "./shared/network/autoLine";
-import { APP_VERSION, LOCAL, logLine, platform, webviewVersion } from "./shared/api/api";
+import { APP_VERSION, LOCAL, armBootBudget, logLine, platform, webviewVersion } from "./shared/api/api";
 import { mseHlsSupported } from "./features/playback/mediaProbe";
 import { installLayoutDiagnostics } from "./shared/diagnostics/layoutDiagnostics";
 import { installViewportVars } from "./shared/lib/viewport";
@@ -24,6 +24,10 @@ void initPlaybackLog();
     const applied = getComputedStyle(document.documentElement).getPropertyValue("--sab").trim();
     logLine(`[safearea] inset_px=${px} css=${css} mode=${mode} applied=${applied || "(空)"}`);
   };
+/* 冷启动首屏：把后端单次请求预算压到 4.5 秒（内容出现后 Home 立刻放开，20 秒兜底）。
+   被墙的线路要尽快露馅 —— 一次请求等满 12 秒，首屏就只能等下一次换线。 */
+armBootBudget();
+
 /* 环境指纹：写进始终记录的 debug.log。用户复制诊断时不用再自报版本、平台、内核版本 */
 const hlsOk = mseHlsSupported();
 logLine(

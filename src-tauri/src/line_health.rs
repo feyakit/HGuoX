@@ -178,12 +178,43 @@ fn save_last_good(origin: &str) {
     let _ = std::fs::write(&temp, body).and_then(|_| std::fs::rename(&temp, path));
 }
 
-/// 上次真正连通过、且仍然可信的 origin（磁盘记录，可能为空）。
-pub fn last_good() -> Option<String> {
+/// 上次成功线路的「新鲜期」（3.0.20）：24 小时内成功过，冷启动就直接用它当头号候选，
+/// 连主域都不探（被墙网络里每次先撞主域是最贵的浪费）。超过 24 小时只当普通候选，
+/// 优先级降到发布页镜像之后 —— 网络环境可能早就变了。
+pub const LAST_GOOD_FRESH: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 上次成功线路 + 距那次成功过了多久（磁盘记录，可能为空）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastGood {
+    pub origin: String,
+    pub age: Duration,
+}
+
+impl LastGood {
+    /// 24 小时内成功过：可以跳过探活直接沿用。
+    pub fn fresh(&self) -> bool {
+        self.age < LAST_GOOD_FRESH
+    }
+}
+
+pub fn last_good_info() -> Option<LastGood> {
     let text = std::fs::read_to_string(health_path()?).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let origin = value.get("last_good").and_then(Value::as_str)?;
-    crate::net::normalize_base(origin)
+    let origin = crate::net::normalize_base(value.get("last_good").and_then(Value::as_str)?)?;
+    let saved_at = value.get("saved_at").and_then(Value::as_u64).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    Some(LastGood {
+        origin,
+        age: Duration::from_secs(now.saturating_sub(saved_at)),
+    })
+}
+
+/// 上次真正连通过、且仍然可信的 origin（磁盘记录，可能为空）。
+pub fn last_good() -> Option<String> {
+    last_good_info().map(|last| last.origin)
 }
 
 /// 诊断/日志快照：黑名单与失败计数（不含任何凭据或请求内容）。
@@ -202,7 +233,7 @@ pub fn snapshot() -> Value {
             })
             .collect::<Vec<_>>()
     });
-    json!({ "blacklist": blocked, "last_good": last_good() })
+    json!({ "blacklist": blocked, "last_good": last_good(), "last_good_age_s": last_good_info().map(|last| last.age.as_secs()) })
 }
 
 #[cfg(test)]
@@ -265,5 +296,40 @@ mod tests {
         let origin = "https://pen.example";
         penalize(origin);
         assert!(blacklisted(origin));
+    }
+
+    /// 3.0.20：冷启动只在 last_good「24h 内成功过」时才跳过探活；
+    /// 超过一天就只当普通候选（`fresh()` 为假）。
+    #[test]
+    fn last_good_recency_decides_the_boot_fast_path() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hguox-last-good-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        bind(&dir);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        let write = |saved_at: u64| {
+            std::fs::write(
+                dir.join(HEALTH_FILE),
+                json!({ "last_good": "https://huangguoai.com", "saved_at": saved_at }).to_string(),
+            )
+            .unwrap();
+        };
+
+        write(now - 60);
+        let last = last_good_info().expect("刚成功过的一分钟前要能读回来");
+        assert_eq!(last.origin, "https://huangguoai.com");
+        assert!(last.fresh(), "1 分钟前成功过：冷启动直接沿用");
+
+        write(now - 23 * 3600);
+        assert!(last_good_info().expect("23 小时前").fresh(), "23 小时仍在新鲜期内");
+
+        write(now - 25 * 3600);
+        assert!(!last_good_info().expect("25 小时前").fresh(), "超过 24 小时降级为普通候选");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
