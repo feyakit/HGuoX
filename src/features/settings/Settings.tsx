@@ -209,20 +209,31 @@ export default function Settings({ onBack }: { onBack: () => void; wide: boolean
                   logLine(`[net_diag] ${JSON.stringify(diag)}`);
                   const http = (diag.http ?? {}) as { ms?: number; status?: number };
                   const dns = (diag.dns ?? {}) as { count?: number; has_fake_ip?: boolean };
+                  const doh = (diag.doh ?? {}) as { addrs?: string[]; system_addrs?: string[]; source?: string; mismatch?: boolean };
+                  const connect = (diag.connect ?? {}) as { addrs?: string[]; source?: string };
                   const env = (diag.env ?? {}) as Record<string, unknown>;
+                  /* 3.0.14：把「系统解析 / DoH 解析 / 实际连接」三行地址写进播放诊断 ——
+                     被污染的网络里，这三行是判定「到底卡在哪一层」的唯一证据。 */
                   tracePlayback("net.diag", {
                     verdict: String(diag.verdict ?? ""),
                     host: hostOf(String(diag.host ?? "")), http_status: http.status ?? null, http_ms: http.ms ?? null,
                     dns_count: dns.count ?? null, fake_ip: dns.has_fake_ip ?? null,
                     proxy: Object.values(env).some(Boolean), strict: strictSecurity,
+                    system_ip: (doh.system_addrs ?? []).join(",") || null,
+                    doh_ip: (doh.addrs ?? []).join(",") || null,
+                    doh_source: doh.source ?? null, doh_mismatch: doh.mismatch ?? null,
+                    connect_ip: (connect.addrs ?? []).join(",") || null, connect_source: connect.source ?? null,
                   });
                   const report = formatNetDiag(diag);
+                  /* 3.0.14：报告永远显示出来（不只是复制）。
+                     被污染的网络里「系统解析 / DoH 解析 / 实际连接」必须能当场看见，
+                     否则用户只知道「已复制」，看不到到底卡在哪一层。 */
+                  setDiagReport(report);
                   try {
                     await copyText(report);
                     toast(`诊断已复制 · ${shortVerdict(diag)}`, "ok");
                   } catch {
-                    setDiagReport(report);
-                    toast("诊断已完成，复制失败，可在报告中重试", "info");
+                    toast("诊断已完成，可在报告里手动复制", "info");
                   }
                 } catch (e) {
                   const detail = e instanceof Error ? e.message : typeof e === "string" ? e : "请稍后重试";

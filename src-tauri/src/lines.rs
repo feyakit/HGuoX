@@ -30,8 +30,9 @@ const RECOMMENDED_MAX: usize = 20;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PUBLISH_BYTES: usize = 512 * 1024;
 const AUTO_PROBE_PATH: &str = "/api/videos?page=1&size=1";
-/// 国内实测镜像探活 1.13–2.75s，3 秒预算最慢一条已用掉 92%。
-const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 国内实测镜像探活 1.13–2.75s；3.0.14 真机再加一条：TLS 握手可能被概率性 RST，
+/// 一次成功要 1.5–3s，所以预算放宽到 8 秒（内含最多 3 次尝试）。
+const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const AUTO_MIRROR_MAX: usize = 10;
 const MIRROR_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAIN_HEAD_START: Duration = Duration::from_millis(1000);
@@ -42,13 +43,19 @@ const MIRROR_GRACE: Duration = Duration::from_millis(2000);
 const SEED_MIN: usize = 3;
 /// 内置兜底：已知可用族的前缀。上游换族会失效，所以只当「发布页拉不到」时的最后一道兜底，
 /// 且**不授予凭据信任**（不进 `TRUSTED_MIRRORS`）。
-const SEED_MIRRORS: [&str; 6] = [
+/// 3.0.14：`huang-guo.pages.dev/publish.js` 现在给的是 `aqkmowihz.cc` / `xxslfswu.cc`
+/// 两族（子域是 19 所高校前缀随机拼）。旧族 dvygahpw/zuxszoix 已经探不通，
+/// 保留两条旧族当「上游又换回来」的兜底，但新族排在前面。
+const SEED_MIRRORS: [&str; 9] = [
+    "https://thu.wsaditmwl.cc",
+    "https://pku.wsaditmwl.cc",
+    "https://zju.wsaditmwl.cc",
+    "https://thu.aqkmowihz.cc",
+    "https://pku.aqkmowihz.cc",
+    "https://thu.xxslfswu.cc",
     "https://thu.dvygahpw.cc",
     "https://pku.dvygahpw.cc",
-    "https://zju.dvygahpw.cc",
     "https://thu.zuxszoix.cc",
-    "https://pku.zuxszoix.cc",
-    "https://sysu.zuxszoix.cc",
 ];
 const MIRROR_CACHE_FILE: &str = "lines-cache.json";
 
@@ -826,28 +833,58 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
     };
     hit.url = origin.clone();
     let started = Instant::now();
-    // edge_once sends the upstream's real envelope without retry backoff.
-    // This total deadline covers DNS, TLS, and the response body.
-    match tokio::time::timeout(
-        timeout,
-        crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
-    )
-    .await
-    {
-        Ok(Ok(data)) => {
-            hit.reachable = true;
-            hit.status = Some(200);
-            hit.ok = healthy_video_data(&data);
-            if !hit.ok {
-                hit.error = Some("接口未返回有效视频列表数据".into());
+    /* 3.0.14 真机结论：这类网络对 TLS 握手是**概率性**阻断 —— 同一域名同一条线路
+       一次 curl 三分之一的尝试 TLS 能过（实测 3 次里 1 次 200）。探活只打一枪的话，
+       一条其实能用的镜像会被判死，用户看到的就是「线路全部不可用」。
+       所以探活在总预算内重试到成功（或预算用尽），不再单发一次定生死。 */
+    let deadline = started + timeout;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            hit.error.get_or_insert_with(|| format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
+            break;
+        }
+        match tokio::time::timeout(
+            remaining,
+            crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
+        )
+        .await
+        {
+            Ok(Ok(data)) => {
+                hit.reachable = true;
+                hit.status = Some(200);
+                hit.ok = healthy_video_data(&data);
+                if !hit.ok {
+                    /* 上游停了边缘信封时，信封这条路会返回「接口已停用」；
+                       虽然 net.rs 里已有自动直连兜底，探活这里再兜一层，避免因为
+                       envelope/缓存状态差异把一条真能用的镜像判死。 */
+                    match crate::net::probe_direct(&origin).await {
+                        Ok(true) => {
+                            hit.ok = true;
+                        }
+                        Ok(false) => hit.error = Some("接口未返回有效视频列表数据".into()),
+                        Err(error) => hit.error = Some(error),
+                    }
+                }
+                break;
+            }
+            Ok(Err(error)) => {
+                hit.error = Some(error);
+                /* 只有链路层失败值得再试；403/401/业务错误重试没意义 */
+                if crate::line_health::fault_kind(hit.error.as_deref().unwrap_or("")).is_none() {
+                    break;
+                }
+            }
+            Err(_) => {
+                hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
             }
         }
-        Ok(Err(error)) => {
-            hit.error = Some(error);
+        if attempt >= 3 {
+            break;
         }
-        Err(_) => {
-            hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
-        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
     hit.ms = started.elapsed().as_millis() as u64;
     hit
@@ -1094,19 +1131,41 @@ async fn auto_pick_full(
 /// 故意**不抓发布页**：发布页一次要 2–12 秒（还可能同样被墙），首屏等不起。
 /// 候选顺序：上次可用（磁盘 line-health.json）→ 发布页缓存 → 内置种子；
 /// 黑名单里的（刚失败过）与 `exclude` 本身直接跳过。
+/// 并发探一批候选，第一个真的能用的就返回（其余立刻取消）。
+async fn race_candidates(candidates: Vec<(String, &'static str)>, budget: Duration) -> (Option<Hit>, Vec<Hit>) {
+    let mut set = tokio::task::JoinSet::new();
+    for (origin, tier) in candidates {
+        set.spawn(async move { probe_hit_with(tier, &origin, budget).await });
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(hit) = joined {
+            let ok = hit.ok;
+            hits.push(hit);
+            if ok {
+                set.abort_all();
+                let winner = hits.last().cloned();
+                return (winner, hits);
+            }
+        }
+    }
+    (None, hits)
+}
+
 pub async fn failover(exclude: &str) -> Value {
-    const FAILOVER_PROBE: Duration = Duration::from_secs(4);
+    /* 4s → 7s：概率性 TLS 阻断下，4 秒常常连一次成功握手都赶不上 */
+    const FAILOVER_PROBE: Duration = Duration::from_secs(7);
     const FAILOVER_MAX: usize = 8;
 
+    /* 发布页在后台先抓起来 —— 真机上它常常是唯一还能拿到「当前族」的来源，
+       和第一阶段的探活并行，省掉 5~10 秒。 */
+    let published = tokio::spawn(async { mirrors().await });
     let excluded = crate::net::normalize_base(exclude).unwrap_or_default();
     let mut seen = HashSet::new();
     seen.insert(excluded);
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
 
-    let mut push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>| {
-        if candidates.len() >= FAILOVER_MAX {
-            return;
-        }
+    let push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>, seen: &mut HashSet<String>| {
         let Some(origin) = crate::net::normalize_base(&raw) else { return };
         if is_fixed(&origin) || crate::line_health::blacklisted(&origin) || !seen.insert(origin.clone()) {
             return;
@@ -1115,39 +1174,57 @@ pub async fn failover(exclude: &str) -> Value {
     };
 
     if let Some(good) = crate::line_health::last_good() {
-        push(good, "last-good", &mut candidates);
+        push(good, "last-good", &mut candidates, &mut seen);
     }
     if let Some(listing) = load_mirrors_cache() {
         for item in listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            if candidates.len() >= FAILOVER_MAX { break; }
             if let Some(url) = item.get("url").and_then(Value::as_str) {
-                push(url.to_string(), "mirror", &mut candidates);
+                push(url.to_string(), "mirror", &mut candidates, &mut seen);
             }
         }
     }
     for origin in SEED_MIRRORS {
-        push(origin.to_string(), "seed", &mut candidates);
+        if candidates.len() >= FAILOVER_MAX { break; }
+        push(origin.to_string(), "seed", &mut candidates, &mut seen);
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for (origin, tier) in candidates {
-        let origin = origin.clone();
-        set.spawn(async move { probe_hit_with(tier, &origin, FAILOVER_PROBE).await });
+    let (winner, mut hits) = race_candidates(candidates, FAILOVER_PROBE).await;
+    if let Some(hit) = winner {
+        crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
+        return json!({
+            "base": hit.url, "tier": "failover", "ms": hit.ms,
+            "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+        });
     }
-    let mut hits: Vec<Hit> = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok(hit) = joined {
-            let ok = hit.ok;
-            let url = hit.url.clone();
-            hits.push(hit);
-            if ok {
-                set.abort_all();
-                return json!({
-                    "base": url, "tier": "failover", "ms": hits.last().map(|hit| hit.ms).unwrap_or(0),
-                    "reason": "failover-ok", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
-                });
+
+    /* 第二阶段：磁盘缓存 + 内置种子全挂 → 抓一次发布页再试。
+       真机教训：上游换族很勤（这次实测发布页已经给出 wsaditmwl.cc，而种子还是上一族），
+       只靠内置种子必然追不上。这里多花几秒，但换来「被墙网络里还有路可走」。 */
+    /* 这里必须强制重抓发布页：mirrors_cached() 在 TTL 内会直接回旧列表，
+       而旧列表正是「上一个族」，全都被墙 —— 真机上就是这个原因导致
+       failover 明明有可用镜像却报「全部不可用」。 */
+    if let Ok(Ok(listing)) = published.await {
+        let items = listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let mut fresh: Vec<(String, &'static str)> = Vec::new();
+        for item in items {
+            if fresh.len() >= FAILOVER_MAX { break; }
+            if let Some(url) = item.get("url").and_then(Value::as_str) {
+                push(url.to_string(), "published", &mut fresh, &mut seen);
             }
         }
+        let (winner, more) = race_candidates(fresh, FAILOVER_PROBE).await;
+        hits.extend(more);
+        if let Some(hit) = winner {
+            crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
+            return json!({
+                "base": hit.url, "tier": "failover", "ms": hit.ms,
+                "reason": "failover-published", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+            });
+        }
     }
+
+    crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
     json!({
         "base": "", "tier": "none", "ms": 0, "reason": "all-down",
         "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),

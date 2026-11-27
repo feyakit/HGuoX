@@ -38,19 +38,23 @@ use std::time::{Duration, Instant};
 /// 默认上游（固定线路 1）。
 pub const DEFAULT_BASE: &str = "https://huangguoai.com";
 
-/// 国内实测这几个域名被 DNS 污染到**公网** Facebook 段（157.240.1.50 / 2a03:2880:...:face:b00c），
+/// 国内实测这几个域名被 DNS 污染到**公网** Facebook/Dropbox 段（157.240.x / 108.160.x / 154.83.x），
 /// 不是 127.0.0.1 也不是私网，所以旧的「私网才回退 DoH」判断救不到：TCP 会一直挂到超时。
 /// 这几个域名把解析顺序反过来——先 DoH，失败再退回系统 DNS。
+#[allow(dead_code)] // 保留：发布页/主站的「已知被污染」清单，诊断与说明用
 const DOH_FIRST_HOSTS: [&str; 3] = [
     "huangguoai.com",
     "huangguoai.pages.dev",
     "huang-guo.pages.dev",
 ];
 
-fn doh_first(host: &str) -> bool {
-    DOH_FIRST_HOSTS
-        .iter()
-        .any(|known| host == *known || host.ends_with(&format!(".{known}")))
+/// 3.0.14 真机结论（小米九 / 用户家宽带）：**镜像域名同样被污染**。
+/// `thu.aqkmowihz.cc` 系统解析给 108.160.163.106（Dropbox 段）→ TCP 连不上；
+/// 用 DoH 拿到真实 CloudFront IP（18.238.96.x）后同一个域名 TLS 通、接口 200。
+/// 所以「先 DoH」不能只给三个固定域名开：默认所有域名都先 DoH，DoH 全挂才退回系统 DNS。
+/// 代价是一次 DoH（缓存 5 分钟）+ 首次解析几十毫秒；收益是被污染网络里镜像真的能用。
+fn doh_first(_host: &str) -> bool {
+    true
 }
 
 /// 当前上游基址（不带结尾斜杠）。可在设置里切到固定线路 2 或镜像线路，运行时立即生效。
@@ -654,7 +658,8 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
         (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source)
     } else if strict {
         if doh_first(host) {
-            // 先 DoH：被污染的域名拿到真地址，才不会在 TCP 上白等一整份超时。
+            /* 先 DoH：小米九实测，镜像域名被污染到 Dropbox 段时，只有 DoH 才拿得到
+               CloudFront 真地址；拿到真地址后同一个域名是通的。 */
             match resolve_doh_fallback(host, port, &route, strict).await {
                 Ok((resolution, source)) => (resolution.addresses, CLIENT_TTL.min(resolution.ttl), source),
                 Err(_) => match network_policy::resolve_target(&target, strict).await {
@@ -1407,6 +1412,7 @@ pub async fn diagnose() -> Value {
         "doh": doh,
         "connect": resolution_source(&host),
         "line_health": crate::line_health::snapshot(),
+        "failover_probe": crate::line_health::probe_log(),
         "tcp": tcp,
         "http": http,
         "env": {
@@ -1561,6 +1567,10 @@ async fn edge_inner(
             return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路或重新加载发布页验证镜像".into());
         }
     }
+    /* 已经知道信封停了（10 分钟内）：直接走 REST，别再每个请求都撞一次。 */
+    if envelope_disabled() {
+        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+    }
     let (encoded, ctype) = match &body {
         Some(v) => (
             B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
@@ -1602,7 +1612,11 @@ async fn edge_inner(
     let mut attempt = 0;
     let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
     let can_retry = allow_retry && method.eq_ignore_ascii_case("GET") && body.is_none();
-    let value = with_retry(can_retry, || {
+    /* 总预算（3.0.14 真机）：被墙的 IP 常常是「黑洞丢包」而不是 RST —— 一次尝试会一直
+       挂到客户端的 20 秒超时，3 次重试就是 60 秒，首页 50 秒还在转圈。
+       这里给整个逻辑请求封顶，超时按链路层失败返回，让前端立刻换线重试。 */
+    let budget = Duration::from_secs(12);
+    let value = match tokio::time::timeout(budget, with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
         let cur = cur.clone();
@@ -1685,8 +1699,12 @@ async fn edge_inner(
             }));
             result
         }
-    })
-    .await;
+    }))
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => Err(format!("deadline has elapsed（请求总时长超过 {} 秒）", budget.as_secs())),
+    };
 
     /* 线路健康（3.0.14 A 节）：只有链路层硬错误才计数/进黑名单；HTTP 与业务错误不算。
        失败样本除了黑名单，还写一行 playback.log，便于用「origin + 错误类型」复盘。 */
@@ -1694,6 +1712,13 @@ async fn edge_inner(
         Ok(value) => {
             crate::line_health::note_success(&cur);
             value
+        }
+        /* 上游停用信封时回的是 HTTP 503/404 + body「接口已停用」，走的是错误分支，
+           以前在这里直接返回，永远轮不到下面的 JSON 判定 —— 真机上就是卡在这。 */
+        Err(error) if error.contains("停用") || error.contains("禁用") || error.contains("下线") => {
+            mark_envelope_disabled();
+            crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
+            return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
         }
         Err(error) => match crate::line_health::note_failure(&cur, &error) {
             Some(kind) => {
@@ -1716,13 +1741,130 @@ async fn edge_inner(
         return Ok(Value::Null);
     }
 
-    if value.get("status").and_then(|v| v.as_i64()) == Some(1) {
+    let business_status = value.get("status").and_then(|v| v.as_i64());
+    let message = value
+        .get("msg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if business_status == Some(1) {
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+    }
+    /* 上游 2026-11-25 起把边缘信封 `/api/edge/request` 停了（返回「接口已停用」），
+       而 App 所有接口都走它 —— 于是「网络明明是通的也打不开首页」。
+       这里认出这句话就整体切到直连 REST（同一个 path 直接请求），并记住一段时间，
+       别每个请求都先撞一次信封。 */
+    if envelope_disabled_message(&message) {
+        mark_envelope_disabled();
+        crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
+        return direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await;
+    }
+    Err(if message.is_empty() { "接口返回失败".to_string() } else { message })
+}
+
+/// 信封被停用的几种说法（都见过）。
+fn envelope_disabled_message(message: &str) -> bool {
+    ["停用", "禁用", "下线", "deprecated", "disabled", "not found"]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
+static ENVELOPE_OFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn envelope_disabled() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    ENVELOPE_OFF_UNTIL.load(Ordering::Relaxed) > now
+}
+
+fn mark_envelope_disabled() {
+    let until = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+        + 10 * 60;
+    ENVELOPE_OFF_UNTIL.store(until, Ordering::Relaxed);
+}
+
+/// 探活用：绕过信封，直接打 REST 看这家镜像到底有没有真数据。
+/// 返回 Ok(true) 表示拿到了有效的视频列表（items + pagination）。
+pub async fn probe_direct(origin: &str) -> Result<bool, String> {
+    let url = format!("{}/api/videos?page=1&size=1", origin.trim_end_matches('/'));
+    let (target, http) = client_for(&url).await?;
+    let response = http
+        .get(target)
+        .header("Accept", "application/json")
+        .header("Referer", format!("{}/", origin.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|error| err_text(&error))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    let text = response.text().await.map_err(|error| err_text(&error))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("返回的不是 JSON（{} 字节）", text.len()))?;
+    let data = value.get("data").cloned().unwrap_or(value);
+    Ok(data.get("items").and_then(Value::as_array).is_some_and(|items| !items.is_empty())
+        && data.get("pagination").and_then(Value::as_object).is_some())
+}
+
+/// 直连 REST：与信封拿的是同一个 `path`，只是不再套 `/api/edge/request`。
+/// 返回结构与信封一致（`{status, data, msg}`），所以上层解析不用改。
+async fn direct_rest(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> Result<Value, String> {
+    let url = format!("{}{}", origin.trim_end_matches('/'), path);
+    let referer = format!("{origin}/");
+    let (target, http) = client_for(&url).await?;
+    let mut request = match method.to_ascii_uppercase().as_str() {
+        "POST" => http.post(target.clone()),
+        "PUT" => http.put(target.clone()),
+        "DELETE" => http.delete(target.clone()),
+        _ => http.get(target.clone()),
+    }
+    .header("Accept", "application/json")
+    .header("Referer", &referer);
+    if let Some(token) = token.filter(|token| !token.is_empty()) {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = match body {
+        Some(body) if !body.is_null() => request.json(body),
+        _ => request,
+    }
+    .send()
+    .await
+    .map_err(|error| err_text(&error))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| err_text(&error))?;
+    if status.as_u16() == 401 {
+        return Err("401".into());
+    }
+    if status.as_u16() == 403 {
+        return Err("403".into());
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", text.chars().take(160).collect::<String>()));
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{error}: {}", text.chars().take(160).collect::<String>()))?;
+    if value.get("status").and_then(Value::as_i64) == Some(1) {
         Ok(value.get("data").cloned().unwrap_or(Value::Null))
     } else {
         Err(value
             .get("msg")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
             .unwrap_or("接口返回失败")
             .to_string())
     }

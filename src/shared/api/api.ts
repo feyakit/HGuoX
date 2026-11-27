@@ -97,6 +97,8 @@ export class ApiError extends Error {
 }
 /** 链路层失败时给用户看的话（报告 G 节）：说清楚「可能被拦」，并给一条可执行的建议。 */
 export const NETWORK_FAIL_TEXT = "可能被网络拦截。已尝试切换到备用线路，仍然失败。如果开了代理，请把 huangguoai.com 设为直连或全局代理。";
+/** 用户手动选的线路不通时的文案：不换，是尊重选择，得说清楚（硬约束）。 */
+export const MANUAL_LINE_FAIL_TEXT = "这条线路是你手动选的，不会自动切换。可以点「换个线路」选一条可用的，或稍后重试。";
 const failMessage = (msg: string, status?: string) =>
   status
     ? `服务器请求失败（HTTP ${status}），请稍后重试或在设置中切换线路`
@@ -197,7 +199,7 @@ function remember(key: string, ttl: number, value: unknown) {
 /** 紧急换线（3.0.14 A 节）：链路层硬错误时让后端马上去找一条备用线路。
  *  同一时刻只跑一次（首页一屏十几个请求同时挂，不能各自触发一轮探活）。
  *  返回是否真的换了线路；换了就派 `hg:line-changed`（缓存与页面自己刷新）。 */
-let failoverFlight: Promise<boolean> | null = null;
+let failoverFlight: Promise<FailoverOutcome> | null = null;
 /** 最近一次紧急换线切到的 host。冷启动时事件可能早于界面的监听器（子组件 effect 先跑），
  *  所以除了派事件，还留一份给界面「补拿」——见 store 里的 takeFailoverNotice()。 */
 let pendingFailoverHost = "";
@@ -206,13 +208,14 @@ export const takeFailoverNotice = (): string => {
   pendingFailoverHost = "";
   return host;
 };
-export function failoverOnce(): Promise<boolean> {
+export type FailoverOutcome = { switched: boolean; reason: string };
+export function failoverOnce(): Promise<FailoverOutcome> {
   if (!failoverFlight) {
     failoverFlight = invoke<{ switched?: boolean; base?: string; reason?: string }>("line_failover")
       .then((result) => {
         if (!result?.switched || !result.base) {
           logLine(`[line] failover 未换线（${result?.reason ?? "all-down"}）`);
-          return false;
+          return { switched: false, reason: result?.reason ?? "all-down" };
         }
         const host = hostOf(result.base);
         logLine(`[line] failover 已切到 ${host}（${result.reason ?? ""}）`);
@@ -220,11 +223,11 @@ export function failoverOnce(): Promise<boolean> {
         /* 先派「换了哪条」（让提示能弹出来），再派「线路变了」（各页重挂载重拉） */
         window.dispatchEvent(new CustomEvent("hg:line-failover", { detail: { host, base: result.base } }));
         window.dispatchEvent(new Event("hg:line-changed"));
-        return true;
+        return { switched: true, reason: result.reason ?? "failover-ok" };
       })
       .catch((error) => {
         logLine(`[line] failover 失败：${(error as Error)?.message ?? error}`);
-        return false;
+        return { switched: false, reason: "error" };
       })
       .finally(() => { failoverFlight = null; });
   }
@@ -255,7 +258,7 @@ async function request<T>(cmd: string, args: Record<string, unknown> | undefined
     publishData(cmd, key, value);
     return value;
   };
-  let last = { msg: "", raw: "", networkish: false, switched: false };
+  let last = { msg: "", raw: "", networkish: false, switched: false, manual: false };
   try {
     return succeed(await once());
   } catch (e) {
@@ -265,13 +268,15 @@ async function request<T>(cmd: string, args: Record<string, unknown> | undefined
     logLine(`[api] ${cmd} → ${msg}`);
     tracePlayback("api.fail", { cmd, err: msg, status: status ?? null, networkish });
     notifyNet({ ok: false, cmd, msg, networkish });
-    last = { msg, raw: stripNetPrefix(msg), networkish, switched: false };
+    last = { msg, raw: stripNetPrefix(msg), networkish, switched: false, manual: false };
     if (!networkish || !READ_ONLY.has(cmd)) throw new ApiError(failMessage(msg, status), stripNetPrefix(msg), networkish, false);
   }
 
   const rounds = 2;
   for (let round = 0; round < rounds; round += 1) {
-    const switched = await failoverOnce();
+    const outcome = await failoverOnce();
+    const switched = outcome.switched;
+    if (outcome.reason === "manual") last.manual = true;
     last.switched = last.switched || switched;
     logLine(`[api] ${cmd} 链路异常，${switched ? `已换线（第 ${round + 1} 轮），立刻重试` : "1.2s 后原地重试一次"}`);
     tracePlayback("api.retry", { cmd, err: last.msg, round, switched });
@@ -285,13 +290,17 @@ async function request<T>(cmd: string, args: Record<string, unknown> | undefined
       const again = typeof e2 === "string" ? e2 : last.msg;
       const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
       const againNetworkish = !againStatus && isNetworkMessage(again);
-      last = { msg: again, raw: stripNetPrefix(again), networkish: againNetworkish, switched: last.switched };
+      last = { msg: again, raw: stripNetPrefix(again), networkish: againNetworkish, switched: last.switched, manual: last.manual };
       logLine(`[api] ${cmd} 第 ${round + 1} 轮重试仍失败 → ${again}`);
       tracePlayback("api.retry_failed", { cmd, err: again, round, status: againStatus ?? null });
       if (!againNetworkish) throw new ApiError(failMessage(again, againStatus), stripNetPrefix(again), false, last.switched);
     }
   }
-  throw new ApiError(last.networkish ? NETWORK_FAIL_TEXT : failMessage(last.msg), last.raw, last.networkish, last.switched);
+  /* 手动线路：说明「不会自动换」，别让用户以为我们在替他换又换失败了 */
+  const text = !last.networkish ? failMessage(last.msg)
+    : last.manual ? MANUAL_LINE_FAIL_TEXT
+    : NETWORK_FAIL_TEXT;
+  throw new ApiError(text, last.raw, last.networkish, last.switched);
 }
 
 /** 后台静默刷新：同一个 key 只跑一次，失败不弹任何东西（下次进来还是旧值兜底）。 */

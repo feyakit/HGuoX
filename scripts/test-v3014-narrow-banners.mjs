@@ -312,8 +312,10 @@ try {
     alert: document.querySelector('[role="alert"]')?.textContent?.slice(0, 120) || "",
   }));
   const notSwitched = !manualState.events.includes("hg:line-changed") && !manualPage.url().includes("?line=");
-  report.cases.push({ case: "手动线路失败：不自动换线，只给提示", ...manualState, notSwitched, pass: notSwitched && manualState.calls.includes("line_failover") });
+  const manualCopy = /这条线路是你手动选的/.test(manualState.alert);
+  report.cases.push({ case: "手动线路失败：不自动换线，只给提示（文案说清是手动线路）", ...manualState, notSwitched, manualCopy, pass: notSwitched && manualCopy && manualState.calls.includes("line_failover") });
   assert.ok(notSwitched, "手动选定的线路失败时不允许自动跳线");
+  assert.ok(manualCopy, "手动线路失败时要说明「不会自动切换」");
   await manualPage.screenshot({ path: join(output, "home-manual-line-down.png") });
   await manualPage.close();
 

@@ -70,6 +70,43 @@ export function formatNetDiag(raw: Json): string {
   lines.push(`${pad("主机")}${str(raw.host) || "-"}`);
   lines.push("");
 
+  /* ── DoH 对照（3.0.14）：系统解析 vs 加密 DoH ── */
+  const doh = obj(raw.doh);
+  if (str(doh.source) || arr(doh.addrs).length) {
+    lines.push("── DoH ───────────────────────────");
+    lines.push(`${pad("系统解析")}${arr(doh.system_addrs).map(String).join(", ") || "-"}`);
+    lines.push(`${pad("DoH 解析")}${arr(doh.addrs).map(String).join(", ") || "-"}${str(doh.source) ? `（${str(doh.source)}）` : ""}`);
+    lines.push(`${pad("两者一致")}${doh.mismatch === true ? "否（系统 DNS 被污染/改写）" : "是"}`);
+    lines.push("");
+  }
+
+  /* ── 最近一次换线尝试的候选明细（3.0.14）：放在最前面，一眼能看出哪家探不通 ── */
+  const probes = arr(raw.failover_probe).map(obj);
+  if (probes.length) {
+    lines.push("── 换线候选 ──────────────────────");
+    for (const row of probes.slice(0, 10)) {
+      const host = String(str(row.url) ?? "").replace(/^https:\/\//, "");
+      const ok = row.ok === true;
+      const tail = ok
+        ? `${num(row.ms) ?? 0}ms`
+        : `失败：${str(row.error) ?? "未知"}`.replace(/\s+/g, " ").slice(0, 60);
+      lines.push(`${pad(String(str(row.tier) ?? ""))}${host} · ${tail}`);
+    }
+    lines.push("");
+  }
+
+  /* ── 线路健康（3.0.14）：最近可用线路 + 被判死的线路 ── */
+  const health = obj(raw.line_health);
+  const blocked = arr(health.blacklist).map(obj);
+  if (blocked.length || str(health.last_good)) {
+    lines.push("── 线路健康 ──────────────────────");
+    if (str(health.last_good)) lines.push(`${pad("上次可用")}${str(health.last_good)}`);
+    for (const row of blocked.slice(0, 6)) {
+      lines.push(`${pad("判死")}${str(row.origin)}（${num(row.fails) ?? "?"} 次失败，剩 ${num(row.ttl_left_s) ?? "?"}s）`);
+    }
+    lines.push("");
+  }
+
   /* ── DNS ── */
   lines.push("── DNS ───────────────────────────");
   if (str(dns.error)) {
