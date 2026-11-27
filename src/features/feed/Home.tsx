@@ -1,9 +1,10 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { prefetchDetails } from "../../shared/api/detailFast";
 import { useTabSwipe } from "./useTabSwipe";
-import { ApiError, api, fmt, hostOf, isMobile, logLine } from "../../shared/api/api";
+import { ApiError, api, fmt, hostOf, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
-import type { HomeBanner } from "../../shared/api/api";
+import type { HomeBanner, HomeBannerDetail } from "../../shared/api/api";
+import { withLineRetries } from "../../shared/network/firstScreen";
 import { useStore } from "../../shared/model/store";
 import { Button } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
@@ -41,6 +42,18 @@ type HeroSpot = {
   total_episodes?: number;
   is_finished: boolean;
   kicker: string;
+};
+
+/** `mergeBannerText` 的输入：feed 卡片（`id`）与 hero 补全（`video_id`）共用的字段子集。 */
+type BannerTextSource = {
+  id?: number;
+  video_id?: number;
+  title?: string | null;
+  tags?: string[] | null;
+  episode_count?: number | null;
+  total_episodes?: number | null;
+  is_finished?: boolean | null;
+  cover?: string | null;
 };
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -168,6 +181,10 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const shelfSeq = useRef(0);
   const topicSeq = useRef(0);
   const loadedKey = useRef("");
+  /* 骨架 → 真实内容的时间点（3.0.20 取证：一行 `[net] first content ms=…` 进 logcat） */
+  const firstContentAt = useRef(0);
+  /* hero 文字补全只跑一次（阶段二） */
+  const detailsAt = useRef(0);
   const aliveRef = useRef(true);
   useEffect(() => { aliveRef.current = true; return () => { aliveRef.current = false; }; }, []);
   const fresh = useFreshness();
@@ -183,6 +200,40 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     containerRef: scrollRef,
   });
 
+  /* 把已知的剧名/标签/集数并回 banner：阶段一用首屏 feed 里同 id 的卡片顶，
+     阶段二用 `api_home_details` 的补全结果。**只填空缺**，已有值不覆盖 ——
+     否则每次下拉刷新 hero 的文字都会先空一下再回来。 */
+  const mergeBannerText = useCallback((rows: BannerTextSource[]) => {
+    if (!rows.length) return;
+    const byId = new Map<number, BannerTextSource>();
+    for (const row of rows) {
+      const id = row.video_id ?? row.id ?? 0;
+      if (id > 0) byId.set(id, row);
+    }
+    if (!byId.size) return;
+    setBanners(prev => {
+      let touched = false;
+      const next = prev.map(banner => {
+        const known = byId.get(banner.video_id);
+        if (!known) return banner;
+        const title = (banner.title || "").trim() || (known.title || "").trim();
+        if (!title) return banner;
+        if (title === banner.title && banner.tags?.length && banner.episode_count) return banner;
+        touched = true;
+        return {
+          ...banner,
+          title,
+          tags: banner.tags?.length ? banner.tags : (known.tags ?? null),
+          episode_count: banner.episode_count ?? known.episode_count ?? null,
+          total_episodes: banner.total_episodes ?? known.total_episodes ?? null,
+          is_finished: banner.is_finished ?? known.is_finished ?? null,
+          image_url: banner.image_url || known.cover || "",
+        };
+      });
+      return touched ? next : prev;
+    });
+  }, []);
+
   /* `opts.force` = 绕过 api 读缓存打真实请求；`opts.silent` = 不闪骨架/不报错（回前台、切回 tab 用）。
      两个都给 = "后台静默换新"：用户看到的列表不动，数据悄悄变成最新的。 */
   const load = useCallback(async (p: number, key: FeedTab, replaceBatch = false, opts?: { force?: boolean; silent?: boolean }) => {
@@ -194,15 +245,40 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     if (replaceBatch) setShuffling(true);
     if (!silent) setError("");
     const my = ++seq.current;
+    const fetchFeed = () => (key === "new"
+      ? api.feed(p, 21, "new", force)
+      : api.feed(p, 21, undefined, force));
+    /* 首屏（第 1 页、非静默）失败不再直接停在错误页：换线 + 1s / 3s / 7s 各重试一次，
+       三次都失败才让错误页出现（文案与按钮沿用原样）。
+       HTTP 4xx/5xx 是站点在回答 —— 换线没用，仍按旧行为直接上错误页。 */
+    const firstScreen = p === 1 && !silent;
     try {
-      const res = key === "new"
-        ? await api.feed(p, 21, "new", force)
-        : await api.feed(p, 21, undefined, force);
+      const res = firstScreen
+        ? await withLineRetries(fetchFeed, {
+            switchLine: (tried, kind) => switchLineForRetry(kind, tried),
+            shouldRetry: (error) => {
+              const failure = error as ApiError;
+              return !!failure?.networkish || !!failure?.failoverTried;
+            },
+            onRetry: ({ n, delay }) => {
+              netLog(`[net] retry n=${n} delay=${delay}`);
+              logLine(`[feed] 首屏第 ${n}/3 次重试（${delay}ms 后）`);
+            },
+          })
+        : await fetchFeed();
       if (my !== seq.current) return;
       const rows = (res?.items ?? []).filter(v => v && v.cover);
       const pages = Math.max(1, res?.pagination?.pages || 1);
       setTotalPages(pages);
       setItems(prev => (p === 1 || replaceBatch) ? rows : [...prev, ...rows.filter(r => !prev.some(x => x.id === r.id))]);
+      /* 骨架 → 真实内容：一条 logcat 行 + 立刻放开冷启动的 4.5s 请求预算 */
+      if (firstScreen && !firstContentAt.current) {
+        firstContentAt.current = Math.max(1, Math.round(performance.now()));
+        netLog(`[net] first content ms=${firstContentAt.current}`);
+        releaseBootBudget();
+      }
+      /* hero 的剧名先用首屏 feed 里已有的同名 id 顶上，不等补全（少一次首屏空窗） */
+      mergeBannerText(rows);
       /* 首屏预取详情（并发 2、失败静默）：点进去时详情页能直接出内容，不用等镜像 RTT */
       if (p === 1 || replaceBatch) prefetchDetails(rows.slice(0, 4).map(v => v.id));
       setPage(p);
@@ -233,7 +309,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
         loadingRef.current = false;
       }
     }
-  }, [fresh]);
+  }, [fresh, mergeBannerText]);
 
   /* 推荐页专属异构货架数据（官方口碑推荐榜 + 热播榜 TOP10 + 独家原创宽画幅）。
      每次进页/回前台超过 30s 就重拉（force 绕过缓存），不再是"一个线路只拉一次"。
@@ -261,7 +337,24 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       const res = await api.home(force);
       const rows = (res?.banners ?? []).filter(b => b && b.video_id > 0 && !!b.image_url);
       if (!aliveRef.current) return;
-      setBanners(rows);
+      /* 新列表只有封面和分数（详情补全是阶段二的事）：把已经补到的文字按 video_id 带过来，
+         否则每次下拉刷新 hero 都会先掉成无剧名再补回来。 */
+      setBanners(prev => {
+        const known = new Map(prev.filter(b => (b.title || "").trim()).map(b => [b.video_id, b]));
+        return rows.map(banner => {
+          const old = known.get(banner.video_id);
+          if (!old) return banner;
+          return {
+            ...banner,
+            title: banner.title ?? old.title,
+            tags: banner.tags ?? old.tags,
+            episode_count: banner.episode_count ?? old.episode_count,
+            total_episodes: banner.total_episodes ?? old.total_episodes,
+            is_finished: banner.is_finished ?? old.is_finished,
+            image_url: banner.image_url || old.image_url,
+          };
+        });
+      });
       bannersAt.current = Date.now();
       if (rows.length) logLine(`[home] banners=${rows.length} order=${rows.map(b => b.video_id).join(",")}`);
     } catch (e) {
@@ -283,17 +376,40 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
 
   /* 切线路：货架/专题的时间戳与在途请求全部作废，下一次进页强制重拉 */
   useEffect(() => {
-    shelvesAt.current = 0; topicsAt.current = 0; bannersAt.current = 0;
+    shelvesAt.current = 0; topicsAt.current = 0; bannersAt.current = 0; detailsAt.current = 0;
     shelfSeq.current++; topicSeq.current++;
     setBanners([]);
   }, [lineEpoch]);
 
+  /* 阶段一（首屏只等两个请求）：feed 第 1 页（下面那个 effect）＋ 官网 banners（hero 数据源）。
+     货架 / 榜位 / 专题都挪到「内容已经出现」之后的阶段二，别和首屏抢带宽和超时预算。 */
   useEffect(() => {
     if (!active || tab !== "all") return;
+    if (bannersAt.current && Date.now() - bannersAt.current < FRESH_GAP_MS) return;
+    void loadBanners(bannersAt.current > 0);
+  }, [active, tab, lineEpoch, loadBanners]);
+
+  /* 阶段二：内容（items）出现之后才补货架 —— 口碑推荐榜 / 热播 TOP10 / 独家原创。
+     旧实现和 feed 同时发，首屏一共 4 个请求抢同一条被墙的线路，谁先超时谁决定首屏时间。 */
+  useEffect(() => {
+    if (!active || tab !== "all" || !items.length) return;
     if (shelvesAt.current && Date.now() - shelvesAt.current < FRESH_GAP_MS) return;
     void loadShelves(shelvesAt.current > 0);
-    void loadBanners(bannersAt.current > 0);
-  }, [active, tab, lineEpoch, loadShelves, loadBanners]);
+  }, [active, tab, items.length, lineEpoch, loadShelves]);
+
+  /* 阶段二：hero 文字补全（banner 只给封面和分数，剧名 / 标签 / 集数要逐条补）。 */
+  useEffect(() => {
+    if (!active || tab !== "all" || !items.length) return;
+    const missing = banners.filter(b => !(b.title || "").trim()).map(b => b.video_id).slice(0, 10);
+    if (!missing.length) return;
+    if (detailsAt.current && Date.now() - detailsAt.current < FRESH_GAP_MS) return;
+    detailsAt.current = Date.now();
+    let alive = true;
+    void api.homeDetails(missing)
+      .then(res => { if (alive && res?.items?.length) mergeBannerText(res.items); })
+      .catch(() => { /* 补不到就保持无剧名：banner 仍有封面和分数，照样可点 */ });
+    return () => { alive = false; };
+  }, [active, tab, items.length, banners, lineEpoch, mergeBannerText]);
 
   useEffect(() => {
     if (!active || tab !== "all" || !items.length) return;
