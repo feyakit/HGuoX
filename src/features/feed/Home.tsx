@@ -3,7 +3,7 @@ import { prefetchDetails } from "../../shared/api/detailFast";
 import { useTabSwipe } from "./useTabSwipe";
 import { ApiError, api, fmt, hostOf, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
-import type { HomeBanner, HomeBannerDetail } from "../../shared/api/api";
+import type { HomeBanner } from "../../shared/api/api";
 import { withLineRetries } from "../../shared/network/firstScreen";
 import { useStore } from "../../shared/model/store";
 import { Button } from "../../shared/ui/ios/controls";
