@@ -484,7 +484,7 @@
 .ios-mobile-nav .ios-mobile-nav-item,
 .ios-mobile-nav[data-over-video="true"] .ios-mobile-nav-item {
   color: rgba(255, 255, 255, 0.72);
-  font-size: 11px;
+  font-size: 10.5px;
 }
 .ios-mobile-nav .ios-mobile-nav-item[aria-current="page"],
 .ios-mobile-nav[data-over-video="true"] .ios-mobile-nav-item[aria-current="page"],
@@ -516,17 +516,23 @@
   margin-top: 6px; font-size: 12px; line-height: 1.4; color: #8A8AA3;
 }
 
-/* 底栏浮岛：半透明亮磨砂玻璃，对齐设计稿 */
-.ios-mobile-nav { padding: 8px calc(16px + var(--sar, 0px)) calc(12px + var(--sab, 0px)) calc(16px + var(--sal, 0px)); }
+/* 底栏浮岛：半透明亮磨砂玻璃，对齐设计稿
+   3.0.18：用户定的「B 尺寸 + C 透明度」——高 66→56、距底 36→8（去掉 --sab 的 24px 兜底）、
+   玻璃不透明度 32%→10%（白膜 14%→6%，渐变 8/34%→1.6/6.9%），blur 28→24、saturate 140→160。
+   度量口径与「为什么距底是 36 不是 12」见 skill 的 references/bottom-nav-metrics.md。 */
+.ios-mobile-nav { padding: 8px calc(16px + var(--sar, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) calc(16px + var(--sal, 0px)); }
 .ios-mobile-nav .hg-glass {
-  height: 66px; width: 100%; max-width: 360px; border-radius: 33px;
-  background-color: rgba(255, 255, 255, 0.14);
-  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(16, 18, 32, 0.34));
+  height: 56px; width: 100%; max-width: 360px; border-radius: 28px;
+  background-color: rgba(255, 255, 255, 0.06);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.016), rgba(16, 18, 32, 0.069));
   border: 1px solid rgba(255, 255, 255, 0.22);
-  -webkit-backdrop-filter: blur(28px) saturate(140%); backdrop-filter: blur(28px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%);
 }
 .ios-mobile-nav .hg-drop { top: 5px; bottom: 5px; width: 25%; left: 0; }
 .ios-mobile-nav .hg-drop > .ios-liquid-fill { margin: 0 5px; width: calc(100% - 10px); height: 100%; border-radius: 999px; }
+/* 图标 21→20、图标↔文字 7.2→4（gap 在 ios.css:199，用三段类名压过去） */
+.ios-mobile-nav .hg-glass .ios-mobile-nav-item svg { width: 20px; height: 20px; }
+.ios-mobile-nav .hg-glass .ios-mobile-nav-item { gap: 4px; }
 
 /* ------------------------------------------------------------------
    吃瓜（社区信息流）& 二级下划线 tab
