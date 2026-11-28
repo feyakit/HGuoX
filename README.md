@@ -17,7 +17,7 @@
 
 ---
 
-**项目定位**：`HGuoX`（当前版本 `3.0.17`）是一款基于 **Rust + Tauri 2 + React 19** 构建的跨平台短剧 / 漫剧客户端，一套代码覆盖 **Android、iOS、Windows、macOS、Linux** 五大平台，围绕「莫比乌斯极光玻璃视觉、双模式沉浸追剧、国内复杂网络并发选线」进行深度工程化打磨。
+**项目定位**：`HGuoX`（当前版本 `3.0.20`）是一款基于 **Rust + Tauri 2 + React 19** 构建的跨平台短剧 / 漫剧客户端，一套代码覆盖 **Android、iOS、Windows、macOS、Linux** 五大平台，围绕「莫比乌斯极光玻璃视觉、双模式沉浸追剧、国内复杂网络并发选线」进行深度工程化打磨。
 
 > [!NOTE]
 > **包名（Android / iOS）**：`com.dusk.player`。3.0.9 之前的 `com.hguox.app` 数据**不继承**，升级需要卸载重装（`adb install` 会因包名不同并存一份旧应用）。
