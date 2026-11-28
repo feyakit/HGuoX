@@ -2155,4 +2155,5 @@
 .hg-line-chip-text { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 359px) {
   .hg-line-chip-text { max-width: 74px; }
+  .hg-detail-counts { flex-wrap: wrap; row-gap: 2px; }
 }

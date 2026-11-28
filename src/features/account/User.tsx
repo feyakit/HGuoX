@@ -5,6 +5,10 @@ import { api, fmt } from "../../shared/api/api";
 import type { Paged, UserProfile, VideoCard } from "../../shared/api/types";
 import { useStore } from "../../shared/model/store";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
+import {
+  filterVideosByStatus, SERIALIZATION_FILTER_OPTIONS, sortVideosByMetric, VIDEO_SORT_OPTIONS,
+  type SerializationStatusFilter, type VideoSortDirection, type VideoSortMetric,
+} from "../../shared/model/videoSort";
 import { Masonry } from "../../shared/ui/cards";
 import { InplaceSearch } from "../search/InplaceSearch";
 import { Avatar, Empty } from "../../shared/ui/ui";
@@ -207,6 +211,19 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
   const followVersion = useRef(0);
   const request = useCallback((page: number) => api.userVideos(id, page, 20), [id]);
   const state = useUserVideos(true, request);
+  const [sortMetric, setSortMetric] = useState<VideoSortMetric>("default");
+  const [sortDir, setSortDir] = useState<VideoSortDirection>("desc");
+  const [statusFilter, setStatusFilter] = useState<SerializationStatusFilter>("all");
+  const displayItems = useMemo(
+    () => sortVideosByMetric(filterVideosByStatus(state.items, statusFilter), sortMetric, sortDir),
+    [state.items, statusFilter, sortMetric, sortDir],
+  );
+  const pickMetric = (metric: VideoSortMetric) => {
+    if (metric === "default") { setSortMetric("default"); setSortDir("desc"); return; }
+    if (sortMetric === metric) { setSortDir(d => d === "desc" ? "asc" : "desc"); return; }
+    setSortMetric(metric);
+    setSortDir("desc");
+  };
 
   useEffect(() => {
     mounted.current = true;
@@ -214,7 +231,7 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
     setFollowBusy(false); setFollowError("");
     return () => { mounted.current = false; followVersion.current++; };
   }, [id, accountScope]);
-  useEffect(() => { setProfile(null); setStats(null); }, [id]);
+  useEffect(() => { setProfile(null); setStats(null); setSortMetric("default"); setSortDir("desc"); setStatusFilter("all"); }, [id]);
   useEffect(() => {
     let alive = true;
     setInfoLoading(true); setInfoError("");
@@ -286,9 +303,9 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
             <span className="whitespace-nowrap">粉丝 <b className="text-on text-[14px]">{stat(stats?.followers)}</b></span>
             <span className="whitespace-nowrap">获赞 <b className="text-on text-[14px]">{stat(stats?.like_count)}</b></span>
           </div>
-          {state.items.length > 0 && (
+          {displayItems.length > 0 && (
             <Button card className="hg-quick-action"
-              onClick={() => push({ kind: "feed", videoIds: state.items.map(x => x.id), index: 0, title: profile?.nickname || name || "用户作品" })}>
+              onClick={() => push({ kind: "feed", videoIds: displayItems.map(x => x.id), index: 0, title: profile?.nickname || name || "用户作品" })}>
               <IPlayF size={12} /><span>连刷TA的作品</span>
             </Button>
           )}
@@ -310,13 +327,39 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
         <Button disabled={infoLoading} onClick={() => setInfoReload(value => value + 1)} className="mt-2 px-3 text-primary">重试资料</Button>
       </div>}
 
-      <div className="mt-4 mb-2.5 flex flex-wrap items-baseline justify-between gap-2">
+      <div className="mt-4 mb-2 flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-[15px] font-extrabold text-on">TA 的作品</h2>
-        <p role="status" className="text-[12px] text-mut">{countLabel(state)}</p>
+        <p role="status" className="text-[12px] text-mut">{countLabel({ ...state, items: displayItems, total: statusFilter === "all" ? state.total : null })}</p>
       </div>
+      {state.items.length > 0 && (
+        <div className="mb-3 flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="作品指标排序">
+            {VIDEO_SORT_OPTIONS.map(opt => {
+              const activeOpt = sortMetric === opt.key;
+              return (
+                <Button key={opt.key} card aria-pressed={activeOpt}
+                  className={`hg-tag-pill ${activeOpt ? "is-on" : ""}`}
+                  onClick={() => pickMetric(opt.key)}>
+                  {opt.label}{activeOpt && opt.key !== "default" ? (sortDir === "desc" ? " ↓" : " ↑") : ""}
+                </Button>
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="连载状态筛选">
+            {SERIALIZATION_FILTER_OPTIONS.map(opt => (
+              <Button key={opt.key} card aria-pressed={statusFilter === opt.key}
+                className={`hg-tag-pill ${statusFilter === opt.key ? "is-on" : ""}`}
+                onClick={() => setStatusFilter(opt.key)}>
+                {opt.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
       {state.loading && !state.items.length ? <div className="flex justify-center py-12"><Loader /></div>
         : state.err && !state.items.length ? <Empty icon={<IGrid size={26} />} title="作品加载失败" sub={state.err} action="重试" onAction={() => void state.loadMore()} />
-        : state.items.length ? <Masonry videos={state.items} scopeKey={id} wide={wide} onOpen={v => push({ kind: "series", id: v.id })} />
+        : displayItems.length ? <Masonry videos={displayItems} scopeKey={`${id}:${sortMetric}:${sortDir}:${statusFilter}`} wide={wide} onOpen={v => push({ kind: "series", id: v.id })} />
+        : state.items.length > 0 && statusFilter !== "all" ? <Empty icon={<IGrid size={26} />} title="当前筛选下暂无作品" sub="切换其他状态或查看全部作品" action="查看全部" onAction={() => setStatusFilter("all")} />
         : <Empty icon={<IGrid size={26} />} title="暂无作品" />}
       <PaginationFeedback state={state} />
     </div>
