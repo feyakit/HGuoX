@@ -138,6 +138,16 @@ export default function StartupGate({ children }: { children: ReactNode }) {
 
   /* 已经播过的会话（launchCompleted）直接是完成态，但 HTML 上的启动锁要顺手摘掉。 */
   useEffect(() => { if (finished) releaseLaunchSurface(); }, [finished]);
-  if (!finished) return <><LaunchAnimation onFinish={finish} />{mountChildren && children}</>;
-  return children;
+  /* 两边都返回**同一个 Fragment**，children 永远在第 2 位上。
+     3.0.20 的写法是「未完成 → <><动画/>{children}</>，完成 → children」：
+     根节点类型一变（Fragment → App），React 会把 AppProvider + App + Home 整棵子树
+     卸载再重挂 —— 首屏因此跑两遍（api_feed 两条、8 个 banner 详情各两条、
+     `[net] first content` 两条），在途请求也跨了两个 React 实例。
+     动画只该卸载它自己。 */
+  return (
+    <>
+      {finished ? null : <LaunchAnimation onFinish={finish} />}
+      {mountChildren && children}
+    </>
+  );
 }

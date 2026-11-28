@@ -61,6 +61,29 @@ export const playlist = (url: string) => `${LOCAL}/hls?u=${encodeURIComponent(ur
 /** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它） */
 export const logLine = (msg: string) => invoke("debug_log", { msg }).catch(() => {});
 
+/** 写一行到 **logcat tag `hguox-net`**（3.0.20）：release 包不可调试、拿不到 debug.log，
+ *  真机取证只靠 `adb logcat -s hguox-net`。行格式见 src-tauri/src/netlog.rs。 */
+export const netLog = (msg: string) => invoke("net_log", { msg }).catch(() => {});
+
+/* ── 冷启动首屏请求预算 ───────────────────────────────────
+ * 冷启动头几秒把后端单次请求预算压到 `ms`（默认 4.5s）：被墙的线路尽快露馅，
+ * 交给「换线重试」；真实内容出现后立刻 `releaseBootBudget()` 恢复常规 12 秒，
+ * 免得弱网下的慢请求被误杀。20 秒兜底，任何异常路径都不会一直压着预算。
+ */
+let bootBudgetTimer = 0;
+export function armBootBudget(ms = 4500, capMs = 20_000) {
+  void invoke("net_boot_budget", { ms }).catch(() => {});
+  window.clearTimeout(bootBudgetTimer);
+  bootBudgetTimer = window.setTimeout(releaseBootBudget, capMs);
+}
+export function releaseBootBudget() {
+  if (bootBudgetTimer) {
+    window.clearTimeout(bootBudgetTimer);
+    bootBudgetTimer = 0;
+  }
+  void invoke("net_boot_budget", { ms: 0 }).catch(() => {});
+}
+
 /** 网络类失败的样子：没有 HTTP 状态码，纯链路层（DNS / 连接 / 超时 / TLS） */
 const NET_FAIL = /dns|timed? ?out|timeout|connection|refused|reset|unreachable|broken pipe|tls|ssl|handshake|证书|网络|连接/i;
 /** 只读命令：链路抖动时可以安全重试一次；写操作绝不重试（避免重复提交） */
@@ -69,7 +92,7 @@ const READ_ONLY = new Set([
   "api_posts", "api_blog_posts", "api_post", "api_post_comments", "api_video", "api_play", "api_comments",
   "api_topics", "api_topic", "api_tags", "api_tag_videos", "api_search_hot",
   "api_post_playback", "api_post_categories", "api_post_category", "api_post_tag", "api_related", "api_following", "api_user", "api_user_stats", "api_user_videos",
-  "api_home", "api_hot_tags",
+  "api_home", "api_hot_tags", "api_home_details",
 ]);
 /** 给自动选线用的观察点。api.ts 不反向依赖 autoLine，避免循环 import。 */
 export type NetObserver = (r: { ok: boolean; cmd: string; msg?: string; networkish?: boolean }) => void;
@@ -272,7 +295,10 @@ async function request<T>(cmd: string, args: Record<string, unknown> | undefined
     if (!networkish || !READ_ONLY.has(cmd)) throw new ApiError(failMessage(msg, status), stripNetPrefix(msg), networkish, false);
   }
 
-  const rounds = 2;
+  /* 3.0.20：只换一次线、重试一次。原来是两轮，最坏情况「12s 等满 + 7s 换线 + 重试」
+     叠成 30 秒以上；现在失败一次就换线重试一次，仍失败就交给首屏的 1s/3s/7s 自动重试
+     （见 shared/network/firstScreen.ts），每一轮都有机会落到另一条线路上。 */
+  const rounds = 1;
   for (let round = 0; round < rounds; round += 1) {
     const outcome = await failoverOnce();
     const switched = outcome.switched;
@@ -280,6 +306,7 @@ async function request<T>(cmd: string, args: Record<string, unknown> | undefined
     last.switched = last.switched || switched;
     logLine(`[api] ${cmd} 链路异常，${switched ? `已换线（第 ${round + 1} 轮），立刻重试` : "1.2s 后原地重试一次"}`);
     tracePlayback("api.retry", { cmd, err: last.msg, round, switched });
+    netLog(`[net] retry n=1 delay=${switched ? 0 : 1200}`);
     if (!switched) await new Promise((r) => setTimeout(r, 1200));
     try {
       const value = await once();
@@ -386,8 +413,17 @@ export const api = {
   /** `sort="new"` = 站点「最新上架」（/api/videos?sort=new，实测有效）。
    *  最后一个参数 `force=true` 表示刷新语义（绕过读缓存），下拉刷新/回前台/切 tab 用。 */
   feed: (page = 1, size = 20, sort?: "new", force = false) => call<Paged<VideoCard>>("api_feed", { page, size, sort: sort ?? null }, force),
-  /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。 */
+  /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。
+   *  3.0.20 起**只发一条请求**（`/api/home` 原样返回，不做详情补全）—— 首屏只等它和 feed。 */
   home: (force = false) => call<{ banners: HomeBanner[]; source: string }>("api_home", undefined, force),
+  /** 首页 hero 的文字补全（阶段二）：内容出现后再调，逐条 `/api/videos/{id}`，失败就少一条。
+   *  3.0.20 修：走 `call()` 的在途合并（只读命令），并把 ids 归一化（去重 + 升序）——
+   *  以前是裸 `invoke`，同一批 id 被调用两次就各发一轮（8 个 id → 16 条 api_video），
+   *  api 层的 INFLIGHT 根本看不到它。 */
+  homeDetails: (ids: number[]) =>
+    call<{ items: HomeBannerDetail[] }>("api_home_details", {
+      ids: [...new Set(ids.filter((id) => Number.isFinite(id) && id > 0))].sort((a, b) => a - b),
+    }),
   topics: (force = false) => call<{ items: TopicCard[] }>("api_topics", undefined, force),
   topic: (slug: string, page = 1, size = 20, force = false) => call<TopicDetail>("api_topic", { slug, page, size }, force),
   tags: () => call<{ categories: TagGroup[] }>("api_tags"),
@@ -575,6 +611,17 @@ export type HomeBanner = {
   is_finished: boolean | null;
 };
 
+/** `api_home_details` 的返回（3.0.20，hero 文字补全）。缺的字段照样是 null。 */
+export type HomeBannerDetail = {
+  video_id: number;
+  title: string | null;
+  tags: string[] | null;
+  episode_count: number | null;
+  total_episodes: number | null;
+  is_finished: boolean | null;
+  cover: string | null;
+};
+
 /** 回切主站的探测结果：`probe.ok` 为主站到底通不通 */
 export type LineTryMain = {
   cancelled?: boolean;
@@ -588,6 +635,34 @@ export type LineTryMain = {
 export const hostOf = (url: string) => {
   try { return new URL(url).host; } catch { return url.replace(/^https?:\/\//, "").replace(/\/.*$/, ""); }
 };
+
+/** 首屏重试专用换线（3.0.20）：换到一条**还没试过**的候选线路。
+ *
+ *  和 `failoverOnce()` 的区别：带 `exclude`（这一轮已经失败过的 origin），
+ *  并且 `reason`（dns/tls/reset/timeout）会进 logcat，真机上能一眼对上「为什么换」。
+ *  用户手动选定的线路后端会拒绝切换（`reason: "manual"`），这里如实返回空串。
+ *
+ *  返回换到的 host（空串 = 没换）。 */
+export async function switchLineForRetry(kind: string, tried: string[]): Promise<string> {
+  try {
+    const result = await invoke<{ switched?: boolean; base?: string; reason?: string }>(
+      "line_failover_next",
+      { reason: kind, exclude: [...tried] },
+    );
+    if (!result?.switched || !result.base) {
+      logLine(`[line] 换线未成（${result?.reason ?? "all-down"}，尝试排除 ${tried.length} 条）`);
+      return "";
+    }
+    const host = hostOf(result.base);
+    pendingFailoverHost = host;
+    window.dispatchEvent(new CustomEvent("hg:line-failover", { detail: { host, base: result.base } }));
+    window.dispatchEvent(new Event("hg:line-changed"));
+    return host;
+  } catch (error) {
+    logLine(`[line] 换线失败：${(error as Error)?.message ?? error}`);
+    return "";
+  }
+}
 
 /* ── 自检：验证 webview → 本地协议 → 上游 的取流链路 ───────── */
 export async function selfTest(): Promise<string> {

@@ -134,18 +134,25 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
     return request;
   }, [accountScope, store.lineEpoch]);
-  /* 播放地址永不缓存：force=true 时先丢掉在途/已完成的那条，重新问服务器。
-     CDN token 会过期，"复用上次的地址"就是用户看到 403 / 卡首帧的原因。 */
-  const requestPlay = useCallback((id: number, episode: number, force = false) => {
+  /* 播放地址请求：**同一个 (视频 id, 集, 线路代次) 只允许一次在途请求**。
+     key 里带 accountScope + lineEpoch（线路代次）+ id + ep，所以换线 / 换账号 / 换集都是新 key；
+     预取与播放用同一个 key（同一条流不该问两遍），差别只在 purpose 标签上，便于看日志分清是谁发起的。
+     条目在请求落地后立刻删掉 —— 「播放地址永不缓存」的语义不变，
+     所以 force 只在「重取」时用（403/404 自动重取、代理切换），切集不再 force。 */
+  const requestPlay = useCallback((id: number, episode: number, force = false, purpose: "play" | "prefetch" = "play") => {
     const key = `${accountScope}:${store.lineEpoch}:${id}:${episode}`;
     if (force) playRequests.current.delete(key);
     let request = playRequests.current.get(key);
     if (!request) {
+      logLine(`[play] request id=${id} ep=${episode} by=${purpose}${force ? " force" : ""}`);
       request = api.play(id, episode).finally(() => {
         if (playRequests.current.get(key) === request) playRequests.current.delete(key);
       });
       playRequests.current.set(key, request);
       if (playRequests.current.size > 12) playRequests.current.delete(playRequests.current.keys().next().value!);
+    } else {
+      /* 合并了：预取在途 / 播放重复触发，都只打一次网络。 */
+      logLine(`[play] merge in-flight id=${id} ep=${episode} by=${purpose}`);
     }
     return request;
   }, [accountScope, store.lineEpoch]);
@@ -194,6 +201,10 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 播放地址重取：每个 playKey 只自动重试一次，避免坏源无限循环 */
   const [playBust, setPlayBust] = useState(0);
   const playRetried = useRef<Record<string, boolean>>({});
+  /* 预取刚落地的地址：playKey → { at, url }。**只有预取写这里**，播放自己拿到的地址不写，
+     所以「重进这一集 / 回到前台」仍然重新问一次（原来的语义不变）。
+     用途：切到下一集时直接吃预取那一份，不再问第二次（v3.0.20 修「加载两次」）。 */
+  const prefetchedPlay = useRef<Record<string, { at: number; url: string }>>({});
   const [relatedByVideo, setRelatedByVideo] = useState<Record<string, VideoCard[]>>({});
 
   const playbackClock = useMemo(() => createPlaybackClock(), []);
@@ -398,6 +409,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     progressScope.current = accountScope;
     resumeRef.current = null;
     lastSaveRef.current = 0;
+    prefetchedPlay.current = {};
     liveRef.current = { id: 0, ep: 1, dur: 0, t: 0, permissionKey: "", accountScope };
   }, [accountScope]);
   const mounted = useRef(true);
@@ -568,6 +580,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     /* 旧线路预取的地址（下一集等）不能再用：只留当前这一条，画面不黑等新地址回来替换。 */
     setPlayUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
     setHevcUrls((previous) => (previous[playKey] ? { [playKey]: previous[playKey] } : {}));
+    /* 旧线路的「预取落地」标记一并作废：playKey 不含线路代次，不清的话
+       换线后切集会吃到上一条线路的地址（等于没重取）。 */
+    prefetchedPlay.current = {};
     setHevcFallback({});
     if (!active) return;
     const v = videoRef.current?.el();
@@ -1027,11 +1042,36 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   }, [active, curId, kind, allowed, panel, relatedKey, relatedByVideo]);
 
   /* 拉播放地址：每次进集/回到前台播放都重新问一次（api_play 不缓存，见 api.ts 的 CACHE_TTL）。
-     playBust 由「403/404 自动重取一次」推进。 */
+     playBust 由「403/404 自动重取一次」推进（proxyRetry 是代理切换后重取）。
+     **切集本身不算重取**：下一集的地址上面那条预取 effect 已经问过了，
+     这里再问一次就是用户报的「加载两次 —— 转圈、停顿、又转圈」（v3.0.20 修）。
+     判据按来源分：① 预取刚落地 → 直接用它，不再问；② 预取还在途 → 合并那一次在途请求；
+     ③ 预取没跑到（比如集数到头、失败） → 问一次；④ 403/代理切换 → force 重新问。 */
+  const playRetrigger = useRef({ bust: playBust, proxy: proxyRetry });
+  /* 预取地址的复用窗口：预取是「这一集刚开始播」时发的，短剧一集 1–2 分钟，
+     所以窗口要盖住一集时长；超窗口照旧重新问。token 真过期也不会卡死 ——
+     <video> 报 403/404 时有「每个 playKey 自动重取一次」的兜底（见 onError）。 */
+  const PLAY_PREFETCH_REUSE_MS = 10 * 60_000;
   useEffect(() => {
     if (!active || !curId || !allowed) return;
     let alive = true;
-    requestPlay(curId, curEp, true)
+    const retryRequested = playRetrigger.current.bust !== playBust || playRetrigger.current.proxy !== proxyRetry;
+    playRetrigger.current = { bust: playBust, proxy: proxyRetry };
+    const prefetchedAddr = prefetchedPlay.current[playKey];
+    if (!retryRequested && prefetchedAddr && Date.now() - prefetchedAddr.at < PLAY_PREFETCH_REUSE_MS) {
+      /* 预取已经给过这一集的地址：用它，这一集总共只打一次 api_play。
+         setPlayUrls 用同一个字符串时 React 原样返回，不会多渲染一次。 */
+      delete prefetchedPlay.current[playKey];
+      setPlayUrls((m) => (m[playKey] === prefetchedAddr.url ? m : { ...m, [playKey]: prefetchedAddr.url }));
+      logLine(`[play] reuse prefetch id=${curId} ep=${curEp} age=${Date.now() - prefetchedAddr.at}ms`);
+      tracePlayback("play.resolve", {
+        video_id: curId, episode: curEp, resolved: true, kind: "prefetch-reuse", host: "?",
+        status: null, msg: null,
+      });
+      if (kind === "video") addHistory(curId, curEp);
+      return;
+    }
+    requestPlay(curId, curEp, retryRequested, "play")
       .then((info) => {
         if (!alive || !isCurrentPlayback()) return;
         const streamUrl = info?.streams?.main || info?.video_url;
@@ -1097,13 +1137,15 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (nextEpisode > episodes.length) return;
     const key = `${curId}:${nextEpisode}`;
     if (playUrls[key]) return;
-    requestPlay(curId, nextEpisode)
+    requestPlay(curId, nextEpisode, false, "prefetch")
       .then((info) => {
         if (!alive || !playGuard.current.allowed || playGuard.current.permissionKey !== permissionKey) return;
         const u = info?.streams?.main || info?.video_url;
         const h = info?.streams?.hevc || info?.video_url_hevc || "";
         if (u) {
           setPlayUrls((m) => ({ ...m, [key]: u }));
+          /* 记一笔落地时间：切到这一集时播放这一路直接吃它，不再问第二次。 */
+          prefetchedPlay.current[key] = { at: Date.now(), url: u };
           if ("__TAURI_INTERNALS__" in window) void fetch(playlist(u)).catch(() => {});
         }
         if (h) setHevcUrls((m) => ({ ...m, [key]: h }));
@@ -1137,12 +1179,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           if (mode === "home") onBlocked?.(nextId);
           return;
         }
-        const info = await requestPlay(nextId, 1);
+        const info = await requestPlay(nextId, 1, false, "prefetch");
         if (!stillRelevant()) return;
         const url = info?.streams?.main || info?.video_url;
         const hevc = info?.streams?.hevc || info?.video_url_hevc || "";
         if (url) {
           setPlayUrls(previous => ({ ...previous, [nextKey]: url }));
+          prefetchedPlay.current[nextKey] = { at: Date.now(), url };
           if ("__TAURI_INTERNALS__" in window) void fetch(playlist(url)).catch(() => {});
         }
         if (hevc) setHevcUrls(previous => ({ ...previous, [nextKey]: hevc }));

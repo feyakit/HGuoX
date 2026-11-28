@@ -37,6 +37,9 @@ const AUTO_MIRROR_MAX: usize = 10;
 const MIRROR_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAIN_HEAD_START: Duration = Duration::from_millis(1000);
 const SETTLE_GRACE: Duration = Duration::from_millis(350);
+/// 冷启动「上次成功线路」单独探活的时间预算（3.0.20）。只有 2.5 秒：
+/// 它 24 小时内刚成功过，正常一次握手 1–2 秒；超时就当它挂了走完整流程。
+const LAST_GOOD_PROBE: Duration = Duration::from_millis(2500);
 /// 第一个发布页成功后，再给另一页这么久补齐列表（另一页常常是被污染的，别等它）。
 const MIRROR_GRACE: Duration = Duration::from_millis(2000);
 /// 发布页候选少于这个数就用内置种子补位（种子同样要真探活，不通不入选中）。
@@ -947,7 +950,7 @@ fn pick_from_hits(hits: &[Hit]) -> Value {
     let winner = hits
         .iter()
         .filter(|hit| hit.ok)
-        .min_by_key(|hit| (hit.tier == "custom", hit.tier == "seed", hit.ms));
+        .min_by_key(|hit| (hit.tier == "custom", hit.tier == "seed", hit.tier == "last-good-stale", hit.ms));
     let candidates: Vec<_> = hits.iter().map(Hit::json).collect();
     match winner {
         Some(hit) => json!({ "base": hit.url, "tier": hit.tier, "ms": hit.ms,
@@ -979,50 +982,42 @@ fn custom_candidate(current: &str) -> Option<String> {
 /// Prefer the real main API when it responds promptly; otherwise fetch cached
 /// mirrors concurrently and settle shortly after the first healthy mirror.
 pub async fn auto_pick() -> Value {
-    /* A4：上次真正连通过的线路优先试一次，和主站并行、只给 3.5 秒。
-       被墙的网络里主站必挂，而发布页经常一起挂——旧流程会先白等 12 秒发布页
-       才轮到镜像，用户看到的就是「首页一直转圈」。这条快路只要有一条通就直接用，
-       两条都不通才回到下面完整流程（发布页 + 种子 + 自定义线路）。 */
-    if let Some(good) = crate::line_health::last_good()
-        .filter(|origin| !is_fixed(origin) && !crate::line_health::blacklisted(origin))
-        .filter(|origin| origin != &crate::net::base())
-    {
-        let main = FIXED[0].1.to_string();
-        let good_for_probe = good.clone();
-        let mut set = tokio::task::JoinSet::new();
-        set.spawn(async move { probe_hit_with("main", &main, Duration::from_secs(3)).await });
-        set.spawn(async move {
-            probe_hit_with("mirror", &good_for_probe, Duration::from_secs(3)).await
-        });
-        let mut hits = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
-        loop {
-            let next = tokio::select! {
-                joined = set.join_next() => joined,
-                _ = tokio::time::sleep_until(deadline) => None,
-            };
-            let Some(joined) = next else { break };
-            let Ok(hit) = joined else { continue };
-            let ok = hit.ok;
-            let is_main = hit.tier == "main";
-            hits.push(hit);
-            if ok {
-                /* 主站通了优先用主站；镜像先通就先回镜像（速度优先，之后 try_main 会回切） */
-                set.abort_all();
-                let mut result = pick_from_hits(&hits);
-                result["reason"] = json!(if is_main { "main-ok-fast" } else { "last-good-fast" });
+    /* 3.0.20 冷启动：**上次成功过的线路就是首选**，不再「先撞主域再比一轮」。
+       被墙网络里 5 次冷启动有 4 次靠后面换线才有内容，原因就是这个顺序 ——
+       主域每次都要白等 3~12 秒。现在的顺序：
+         ① base 本来就是 24h 内成功过的那条 → 直接认，零探活；
+         ② 上次成功的不是当前这条 → 只探它（2.5 秒），通了就用，**完全不碰主域**；
+         ③ 它也不通，才进入原来的完整流程（主域 + 发布页镜像 + 种子 + 自定义）。
+       超过 24h 的 last_good 不进 ①②（只在这一轮候选里降级参与），见 load 逻辑。 */
+    let current = crate::net::base();
+    if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
+        let usable_origin = !is_fixed(&last.origin) && !crate::line_health::blacklisted(&last.origin);
+        if usable_origin && last.origin == current {
+            return json!({
+                "base": last.origin, "tier": "last-good", "ms": 0,
+                "reason": "last-good-keep", "candidates": [],
+            });
+        }
+    }
+    let mut carried: Vec<Hit> = Vec::new();
+    if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
+        if last.origin != current
+            && !is_fixed(&last.origin)
+            && !crate::line_health::blacklisted(&last.origin)
+        {
+            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE).await;
+            if hit.ok {
+                let mut result = pick_from_hits(std::slice::from_ref(&hit));
+                result["reason"] = json!("last-good-first");
                 return result;
             }
+            /* 探不通：把这次失败样本带进完整流程（候选明细里能看见它为什么没被选） */
+            carried.push(hit);
         }
-        set.abort_all();
-        /* 两条都快挂：保留失败样本给 pick_from_hits / 日志，继续完整流程 */
-        let main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
-        let mirrors_handle = tokio::spawn(mirrors_cached());
-        return auto_pick_full(main_handle, mirrors_handle, hits).await;
     }
     let main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
     let mirrors_handle = tokio::spawn(mirrors_cached());
-    auto_pick_full(main_handle, mirrors_handle, Vec::new()).await
+    auto_pick_full(main_handle, mirrors_handle, carried).await
 }
 
 async fn auto_pick_full(
@@ -1094,6 +1089,18 @@ async fn auto_pick_full(
             set.spawn(async move { Some(probe_hit("seed", origin).await) });
         }
     }
+    /* 3.0.20：上次成功过但已经超过 24h 的线路 —— 只当普通候选，优先级降到
+       发布页镜像之后（网络环境可能早就变了），但比内置种子可信：它至少真通过一次。 */
+    if let Some(last) = crate::line_health::last_good_info().filter(|last| !last.fresh()) {
+        let known = hits.iter().any(|hit| hit.url == last.origin);
+        if !known
+            && !is_fixed(&last.origin)
+            && !crate::line_health::blacklisted(&last.origin)
+            && last.origin != crate::net::base()
+        {
+            set.spawn(async move { Some(probe_hit("last-good-stale", &last.origin).await) });
+        }
+    }
 
     let mut settle_deadline: Option<tokio::time::Instant> = None;
     loop {
@@ -1152,7 +1159,9 @@ async fn race_candidates(candidates: Vec<(String, &'static str)>, budget: Durati
     (None, hits)
 }
 
-pub async fn failover(exclude: &str) -> Value {
+/// 多排除版本：首屏自动重试时每次要换到「还没试过的」那一条（3.0.20），
+/// 单靠 exclude 当前线路不够 —— 上一轮换到 A 失败了，这一轮得把 A 也排除。
+pub async fn failover_excluding(excludes: &[String]) -> Value {
     /* 4s → 7s：概率性 TLS 阻断下，4 秒常常连一次成功握手都赶不上 */
     const FAILOVER_PROBE: Duration = Duration::from_secs(7);
     const FAILOVER_MAX: usize = 8;
@@ -1160,10 +1169,37 @@ pub async fn failover(exclude: &str) -> Value {
     /* 发布页在后台先抓起来 —— 真机上它常常是唯一还能拿到「当前族」的来源，
        和第一阶段的探活并行，省掉 5~10 秒。 */
     let published = tokio::spawn(async { mirrors().await });
-    let excluded = crate::net::normalize_base(exclude).unwrap_or_default();
-    let mut seen = HashSet::new();
-    seen.insert(excluded);
+    let mut excluded: HashSet<String> = HashSet::new();
+    for raw in excludes {
+        if let Some(origin) = crate::net::normalize_base(raw) {
+            excluded.insert(origin);
+        }
+    }
+    let mut seen = excluded.clone();
     let mut candidates: Vec<(String, &'static str)> = Vec::new();
+    let mut hits: Vec<Hit> = Vec::new();
+
+    /* 3.0.20：24h 内成功过的线路先单独敲一次（2.5 秒）。被墙网络里换线最理想的结果
+       就是「回到上次那条通的」，而它通常一次握手就有答复；打不通再并发探一批，
+       免得一条死线路先把首屏的 7 秒预算吃掉。 */
+    if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
+        if !excluded.contains(&last.origin)
+            && !is_fixed(&last.origin)
+            && !crate::line_health::blacklisted(&last.origin)
+        {
+            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE).await;
+            if hit.ok {
+                hits.push(hit);
+                crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
+                let hit = hits.last().cloned().unwrap_or_else(|| unreachable!());
+                return json!({
+                    "base": hit.url, "tier": "failover", "ms": hit.ms,
+                    "reason": "failover-last-good", "candidates": hits.iter().map(Hit::json).collect::<Vec<_>>(),
+                });
+            }
+            hits.push(hit);
+        }
+    }
 
     let push = |raw: String, tier: &'static str, candidates: &mut Vec<(String, &'static str)>, seen: &mut HashSet<String>| {
         let Some(origin) = crate::net::normalize_base(&raw) else { return };
@@ -1189,7 +1225,8 @@ pub async fn failover(exclude: &str) -> Value {
         push(origin.to_string(), "seed", &mut candidates, &mut seen);
     }
 
-    let (winner, mut hits) = race_candidates(candidates, FAILOVER_PROBE).await;
+    let (winner, raced) = race_candidates(candidates, FAILOVER_PROBE).await;
+    hits.extend(raced);
     if let Some(hit) = winner {
         crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
         return json!({
@@ -1433,6 +1470,20 @@ mod tests {
             status: Some(200),
             error: None,
         }
+    }
+
+    /// 3.0.20：超过 24h 的 last_good 只当普通候选 —— 排在发布页镜像之后（网络可能早变了），
+    /// 但仍比内置种子优先（它至少真通过一次）。
+    #[test]
+    fn stale_last_good_ranks_after_published_mirrors() {
+        let mut stale = hit("https://stale.example", true, 40);
+        stale.tier = "last-good-stale";
+        let picked = pick_from_hits(&[stale.clone(), hit("https://pub.example", true, 900)]);
+        assert_eq!(picked["base"], "https://pub.example");
+        let mut seed = hit("https://seed.example", true, 10);
+        seed.tier = "seed";
+        let picked = pick_from_hits(&[stale, seed]);
+        assert_eq!(picked["base"], "https://stale.example", "过期的 last_good 仍比内置种子优先");
     }
 
     #[test]

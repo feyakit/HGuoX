@@ -152,7 +152,14 @@ export function loadDetail(id: number): Promise<Detail> {
   const hit = cachedDetail(id);
   if (hit) return Promise.resolve(hit);
   const running = inflight.get(id);
-  if (running) return running;
+  /* 复用在途（可能是预取发出的那一条）：它失败时把这条在途记录摘掉再走完整链路，
+     否则一次失败的预取会让用户点进去就看到错误页。 */
+  if (running) {
+    return running.catch(() => {
+      if (inflight.get(id) === running) inflight.delete(id);
+      return loadDetail(id);
+    });
+  }
   const task = slowLaneRace(id, api.video(id))
     .then((data) => remember(id, data))
     .finally(() => { inflight.delete(id); });
@@ -163,6 +170,12 @@ export function loadDetail(id: number): Promise<Detail> {
 /**
  * 预取详情：只取 JSON、不走慢线路重试、失败静默。
  * 并发固定 2，避免把首屏的数据请求挤掉。
+ *
+ * **每个预取请求都登记进 `inflight`**（与 `loadDetail` 同一张表）：
+ * 用户点进去、或者同一批 id 被第二次预取时，直接复用在途那一条，
+ * 不再各发一条 `GET /api/videos/{id}`。不登记的话 api 层的去重也兜不住 ——
+ * 预取走的是 `api.video`，args 相同但两次调用之间有窗口，真机日志里
+ * 「同一部剧的详情 2 条」就是这么来的。
  */
 export function prefetchDetails(ids: number[], limit = PREFETCH_LIMIT): void {
   const queue = [...new Set(ids.filter((id) => Number.isFinite(id) && id > 0))]
@@ -173,11 +186,21 @@ export function prefetchDetails(ids: number[], limit = PREFETCH_LIMIT): void {
   const worker = async () => {
     while (cursor < queue.length) {
       const id = queue[cursor++];
-      try {
-        const data = await api.video(id);
+      /* 另一条 worker / 用户点进去已经把这条拿走了：不再发第二遍 */
+      if (cachedDetail(id) || inflight.has(id)) continue;
+      const task = api.video(id).then((data) => {
         if (data) remember(id, data);
+        return data;
+      });
+      inflight.set(id, task);
+      /* 预取失败一律静默：用户点进去时 loadDetail 会摘掉这条记录再正常请求一次 */
+      void task.catch(() => {});
+      try {
+        await task;
       } catch {
-        /* 预取失败一律静默：用户点进去时还会再正常请求一次 */
+        /* 静默 */
+      } finally {
+        if (inflight.get(id) === task) inflight.delete(id);
       }
     }
   };
