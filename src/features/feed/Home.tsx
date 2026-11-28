@@ -255,8 +255,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     const my = ++seq.current;
     loadedTab.current = key;
     const fetchFeed = (attempt?: { attempt: number; switched: boolean; lastKind: string }) => {
-      /* 3.0.22 首枪预算：第一次尝试只给 1.5 秒（被墙线路一秒半露馅），后续按
-         `firstScreenBudget` 的规则给；静默刷新 / 第 2 页不带（照常 12 秒）。 */
+      /* 3.0.22-b：首屏**不再**自带固定预算（3.0.22 的 1.5s 会把可用线路误杀）。
+         预算归后端 `net::first_connect_ms()`：按实测 RTT 自适应，下限 3s / 上限 6s，
+         生效值打在 logcat（`[net] first budget=3000ms rtt=1462ms`）。 */
       const opts = attempt ? { budgetMs: firstScreenBudget(attempt) } : undefined;
       return key === "new" ? api.feed(p, 21, "new", force, opts) : api.feed(p, 21, undefined, force, opts);
     };

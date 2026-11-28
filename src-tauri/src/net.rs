@@ -1540,12 +1540,72 @@ pub const NETWORK_ERROR_PREFIX: &str = "NET:";
 static BOOT_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 平时（内容出现后）的单次逻辑请求预算。
 const NORMAL_BUDGET_MS: u64 = 12_000;
-/// 3.0.21：「首次连接」（冷启动期、还没成功过的 origin）的预算。
+/// 「首次连接」（冷启动期、还没成功过的 origin）预算的**下限 / 上限**。
 ///
-/// 真机证据（小米九 / Xiaomi_501_5G）：被墙的 huangguoai.com 是 **TLS 级 RST** ——
-/// ClientHello 之后 0.18–0.23s 就断，属于快速失败，不需要像黑洞丢包那样等满 4.5 秒。
-/// 反过来，**已经成功过的 origin 不降超时**（弱网下一条慢请求不该被误杀）。
-const FIRST_CONNECT_MS: u64 = 1_500;
+/// 3.0.21/3.0.22 这里是一个固定值 1.5s（理由是「被墙的 huangguoai.com 是 TLS 级 RST，
+/// 0.2s 就断」）。真机（小米九 / 2026-11-28 / W115）证明这个前提不成立：
+/// 被墙的主域确实快失败，但**唯一能用的线路**在 CloudFront LAX 边缘上跑，
+/// 单请求实测 0.78 / 2.10 / 3.05 秒（同族探活成功那次 1462ms）——
+/// 1.5s 固定预算把能用的线路一起误杀，B 组同一 origin 连出
+/// `ms=1501 err=timeout`、`ms=1501 err=timeout`、`ms=1340 ok`。
+///
+/// 所以改成**按实测 RTT 自适应**：`min(2 × RTT, 上限)`，下限 3s、上限 6s。
+/// 快速失败（refused / TLS RST）本来就在 0.3s 内返回，短预算对它们没意义；
+/// 需要保护的是「慢但能用」的那条线路。
+const FIRST_CONNECT_FLOOR_MS: u64 = 3_000;
+const FIRST_CONNECT_CEIL_MS: u64 = 6_000;
+/// 预算 = RTT × 这个倍数（一次完整的信封请求 ≈ 2 个 RTT 量级，留一点余量）。
+const FIRST_CONNECT_RTT_FACTOR: u64 = 2;
+
+/// 最近观察到的「成功请求耗时」（毫秒，进程内；0 = 还没有样本）。
+///
+/// 只记**成功**的请求：被墙线路的失败耗时（0.09–0.15s 的 refused）会把 RTT 估得虚低。
+/// 更新规则是「移动最大值」：新样本取 max，历史值每次衰减 25% ——
+/// 网络变快时预算能慢慢降回来，不会被历史上的一个慢样本永久钉在 6 秒。
+static OBSERVED_RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 上次打日志时用的生效预算（`u64::MAX` = 还没打过）：只在值变化时写一行，避免刷屏。
+static LOGGED_FIRST_BUDGET_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 记一次成功请求的耗时（`edge_inner` 收口时调用）。
+fn note_observed_rtt(elapsed_ms: u64) {
+    let prev = OBSERVED_RTT_MS.load(Ordering::Relaxed);
+    OBSERVED_RTT_MS.store(moving_max(prev, elapsed_ms), Ordering::Relaxed);
+}
+
+/// 「移动最大值」：新样本与衰减 25% 的历史值取大（纯函数，便于钉住这条策略）。
+fn moving_max(prev: u64, sample: u64) -> u64 {
+    let decayed = prev - prev / 4;
+    sample.max(decayed).min(60_000)
+}
+
+/// 当前观察到的 RTT（毫秒；0 = 还没有成功样本）。真机取证要读它。
+pub fn observed_rtt_ms() -> u64 {
+    OBSERVED_RTT_MS.load(Ordering::Relaxed)
+}
+
+/// 「首次连接」预算的实际生效值（毫秒）：`clamp(2 × RTT, 3s, 6s)`，无样本时取 3s。
+pub fn first_connect_ms() -> u64 {
+    first_connect_for(observed_rtt_ms())
+}
+
+/// RTT → 首屏预算（纯函数，单测钉这条换算）。
+fn first_connect_for(rtt_ms: u64) -> u64 {
+    if rtt_ms == 0 {
+        return FIRST_CONNECT_FLOOR_MS;
+    }
+    rtt_ms
+        .saturating_mul(FIRST_CONNECT_RTT_FACTOR)
+        .clamp(FIRST_CONNECT_FLOOR_MS, FIRST_CONNECT_CEIL_MS)
+}
+
+/// 预算生效值变化时写一行 `[net] first budget=3000ms rtt=1462ms`（3.0.22-b）。
+fn log_first_budget(ms: u64) {
+    if LOGGED_FIRST_BUDGET_MS.swap(ms, Ordering::Relaxed) == ms {
+        return;
+    }
+    crate::netlog::first_budget(ms, observed_rtt_ms());
+}
 
 /// 冷启动首屏预算（毫秒）；传 0 表示恢复常规预算。返回设置后的值。
 pub fn set_boot_budget(ms: u64) -> u64 {
@@ -1557,16 +1617,18 @@ pub fn boot_budget_ms() -> u64 {
     BOOT_BUDGET_MS.load(Ordering::Relaxed)
 }
 
-/// 单个 origin 的预算：冷启动期对「从没成功过」的 origin 压到 1.5s，其余照旧。
+/// 单个 origin 的预算：冷启动期对「从没成功过」的 origin 压到自适应首屏预算，其余照旧。
 pub fn request_budget_for(origin: &str) -> Duration {
     let ms = boot_budget_ms();
     if ms == 0 {
         return Duration::from_millis(NORMAL_BUDGET_MS);
     }
+    let first = first_connect_ms();
     let capped = if crate::line_health::ever_succeeded(origin) {
         ms
     } else {
-        ms.min(FIRST_CONNECT_MS)
+        log_first_budget(first);
+        ms.min(first)
     };
     Duration::from_millis(capped)
 }
@@ -1697,7 +1759,13 @@ async fn edge_inner(
        真机上就能把「这次到底走了哪条路、花了多久」一次看清。 */
     let started = Instant::now();
     let (result, via) = edge_route(origin, method, path, body, token, allow_retry, budget_ms).await;
-    log_net_req(origin, method, path, via, started.elapsed().as_millis(), &result);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    /* 3.0.22-b：用「成功请求的真实耗时」当 RTT 样本，首屏预算按它自适应
+       （见 first_connect_ms）。失败的耗时（被墙线路 0.09–0.15s 的 refused）不能进样本。 */
+    if result.is_ok() {
+        note_observed_rtt(elapsed_ms);
+    }
+    log_net_req(origin, method, path, via, elapsed_ms as u128, &result);
     result
 }
 
@@ -2230,6 +2298,36 @@ async fn fetch_bytes_impl(url: &str, range: Option<&str>) -> Result<RawBytes, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* 3.0.22-b：首屏「首次连接」预算 = clamp(2 × RTT, 3s, 6s)。
+       真机（小米九）可用线路单请求 0.78–3.05s；旧的固定 1.5s 会把它们全部判死
+       （同一 origin 连出 `ms=1501 err=timeout` → `ms=1501 err=timeout` → `ms=1340 ok`）。 */
+    #[test]
+    fn first_connect_budget_follows_rtt_between_floor_and_ceiling() {
+        assert_eq!(first_connect_for(0), 3_000, "还没有成功样本时取下限");
+        assert_eq!(first_connect_for(178), 3_000, "LAX 边缘 178ms 仍取下限 3s");
+        assert_eq!(first_connect_for(1_462), 3_000, "实测探活 1462ms（2×1462 < 3s）→ 仍取下限 3s");
+        assert_eq!(first_connect_for(2_100), 4_200, "2 × RTT 落区间内时按 RTT 走");
+        assert_eq!(first_connect_for(3_050), 6_000, "3.05s 的线路 → 封顶 6s");
+        assert_eq!(first_connect_for(60_000), 6_000, "再慢也不许超过上限");
+    }
+
+    /* 移动最大值：慢样本要留得住，网络变快后要能降回来（历史值每次衰减 25%）。 */
+    #[test]
+    fn observed_rtt_moving_max_decays_towards_faster_samples() {
+        let mut prev = 0u64;
+        prev = moving_max(prev, 1_200);
+        assert_eq!(prev, 1_200);
+        prev = moving_max(prev, 3_000);
+        assert_eq!(prev, 3_000, "更慢的样本直接接管");
+        prev = moving_max(prev, 200);
+        assert_eq!(prev, 2_250, "快样本不会把预算立刻拉低（3s × 0.75）");
+        for _ in 0..12 {
+            prev = moving_max(prev, 200);
+        }
+        assert_eq!(prev, 200, "连续快样本最终收敛到新的真实水平");
+        assert_eq!(moving_max(0, 5_000), 5_000);
+    }
 
     #[test]
     fn media_generation_survives_repeated_refreshes_of_same_configuration() {

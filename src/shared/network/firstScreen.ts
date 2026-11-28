@@ -13,25 +13,19 @@ import { ApiError } from "../api/api";
 /** 三次重试的退避间隔（毫秒），与需求 1s / 3s / 7s 一一对应。 */
 export const FIRST_SCREEN_RETRY_DELAYS: readonly number[] = [1000, 3000, 7000];
 
-/** 首屏首枪的单次请求预算（毫秒，3.0.22）。
+/** 首屏每次尝试该用多短的预算（毫秒）；`undefined` = 由后端决定。
  *
- *  真机（小米九 / 2026-11-28）`[net] req cmd=api_feed origin=huangguoai.com ms=12001 err=timeout`：
- *  首屏第一个请求在主域黑洞上等满 12 秒才失败，而这段时间里候选线路一条都没被试过。
- *  首枪只给 1.5 秒 —— 被墙的线路一秒半就露馅，立刻换候选。 */
-export const FIRST_SCREEN_BUDGET_MS = 1500;
-
-/** 这一次首屏尝试该用多短的预算（毫秒）；`undefined` = 用后端常规 12 秒。
+ *  3.0.22 这里写死过 1500ms，理由是「被墙的线路一秒半就露馅」。真机（小米九 / 2026-11-28 /
+ *  W115）推翻了它：红线是**唯一能用**的线路在 CloudFront LAX 边缘上，单请求实测
+ *  0.78 / 2.10 / 3.05 秒，同一 origin 连出 `ms=1501 err=timeout` → `ms=1501 err=timeout`
+ *  → `ms=1340 ok` —— 1.5s 杀掉的恰恰是能用的那条。
  *
- *  规则（少而可解释）：
- *   * 第一次尝试（首枪）：1.5 秒；
- *   * 之后的尝试：只要「上一次是快速失败形态（refused/reset/tls/dns）」或者「刚换过线路」，
- *     仍然 1.5 秒 —— 换了一条线路还等满 12 秒，等于把整条重试链拖到分钟级；
- *   * 上一次是**纯超时**且没换过线路：`undefined`。那可能只是弱网 / 镜像本身慢，
- *     1.5 秒会把一条其实能用的线路误杀（这是短预算唯一真正的风险）。 */
-export function firstScreenBudget(ctx: { attempt: number; switched: boolean; lastKind: string }): number | undefined {
-  if (ctx.attempt <= 1) return FIRST_SCREEN_BUDGET_MS;
-  if (ctx.lastKind === "timeout" && !ctx.switched) return undefined;
-  return FIRST_SCREEN_BUDGET_MS;
+ *  现在预算归后端：`net::first_connect_ms()` = `clamp(2 × 实测 RTT, 3s, 6s)`，
+ *  生效值写进 logcat（`[net] first budget=3000ms rtt=1462ms`）。前端不再传数字，
+ *  否则前端的小值会把后端的自适应值 `min()` 掉，等于白改。
+ */
+export function firstScreenBudget(_ctx: { attempt: number; switched: boolean; lastKind: string }): number | undefined {
+  return undefined;
 }
 
 export type RetryDeps = {

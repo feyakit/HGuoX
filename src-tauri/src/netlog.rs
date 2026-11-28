@@ -66,17 +66,42 @@ pub fn deny_origin(origin: &str, reason: &str) {
     net(&deny_line(origin, reason));
 }
 
-/// 自动探活预算用尽（3.0.22）：`[net] probe budget exhausted n=8`。
+/// 自动探活预算用尽（3.0.22）：`[net] probe budget exhausted n=10/10`。
 ///
-/// 真机复测就看这一行：出现它说明这一轮冷启动的探测配额已经用光，
-/// 后面的候选**一条都不会再发**（不再有 22–39 条 probe 风暴）。
-pub fn probe_budget_exhausted(used: usize) {
-    net(&format!("[net] probe budget exhausted n={used}"));
+/// 真机复测就看这一行：出现它说明这一轮冷启动的探测配额已经用光，后面的候选
+/// **一条都不会再发**（不再有 22–39 条 probe 风暴）。3.0.22-b 起带上总数，
+/// 一眼能看出上限是多少（旧日志里只有 `n=8`，改过上限之后就没法回溯了）。
+pub fn probe_budget_exhausted(used: usize, total: usize) {
+    net(&format!("[net] probe budget exhausted n={used}/{total}"));
 }
 
 /// 拒绝表命中、**这次根本没发请求**（真机复测就看这行：有它 = 这次没白等）。
 pub fn skip_origin(origin: &str, reason: &str, age_s: u64) {
     net(&skip_line(origin, reason, age_s));
+}
+
+/// 首屏「首次连接」预算的实际生效值（3.0.22-b）：`[net] first budget=3000ms rtt=1462ms`。
+///
+/// 真机复测直接读这一行，不用再猜预算是多少：`rtt=0` 表示这一轮还没有成功样本
+/// （此时取下限 3s）。
+pub fn first_budget(ms: u64, rtt_ms: u64) {
+    net(&format!("[net] first budget={ms}ms rtt={rtt_ms}ms"));
+}
+
+/// 这一轮探测真正发出去了几条：`[net] probe used=6/10`（3.0.22-b）。
+pub fn probe_used(used: usize, total: usize) {
+    net(&format!("[net] probe used={used}/{total}"));
+}
+
+/// 探测候选被「每族上限」砍掉时的汇总行：`[net] probe family=qxeylvrkf.cc keep=2 drop=6`。
+///
+/// 3.0.22 的 8 条预算曾被单一死族（8 个随机子域）一次吃光，可用族一条都没探测到；
+/// 这行就是那次事故的直接指纹。
+pub fn probe_family_capped(family: &str, keep: usize, drop: usize) {
+    net(&format!(
+        "[net] probe family={} keep={keep} drop={drop}",
+        clean(family, "-")
+    ));
 }
 
 fn host_of(origin: &str) -> String {
@@ -88,6 +113,13 @@ fn host_of(origin: &str) -> String {
         .next()
         .unwrap_or(origin)
         .to_string()
+}
+
+/// 主机名部分（`https://thu.x.cc/api/videos` → `thu.x.cc`）。
+///
+/// 线路的「域名族」判定要用它（`lines::family_of`），所以单独开放一个只读入口。
+pub fn host_of_str(origin: &str) -> String {
+    host_of(origin)
 }
 
 pub fn deny_line(origin: &str, reason: &str) -> String {

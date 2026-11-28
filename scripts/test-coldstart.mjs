@@ -195,31 +195,32 @@ try {
   assert.equal(nextCallsAfter, nextCallsBefore, "HTTP 404 不该触发换线重试");
   report.passed.push("边界：HTTP 4xx 不换线、不重试，直接按原文案出错误页");
 
-  /* ── D. 首枪预算（3.0.22 A2）：首屏第一个请求自带 1.5s，后续请求不带 ── */
+  /* ── D. 首屏预算归后端（3.0.22-b）：首屏请求**不再**自带固定预算 ──
+     3.0.22 的固定 1.5s 在真机上把可用线路误杀：同一 origin 连出
+     `ms=1501 err=timeout` → `ms=1501 err=timeout` → `ms=1340 ok`（小米九 / W115）。
+     现在预算由后端 `net::first_connect_ms()` 按实测 RTT 决定（下限 3s / 上限 6s），
+     生效值打在 logcat（`[net] first budget=… rtt=…`）。 */
   await page.goto(`${origin}tests/coldstart.html`);
   await page.waitForFunction(() => window.coldstartFixture?.ready);
   await page.waitForFunction(() => window.coldstartFixture.pendingCount("api_feed") >= 1);
   const firstArgs = await fx(() => window.coldstartFixture.history
     .filter((row) => row.cmd === "api_feed").map((row) => row.args));
   assert.equal(firstArgs.length, 1, `首屏只该发一条 api_feed（实际 ${firstArgs.length} 条：${JSON.stringify(firstArgs)}）`);
-  assert.equal(firstArgs[0].budgetMs, 1500, `首屏第一个请求必须自带 1.5s 预算，实际 ${JSON.stringify(firstArgs[0])}`);
+  assert.equal(firstArgs[0].budgetMs ?? null, null, `首屏请求不该自带固定预算（改由后端按 RTT 自适应），实际 ${JSON.stringify(firstArgs[0])}`);
 
   const budgetPolicy = await fx(() => {
-    const { firstScreenBudget, FIRST_SCREEN_BUDGET_MS } = window.coldstartFixture.retryPolicy;
+    const { firstScreenBudget } = window.coldstartFixture.retryPolicy;
     return {
-      constant: FIRST_SCREEN_BUDGET_MS,
-      first: firstScreenBudget({ attempt: 1, switched: false, lastKind: "" }),
-      afterSwitch: firstScreenBudget({ attempt: 2, switched: true, lastKind: "timeout" }),
+      first: firstScreenBudget({ attempt: 1, switched: false, lastKind: "" }) ?? null,
+      afterSwitch: firstScreenBudget({ attempt: 2, switched: true, lastKind: "timeout" }) ?? null,
       slowNoSwitch: firstScreenBudget({ attempt: 2, switched: false, lastKind: "timeout" }) ?? null,
-      refused: firstScreenBudget({ attempt: 2, switched: false, lastKind: "refused" }),
+      refused: firstScreenBudget({ attempt: 2, switched: false, lastKind: "refused" }) ?? null,
     };
   });
-  assert.equal(budgetPolicy.constant, 1500, "首枪预算常量必须是 1.5s");
-  assert.equal(budgetPolicy.first, 1500, "第一次尝试（首枪）用 1.5s");
-  assert.equal(budgetPolicy.afterSwitch, 1500, "换过线路之后的尝试仍然 1.5s（换条线还等 12s 等于白等）");
-  assert.equal(budgetPolicy.slowNoSwitch, null, "纯超时且没换过线：退回常规预算（保护慢网，别误杀能用的线路）");
-  assert.equal(budgetPolicy.refused, 1500, "快速失败形态（refused）继续用 1.5s");
-  report.passed.push("A2：首屏第一个请求自带 1.5s 预算；换过线仍短预算，纯超时且没换线时退回常规预算（慢网保护）");
+  for (const [name, value] of Object.entries(budgetPolicy)) {
+    assert.equal(value, null, `${name} 应当交给后端决定（undefined），实际 ${value}`);
+  }
+  report.passed.push("A2-b：首屏不再自带 1.5s 固定预算（改由后端按实测 RTT 自适应 3–6s）");
 
   /* 内容出现之后：第 2 页预取不带首屏预算（照常 12s） */
   await fx(() => window.coldstartFixture.resolveFeed(3));
