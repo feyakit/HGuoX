@@ -10,6 +10,13 @@
 //!   2. 同一 origin 会话内失败 2 次后进黑名单，10 分钟 TTL，期间不再优先选它；
 //!   3. 最近一次真正成功的 origin 落盘（下次启动优先用它），黑名单只在内存里 ——
 //!      重启后网络环境可能已经变了，不该带着旧的坏印象启动。
+//!
+//! 3.0.21 补第 4 条（内存黑名单**救不了冷启动**：它随进程重启清零，所以每次开机
+//! 都先撞一遍被墙的 origin）：
+//!   4. 「经过完整协议」的失败（TCP 已接通、TLS 握手被断 —— 真机在
+//!      huangguoai.com:443 上是 ClientHello 后 0.18–0.23s 的 RST）写进**本地拒绝表**
+//!      并落盘，24 小时过期；下次启动**直接跳过**，不再先撞。纯 DNS 污染不写
+//!      （那可能只是临时），成功一次立刻把该 origin 从拒绝表删掉。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -22,6 +29,10 @@ const BLACKLIST_TTL: Duration = Duration::from_secs(10 * 60);
 /// 同一 origin 连续失败多少次判死。
 const FAIL_THRESHOLD: u32 = 2;
 const HEALTH_FILE: &str = "line-health.json";
+/// 本地拒绝表（3.0.21）：**落盘**、24 小时过期。和上面 10 分钟的内存黑名单是两件事：
+/// 黑名单管「这一轮别优先选它」，拒绝表管「重启后别再白等它」。
+const DENY_FILE: &str = "line-deny.json";
+const DENY_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -63,6 +74,14 @@ fn health_path() -> Option<PathBuf> {
 pub fn bind(dir: &Path) {
     if let Ok(mut slot) = DIR.write() {
         *slot = Some(dir.to_path_buf());
+    }
+    /* 换数据目录（测试/切账号）后，拒绝表与成功记录必须重新从盘里读，
+       否则会把上一个目录的记忆带过来。 */
+    if let Ok(mut slot) = DENY.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = SUCCEEDED.write() {
+        *slot = None;
     }
 }
 
@@ -114,6 +133,15 @@ pub fn note_success(origin: &str) {
     with_state(|state| {
         state.remove(origin);
     });
+    /* 成功一次就从拒绝表删掉 + 记进「成功过」集合（冷启动超时压缩要用）。 */
+    clear_deny(origin);
+    if let Ok(mut slot) = SUCCEEDED.write() {
+        if let Some(set) = slot.as_mut() {
+            set.insert(origin.to_string());
+        } else {
+            *slot = Some(std::collections::HashSet::from([origin.to_string()]));
+        }
+    }
     /* 每次成功都写盘没必要（首页一屏十几个请求）：同一 origin 一分钟内只写一次。 */
     let skip = SAVED
         .read()
@@ -167,6 +195,168 @@ pub fn blacklisted(origin: &str) -> bool {
     })
 }
 
+/* ── 本地拒绝表（3.0.21 A 节） ───────────────────────────────
+ *
+ * 真机事实（小米九 / Xiaomi_501_5G，2026-11-25）：huangguoai.com:443 是 **TLS 级 RST**
+ * —— TCP 能连上，ClientHello 之后 0.18–0.23s 被断。每次冷启动都要先吞一个超时、
+ * 再灌几十条探活才切到 .cc 镜像，7 次冷启动里 2 次 35 秒没内容。
+ *
+ * 内存黑名单救不了这件事：它随进程重启清零。所以这里单开一张**落盘**的表，
+ * 只记「TCP 通了、TLS 握手被断」这种经过完整协议的失败（纯 DNS 污染可能是临时的，
+ * 不写表），24 小时过期，命中就直接跳过、连探活都不发。
+ */
+
+/// origin → 判死时刻（unix 秒）。懒加载自 [`DENY_FILE`]。
+static DENY: RwLock<Option<HashMap<String, u64>>> = RwLock::new(None);
+/// 本次进程里真的成功过的 origin。「已经成功过的 origin 不降超时」要用它：
+/// 磁盘上的 last_good 只有一条，而一次冷启动里可能有两条线路先后成功过。
+static SUCCEEDED: RwLock<Option<std::collections::HashSet<String>>> = RwLock::new(None);
+/// 拒绝表文件路径。
+fn deny_path() -> Option<PathBuf> {
+    DIR.read()
+        .ok()
+        .and_then(|dir| dir.as_ref().map(|dir| dir.join(DENY_FILE)))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// 读拒绝表（丢掉过期条目）。文件坏了就当空的：拒绝表是优化，不该拖垮启动。
+fn read_deny_file() -> HashMap<String, u64> {
+    let Some(path) = deny_path() else { return HashMap::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else { return HashMap::new() };
+    let now = now_secs();
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let origin = crate::net::normalize_base(item.get("origin").and_then(Value::as_str)?)?;
+                    let at = item.get("at").and_then(Value::as_u64)?;
+                    /* 时钟回拨（at 比现在还晚）也当成刚判死，别永久钉死一条线路 */
+                    (now.saturating_sub(at) < DENY_TTL_SECS).then_some((origin, at))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn with_deny<R>(f: impl FnOnce(&mut HashMap<String, u64>) -> R) -> R {
+    let mut slot = match DENY.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if slot.is_none() {
+        *slot = Some(read_deny_file());
+    }
+    f(slot.get_or_insert_with(HashMap::new))
+}
+
+fn save_deny() {
+    let Some(path) = deny_path() else { return };
+    let items: Vec<Value> = with_deny(|table| {
+        let now = now_secs();
+        table.retain(|_, at| now.saturating_sub(*at) < DENY_TTL_SECS);
+        table
+            .iter()
+            .map(|(origin, at)| json!({ "origin": origin, "at": at }))
+            .collect()
+    });
+    let body = json!({ "items": items }).to_string();
+    let temp = path.with_extension("json.tmp");
+    let _ = std::fs::write(&temp, body).and_then(|_| std::fs::rename(&temp, path));
+}
+
+/// 拒绝表命中时返回「判死了多久」（秒）；没命中返回 None。
+pub fn blocked_age(origin: &str) -> Option<u64> {
+    let origin = crate::net::normalize_base(origin)?;
+    with_deny(|table| {
+        table.get(&origin).and_then(|at| {
+            let age = now_secs().saturating_sub(*at);
+            (age < DENY_TTL_SECS).then_some(age)
+        })
+    })
+}
+
+pub fn blocked(origin: &str) -> bool {
+    blocked_age(origin).is_some()
+}
+
+/// 写拒绝表 + 落盘 + 打一行 logcat（真机复测就是用这行确认「这次没白等」）。
+pub fn deny(origin: &str, reason: &str) {
+    let Some(origin) = crate::net::normalize_base(origin) else { return };
+    let at = now_secs();
+    let already = with_deny(|table| {
+        let previous = table.insert(origin.clone(), at);
+        previous.is_some()
+    });
+    save_deny();
+    /* 第一次写才打日志：同一条线路每次失败都打会刷屏 */
+    if !already {
+        crate::netlog::deny_origin(&origin, reason);
+    }
+}
+
+/// 成功一次就把该 origin 从拒绝表删掉：拒绝表只是「别先撞」的优化，
+/// 一旦证明它是通的，必须立刻恢复它（否则会白丢一条可用线路整整 24 小时）。
+fn clear_deny(origin: &str) {
+    let Some(origin) = crate::net::normalize_base(origin) else { return };
+    let removed = with_deny(|table| table.remove(&origin).is_some());
+    if removed {
+        save_deny();
+    }
+}
+
+/// 这个 origin 有没有成功过（本次进程 / 磁盘上的 last_good）。
+/// 冷启动把首枪预算压到 1.5s 时，**只压没成功过的**（成功过的不降超时）。
+pub fn ever_succeeded(origin: &str) -> bool {
+    let Some(origin) = crate::net::normalize_base(origin) else { return false };
+    let session = SUCCEEDED
+        .read()
+        .ok()
+        .and_then(|set| set.as_ref().map(|set| set.contains(&origin)))
+        .unwrap_or(false);
+    session || last_good().as_deref().is_some_and(|last| last == origin)
+}
+
+/// 「经过完整协议」的失败：TCP 已接通、TLS 握手被断。
+///
+/// 纯 DNS 污染、连接超时、连接被拒都**不算** —— 它们可能只是临时抖动（尤其 DNS
+/// 在移动网络里一分钟能变三次），拿它们写 24 小时的拒绝表会把线路白丢一天。
+pub fn complete_protocol_failure(message: &str) -> bool {
+    match fault_kind(message) {
+        Some("tls") => true,
+        /* SendRequest 阶段的 reset 说明 TCP 已经通了（握手之后才断）；
+           Connect 阶段的 reset / 纯 timeout 不算 */
+        Some("reset") => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("sendrequest")
+                || lower.contains("before message completed")
+                || lower.contains("handshake")
+        }
+        _ => false,
+    }
+}
+
+/// 失败样本收口：内存黑名单 + 拒绝表，一处判定。
+///
+/// 调用方（`net.rs` 的 `edge_inner`）已经拿到 `fault_kind` 的结论；这里再加一层
+/// 「是不是完整协议失败」的判断，决定要不要写拒绝表。
+pub fn note_transport_failure(origin: &str, message: &str) -> Option<&'static str> {
+    let kind = note_failure(origin, message)?;
+    if complete_protocol_failure(message) {
+        deny(origin, kind);
+    }
+    Some(kind)
+}
+
 fn save_last_good(origin: &str) {
     let Some(path) = health_path() else { return };
     let saved_at = SystemTime::now()
@@ -217,7 +407,14 @@ pub fn last_good() -> Option<String> {
     last_good_info().map(|last| last.origin)
 }
 
-/// 诊断/日志快照：黑名单与失败计数（不含任何凭据或请求内容）。
+/// 测试用全局互斥：`bind()` 改的是进程级状态，多线程跑用例时必须串行。
+#[cfg(test)]
+pub fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 诊断/日志快照：黑名单 + 本地拒绝表与失败计数（不含任何凭据或请求内容）。
 pub fn snapshot() -> Value {
     let now = Instant::now();
     let blocked = with_state(|state| {
@@ -233,7 +430,13 @@ pub fn snapshot() -> Value {
             })
             .collect::<Vec<_>>()
     });
-    json!({ "blacklist": blocked, "last_good": last_good(), "last_good_age_s": last_good_info().map(|last| last.age.as_secs()) })
+    let denied = with_deny(|table| {
+        table
+            .iter()
+            .map(|(origin, at)| json!({ "origin": origin, "age_s": now_secs().saturating_sub(*at) }))
+            .collect::<Vec<_>>()
+    });
+    json!({ "blacklist": blocked, "deny": denied, "last_good": last_good(), "last_good_age_s": last_good_info().map(|last| last.age.as_secs()) })
 }
 
 #[cfg(test)]
@@ -274,6 +477,8 @@ mod tests {
 
     #[test]
     fn two_failures_blacklist_and_success_clears() {
+        /* note_success 会落盘 last_good，必须和别的「用临时目录」的用例串行 */
+        let _guard = disk_guard();
         let origin = "https://bl.example";
         assert!(!blacklisted(origin));
         note_failure(origin, "tls handshake eof");
@@ -293,15 +498,110 @@ mod tests {
 
     #[test]
     fn penalize_blocks_immediately() {
+        let _guard = disk_guard();
         let origin = "https://pen.example";
         penalize(origin);
         assert!(blacklisted(origin));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hguox-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `bind()` 改的是进程级全局目录，而 cargo test 默认多线程跑 ——
+    /// 所有碰线路健康状态的用例必须串行，否则会互相把对方的数据目录换掉。
+    fn disk_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::test_state_lock()
+    }
+
+    /// 3.0.21 A1：只有「TCP 通了、TLS 握手被断」才写拒绝表；
+    /// 纯 DNS 污染 / 连接超时 / 连接被拒都不写（那可能只是临时）。
+    #[test]
+    fn only_complete_protocol_failures_enter_the_deny_table() {
+        for message in [
+            "error sending request ← client error (SendRequest) ← tls handshake eof",
+            "tls handshake eof",
+            "error sending request for url (https://x/) ← client error (SendRequest) ← connection closed before message completed",
+        ] {
+            assert!(complete_protocol_failure(message), "应当写拒绝表：{message}");
+        }
+        for message in [
+            "error sending request ← client error (Connect) ← dns error",
+            "DNS 解析失败",
+            "error sending request ← client error (Connect) ← tcp connect error ← deadline has elapsed",
+            "connection refused",
+            "请求超时",
+            "HTTP 403: forbidden",
+            "connection reset by peer (os error 104)",
+            "",
+        ] {
+            assert!(!complete_protocol_failure(message), "不该写拒绝表：{message}");
+        }
+    }
+
+    #[test]
+    fn deny_table_persists_for_24h_and_is_cleared_by_a_success() {
+        let _guard = disk_guard();
+        let dir = temp_dir("deny");
+        bind(&dir);
+        let origin = "https://huangguoai.com";
+
+        assert!(!blocked(origin), "空表：不该命中");
+        note_transport_failure(origin, "error sending request ← client error (SendRequest) ← tls handshake eof");
+        assert!(blocked(origin), "TLS 被断一次就该写进拒绝表");
+        assert_eq!(blocked_age(origin), Some(0), "刚判死，年龄 0 秒");
+
+        /* 落盘：换目录再 bind 回来，等于「重启进程」 */
+        let text = std::fs::read_to_string(dir.join(DENY_FILE)).expect("拒绝表要落盘");
+        assert!(text.contains("huangguoai.com"), "{text}");
+        bind(&dir);
+        assert!(blocked(origin), "重启后仍然命中（这一条就是 3.0.21 要的「下次启动直接跳过」）");
+
+        /* 超过 24h 的条目读回来就丢掉 */
+        let stale_at = now_secs().saturating_sub(DENY_TTL_SECS + 60);
+        std::fs::write(
+            dir.join(DENY_FILE),
+            json!({ "items": [{ "origin": origin, "at": stale_at }] }).to_string(),
+        )
+        .unwrap();
+        bind(&dir);
+        assert!(!blocked(origin), "过了 24 小时就不再跳过（网络可能已经变了）");
+
+        /* 成功一次立刻解除：拒绝表只是「别先撞」，不是永久判决 */
+        note_transport_failure(origin, "tls handshake eof");
+        assert!(blocked(origin));
+        note_success(origin);
+        assert!(!blocked(origin), "成功一次必须把拒绝表里的这条删掉");
+        assert!(ever_succeeded(origin), "成功过的 origin 进「成功过」集合（不降超时）");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DNS 污染只进内存黑名单，不写 24 小时的拒绝表。
+    #[test]
+    fn dns_pollution_never_enters_the_deny_table() {
+        let _guard = disk_guard();
+        let dir = temp_dir("deny-dns");
+        bind(&dir);
+        let origin = "https://pku.example.cc";
+        note_transport_failure(origin, "error sending request ← client error (Connect) ← dns error");
+        assert!(!blocked(origin), "DNS 污染可能只是临时，不能写 24 小时拒绝表");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 3.0.20：冷启动只在 last_good「24h 内成功过」时才跳过探活；
     /// 超过一天就只当普通候选（`fresh()` 为假）。
     #[test]
     fn last_good_recency_decides_the_boot_fast_path() {
+        let _guard = disk_guard();
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(

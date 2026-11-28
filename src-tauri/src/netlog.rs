@@ -61,6 +61,39 @@ pub fn switched(host: &str, reason: &str) {
     net(&format!("[net] switch line={} reason={}", clean(host, "-"), clean(reason, "-")));
 }
 
+/// 被墙 origin 写进拒绝表（3.0.21 A 节）。
+pub fn deny_origin(origin: &str, reason: &str) {
+    net(&deny_line(origin, reason));
+}
+
+/// 拒绝表命中、**这次根本没发请求**（真机复测就看这行：有它 = 这次没白等）。
+pub fn skip_origin(origin: &str, reason: &str, age_s: u64) {
+    net(&skip_line(origin, reason, age_s));
+}
+
+fn host_of(origin: &str) -> String {
+    origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split('/')
+        .next()
+        .unwrap_or(origin)
+        .to_string()
+}
+
+pub fn deny_line(origin: &str, reason: &str) -> String {
+    format!("[net] deny origin={} reason={} ttl=24h", clean(&host_of(origin), "-"), clean(reason, "-"))
+}
+
+pub fn skip_line(origin: &str, reason: &str, age_s: u64) -> String {
+    format!(
+        "[net] skip origin={} reason={} age={age_s}s",
+        clean(&host_of(origin), "-"),
+        clean(reason, "-")
+    )
+}
+
 /// 只认 ASCII 可见字符：logcat 行不能被空格/换行/控制字符拆开。
 fn clean(value: &str, fallback: &str) -> String {
     let mut out = String::with_capacity(value.len());

@@ -1537,6 +1537,12 @@ pub const NETWORK_ERROR_PREFIX: &str = "NET:";
 static BOOT_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 平时（内容出现后）的单次逻辑请求预算。
 const NORMAL_BUDGET_MS: u64 = 12_000;
+/// 3.0.21：「首次连接」（冷启动期、还没成功过的 origin）的预算。
+///
+/// 真机证据（小米九 / Xiaomi_501_5G）：被墙的 huangguoai.com 是 **TLS 级 RST** ——
+/// ClientHello 之后 0.18–0.23s 就断，属于快速失败，不需要像黑洞丢包那样等满 4.5 秒。
+/// 反过来，**已经成功过的 origin 不降超时**（弱网下一条慢请求不该被误杀）。
+const FIRST_CONNECT_MS: u64 = 1_500;
 
 /// 冷启动首屏预算（毫秒）；传 0 表示恢复常规预算。返回设置后的值。
 pub fn set_boot_budget(ms: u64) -> u64 {
@@ -1548,9 +1554,18 @@ pub fn boot_budget_ms() -> u64 {
     BOOT_BUDGET_MS.load(Ordering::Relaxed)
 }
 
-fn request_budget() -> Duration {
+/// 单个 origin 的预算：冷启动期对「从没成功过」的 origin 压到 1.5s，其余照旧。
+pub fn request_budget_for(origin: &str) -> Duration {
     let ms = boot_budget_ms();
-    Duration::from_millis(if ms == 0 { NORMAL_BUDGET_MS } else { ms })
+    if ms == 0 {
+        return Duration::from_millis(NORMAL_BUDGET_MS);
+    }
+    let capped = if crate::line_health::ever_succeeded(origin) {
+        ms
+    } else {
+        ms.min(FIRST_CONNECT_MS)
+    };
+    Duration::from_millis(capped)
 }
 
 /// 日志里的 `cmd=`：与前端 invoke 的命令名对齐（真机取证时要能一眼对上代码）。
@@ -1737,7 +1752,7 @@ async fn edge_route(
     /* 总预算（3.0.14 真机）：被墙的 IP 常常是「黑洞丢包」而不是 RST —— 一次尝试会一直
        挂到客户端的 20 秒超时，3 次重试就是 60 秒，首页 50 秒还在转圈。
        这里给整个逻辑请求封顶，超时按链路层失败返回，让前端立刻换线重试。 */
-    let budget = request_budget();
+    let budget = request_budget_for(&cur);
     let value = match tokio::time::timeout(budget, with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
@@ -1825,7 +1840,10 @@ async fn edge_route(
     .await
     {
         Ok(value) => value,
-        Err(_) => Err(format!("deadline has elapsed（请求总时长超过 {} 秒）", budget.as_secs())),
+        Err(_) => Err(format!(
+            "deadline has elapsed（请求总时长超过 {} 毫秒）",
+            budget.as_millis()
+        )),
     };
 
     /* 线路健康（3.0.14 A 节）：只有链路层硬错误才计数/进黑名单；HTTP 与业务错误不算。
@@ -1842,7 +1860,7 @@ async fn edge_route(
             crate::playback_log::record("api.envelope_disabled", json!({ "operation": operation }));
             return (direct_rest(&cur, method, path, body.as_ref(), token.as_deref()).await, "direct");
         }
-        Err(error) => match crate::line_health::note_failure(&cur, &error) {
+        Err(error) => match crate::line_health::note_transport_failure(&cur, &error) {
             Some(kind) => {
                 crate::playback_log::record(
                     "line.fault",
