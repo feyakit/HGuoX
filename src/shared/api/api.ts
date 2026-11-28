@@ -92,7 +92,7 @@ const READ_ONLY = new Set([
   "api_posts", "api_blog_posts", "api_post", "api_post_comments", "api_video", "api_play", "api_comments",
   "api_topics", "api_topic", "api_tags", "api_tag_videos", "api_search_hot",
   "api_post_playback", "api_post_categories", "api_post_category", "api_post_tag", "api_related", "api_following", "api_user", "api_user_stats", "api_user_videos",
-  "api_home", "api_hot_tags",
+  "api_home", "api_hot_tags", "api_home_details",
 ]);
 /** 给自动选线用的观察点。api.ts 不反向依赖 autoLine，避免循环 import。 */
 export type NetObserver = (r: { ok: boolean; cmd: string; msg?: string; networkish?: boolean }) => void;
@@ -416,8 +416,14 @@ export const api = {
   /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。
    *  3.0.20 起**只发一条请求**（`/api/home` 原样返回，不做详情补全）—— 首屏只等它和 feed。 */
   home: (force = false) => call<{ banners: HomeBanner[]; source: string }>("api_home", undefined, force),
-  /** 首页 hero 的文字补全（阶段二）：内容出现后再调，逐条 `/api/videos/{id}`，失败就少一条。 */
-  homeDetails: (ids: number[]) => invoke<{ items: HomeBannerDetail[] }>("api_home_details", { ids }),
+  /** 首页 hero 的文字补全（阶段二）：内容出现后再调，逐条 `/api/videos/{id}`，失败就少一条。
+   *  3.0.20 修：走 `call()` 的在途合并（只读命令），并把 ids 归一化（去重 + 升序）——
+   *  以前是裸 `invoke`，同一批 id 被调用两次就各发一轮（8 个 id → 16 条 api_video），
+   *  api 层的 INFLIGHT 根本看不到它。 */
+  homeDetails: (ids: number[]) =>
+    call<{ items: HomeBannerDetail[] }>("api_home_details", {
+      ids: [...new Set(ids.filter((id) => Number.isFinite(id) && id > 0))].sort((a, b) => a - b),
+    }),
   topics: (force = false) => call<{ items: TopicCard[] }>("api_topics", undefined, force),
   topic: (slug: string, page = 1, size = 20, force = false) => call<TopicDetail>("api_topic", { slug, page, size }, force),
   tags: () => call<{ categories: TagGroup[] }>("api_tags"),
