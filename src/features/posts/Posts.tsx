@@ -73,6 +73,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
   const [sort, setSort] = useState<SortKey>("latest");
   const [cate, setCate] = useState<BlogCateKey>("");
   const [commentTarget, setCommentTarget] = useState<{ id: number; total: number } | null>(null);
+  /* 3.0.21 E：评论面板回传的真实总数（以前 onTotalChange 没人传 = 死代码）。 */
+  const [commentTotals, setCommentTotals] = useState<Record<number, number>>({});
   const [likeDelta, setLikeDelta] = useState<Record<number, number>>({});
   const [items, setItems] = useState<Post[]>([]);
   const [extra, setExtra] = useState<Record<number, PostExtra>>({});
@@ -262,6 +264,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
     const liked = isLiked(p.id, undefined, "post");
     const likeBusy = actionPending(`like:post:${p.id}:0`);
     const likeCount = Math.max(0, (info?.like ?? 0) + (likeDelta[p.id] ?? 0));
+    /* 面板回传过的真实评论数优先（3.0.21 E） */
+    const postComments = commentTotals[p.id] ?? info?.comment ?? 0;
     return (
       <div className="hg-tl-foot">
         <button type="button" className="hg-tl-author"
@@ -290,8 +294,8 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
             <span className="hg-post-heart">{liked ? "♥" : "♡"}</span>{fmt(likeCount)}
           </button>
           <button type="button" className="hg-post-stat" aria-label="查看评论"
-            onClick={(e) => { e.stopPropagation(); setCommentTarget({ id: p.id, total: info?.comment ?? 0 }); }}>
-            <IComment size={14} />{fmt(info?.comment ?? 0)}
+            onClick={(e) => { e.stopPropagation(); setCommentTarget({ id: p.id, total: postComments }); }}>
+            <IComment size={14} />{fmt(postComments)}
           </button>
           <button type="button" className="hg-post-stat" aria-label="分享帖子"
             onClick={(e) => {
@@ -474,7 +478,9 @@ export function PostsPage({ onBack, embedded = false, active = true }: { onBack?
       <Sheet open={!!commentTarget} onClose={() => setCommentTarget(null)}>
         {commentTarget && (
           <div className="flex flex-col" style={{ height: "72dvh" }}>
-            <CommentsPanel videoId={commentTarget.id} ep={0} total={commentTarget.total} kind="post" onClose={() => setCommentTarget(null)} />
+            <CommentsPanel videoId={commentTarget.id} ep={0} total={commentTarget.total} kind="post"
+              onTotalChange={(n) => setCommentTotals(prev => (prev[commentTarget.id] === n ? prev : { ...prev, [commentTarget.id]: n }))}
+              onClose={() => setCommentTarget(null)} />
           </div>
         )}
       </Sheet>
@@ -497,6 +503,9 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
   const [tagMenu, setTagMenu] = useState(false);
   const [commentOpen, setCommentOpen] = useState(false);
   const [likeDelta, setLikeDelta] = useState(0);
+  /* 3.0.21 E：评论面板回传的真实总数（打开面板后头部的评论数跟着更新）。 */
+  const [commentLive, setCommentLive] = useState<number | null>(null);
+  useEffect(() => { setCommentLive(null); }, [id]);
   useEffect(() => { if (!active) { setTagMenu(false); setCommentOpen(false); } }, [active]);
   const currentPost = loadedId === id ? post : null;
   const blocked = filtering && currentPost ? blockReason(currentPost.tags) : null;
@@ -746,9 +755,9 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
             <Button card className="hg-post-detail-btn" aria-label="查看评论"
               onClick={() => setCommentOpen(true)}>
               <IComment size={16} />
-              <span>评论{(() => {
-                const n = Number(currentPost.counts?.comment) || Number(currentPost.comment_count) || 0;
-                return n > 0 ? ` ${fmt(n)}` : "";
+              <span>{(() => {
+                const n = commentLive ?? (Number(currentPost.counts?.comment) || Number(currentPost.comment_count) || 0);
+                return n > 0 ? `评论 ${fmt(n)}` : "评论";
               })()}</span>
             </Button>
           </div>
@@ -758,8 +767,8 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
       <Sheet open={active && commentOpen} onClose={() => setCommentOpen(false)}>
         <div className="flex flex-col" style={{ height: "72dvh" }}>
           <CommentsPanel videoId={id} ep={0}
-            total={Number(currentPost?.counts?.comment) || Number(currentPost?.comment_count) || 0}
-            kind="post" onClose={() => setCommentOpen(false)} />
+            total={commentLive ?? (Number(currentPost?.counts?.comment) || Number(currentPost?.comment_count) || 0)}
+            kind="post" onTotalChange={setCommentLive} onClose={() => setCommentOpen(false)} />
         </div>
       </Sheet>
       <TagBlockMenu open={tagMenu && active} tags={currentPost?.tags || []} onClose={() => setTagMenu(false)} />
