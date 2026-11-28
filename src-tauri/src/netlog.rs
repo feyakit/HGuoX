@@ -66,6 +66,14 @@ pub fn deny_origin(origin: &str, reason: &str) {
     net(&deny_line(origin, reason));
 }
 
+/// 自动探活预算用尽（3.0.22）：`[net] probe budget exhausted n=8`。
+///
+/// 真机复测就看这一行：出现它说明这一轮冷启动的探测配额已经用光，
+/// 后面的候选**一条都不会再发**（不再有 22–39 条 probe 风暴）。
+pub fn probe_budget_exhausted(used: usize) {
+    net(&format!("[net] probe budget exhausted n={used}"));
+}
+
 /// 拒绝表命中、**这次根本没发请求**（真机复测就看这行：有它 = 这次没白等）。
 pub fn skip_origin(origin: &str, reason: &str, age_s: u64) {
     net(&skip_line(origin, reason, age_s));
