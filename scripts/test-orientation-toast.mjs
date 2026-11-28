@@ -31,7 +31,7 @@ const UA = {
   ios: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
 };
 
-const HINT_IOS = "已保持竖屏（系统方向锁定已开启）。如需横屏，请在控制中心关闭「竖排方向锁定」";
+const HINT_IOS = "已保持竖屏（系统竖排方向锁定已开启）。需要横屏请在控制中心关闭「竖排方向锁定」";
 const HINT_ANDROID = "系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）";
 const OLD_HINT = "系统未允许锁定屏幕方向：转动手机可能会横屏";
 

@@ -64,7 +64,7 @@ export type OrientationMode = "portrait" | "landscape" | "unspecified";
 let orientationHintShown = false;
 /* iOS：转不过去基本都是用户在控制中心开了「竖排方向锁定」，此时 App 没错、系统也没错 ——
    要告诉他去关哪个开关，而不是报「系统未允许」。 */
-const ORIENTATION_HINT_IOS = "已保持竖屏（系统方向锁定已开启）。如需横屏，请在控制中心关闭「竖排方向锁定」";
+const ORIENTATION_HINT_IOS = "已保持竖屏（系统竖排方向锁定已开启）。需要横屏请在控制中心关闭「竖排方向锁定」";
 /* 安卓：真能锁，失败就是没被允许（多为系统关掉了自动旋转）。文案沿用 3.0.20，不新增概念。 */
 const ORIENTATION_HINT_ANDROID = "系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）";
 
