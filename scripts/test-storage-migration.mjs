@@ -16,6 +16,9 @@ const state = {
 const oldData = {
   hghub_app_v1: JSON.stringify(state), hghub_swipe_ep_v2: "1",
 };
+/* 旧数据里没有这三项，但 store 的 DEFAULTS（src/shared/model/store.tsx:108-109）会在落盘时补齐，
+   所以「迁移后的完整形状」必须带上它们。仍然是整体 deepEqual，断言强度不变。 */
+const MIGRATED_DEFAULTS = { ambientGlow: true, balanceVolume: false, startupTab: "home" };
 let vite, browser;
 const errors = [];
 try {
@@ -73,7 +76,7 @@ try {
     assert.deepEqual(await snapshot(page), { ...state });
     const saved = await storage(page);
     assert.deepEqual(Object.keys(saved).sort(), ["hguox_app_v1", "hguox_swipe_ep_v2"]);
-    assert.deepEqual(JSON.parse(saved.hguox_app_v1), { ...state, postFavs: [] });
+    assert.deepEqual(JSON.parse(saved.hguox_app_v1), { ...state, ...MIGRATED_DEFAULTS, postFavs: [] });
     await page.evaluate(() => window.storageMigrationFixture.clearHistory());
     await page.waitForFunction(() => JSON.parse(localStorage.getItem("hguox_app_v1")).history.length === 0);
     await page.reload();

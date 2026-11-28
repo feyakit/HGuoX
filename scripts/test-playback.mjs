@@ -145,65 +145,90 @@ async function speedMenuKeyboardChecks(page, paused) {
   await page.keyboard.press("Enter");
   await assertSelection(1);
 }
-// 契约以 EpisodePlayer.tsx:1396-1401 的注释为准：
-//   · 单击两态：控件收起 → 唤出；控件可见 → 播放/暂停（单击不再"收起控件"）
-//   · 双击（280ms 内第二下）三分法：左 1/3 退 5s、中 1/3 播放/暂停、右 1/3 进 5s
+// 契约以 EpisodePlayer.tsx 的 onUp 注释为准（v3.0.13 第三轮，用户拍定 A 方案）：
+//   · 单击：只唤出/收起控件，不再播放/暂停（暂停中/面板打开时只「亮出」不收起）
+//   · 双击（280ms 内第二下，位移 <6px）：播放/暂停一次，控件保持可见
+//   · 双击不再按左右 1/3 seek（三分法整段删除）；seek 只走进度条与横滑 scrub
+//   · 长按 = 2x（见 test:gesture-map）
 async function gestureChecks(page) {
   await loadPlayer(page);
   const video = page.locator("video");
-  const clean = () => page.locator(".player-root").getAttribute("data-clean");
   const playing = () => video.evaluate(v => !v.paused);
-  const tapAt = (fx, fy = 0.5) => page.evaluate(([fx, fy]) => {
-    const surface = document.querySelector("video").parentElement.parentElement;
-    const bounds = surface.getBoundingClientRect();
-    const clientX = bounds.x + bounds.width * fx;
-    const clientY = bounds.y + bounds.height * fy;
-    for (const type of ["pointerdown", "pointerup"]) surface.dispatchEvent(new PointerEvent(type, {
-      bubbles: true, pointerId: 91, pointerType: "touch", button: 0, clientX, clientY,
-    }));
-  }, [fx, fy]);
+  /* 手势层在 [data-mobile-hold-target]（EpisodePlayer 的舞台层）上，事件必须派发给它 ——
+     之前钉在 video.parentElement.parentElement 上，指针序列到不了手势层，点什么都无效。 */
+  const stageBox = async () => {
+    const box = await page.locator(".player-root [data-mobile-hold-target]").first().boundingBox();
+    assert(box, "播放器手势层缺失");
+    return box;
+  };
+  const fireTap = async (fx, fy) => {
+    const box = await stageBox();
+    const x = box.x + box.width * fx;
+    const y = box.y + box.height * fy;
+    await page.evaluate(([x, y]) => {
+      const stage = document.querySelector(".player-root [data-mobile-hold-target]");
+      for (const type of ["pointerdown", "pointerup"]) stage.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, pointerId: 91, pointerType: "touch", isPrimary: true,
+        button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y,
+      }));
+    }, [x, y]);
+    await page.waitForTimeout(340);   // 等过 doubleTapMs=280 的单击判定窗口
+  };
+  /* 单击切的是控件胶囊那一排（.hg-seg 在 DOM 里 ⇄ 不在） */
+  const chrome = () => page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length > 0);
 
-  // 1) 控件可见时单击 = 播放/暂停，且不得收起控件
-  assert.equal(await clean(), "false", "Player must start with controls visible");
-  assert(await playing(), "Fixture must start playing");
-  await tapAt(0.5);
-  await page.waitForFunction(() => document.querySelector("video").paused);
-  assert.equal(await clean(), "false", "Tap with controls visible toggles playback and must not hide chrome");
+  // 1) 单击 = 只切换控件可见性，播放状态不变（v3.0.13 第三轮，用户拍定 A 方案）
+  const chromeAtStart = await chrome();
+  const playingAtStart = await playing();
+  await fireTap(0.5, 0.5);
+  assert.notEqual(await chrome(), chromeAtStart, "单击必须把控件 显示↔隐藏 翻过去");
+  assert.equal(await playing(), playingAtStart, "单击不允许再暂停/恢复播放");
 
-  // 2) 控件收起时单击 = 唤出，且要早于双击等待窗口（跟手）
-  await tapAt(0.5);
-  await page.waitForFunction(() => !document.querySelector("video").paused);
-  await page.waitForFunction(() => document.querySelector(".player-root")?.dataset.clean === "true");
-  const start = Date.now();
-  await tapAt(0.5);
-  await page.waitForFunction(() => document.querySelector(".player-root")?.dataset.clean === "false");
-  const singleTapMs = Date.now() - start;
-  assert(singleTapMs < 230, "Waking the controls must land before the double-tap window");
+  // 2) 再单击一次 = 控件翻回原状态，播放状态仍不变
+  await fireTap(0.5, 0.5);
+  assert.equal(await chrome(), chromeAtStart, "第二次单击要把控件翻回原状态");
+  assert.equal(await playing(), playingAtStart, "第二次单击同样不许动播放状态");
 
-  // 3) 中区双击 = 一次播放/暂停，且不收起控件
-  await page.waitForTimeout(320);
-  const playingBefore = await playing();          // true = 双击前正在播
-  await tapAt(0.5);                               // 真实双击间隔约 100–250ms，不要塞在同一毫秒
-  await page.waitForTimeout(120);
-  await tapAt(0.5);
-  await page.waitForFunction(state => document.querySelector("video").paused === state, playingBefore);
-  assert.equal(await clean(), "false", "Mid-zone double tap must not hide chrome");
+  // 3) 中区双击（280ms 内第二下）= 恰好一次播放/暂停切换，控件保持可见
+  const playingBeforeDouble = await playing();
+  await page.evaluate(() => {
+    const stage = document.querySelector(".player-root [data-mobile-hold-target]");
+    const box = stage.getBoundingClientRect();
+    const fire = () => ["pointerdown", "pointerup"].forEach((type, index) => stage.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 92, pointerType: "touch", isPrimary: true,
+      button: 0, buttons: index ? 0 : 1, clientX: box.x + box.width / 2, clientY: box.y + box.height / 2,
+    })));
+    fire();
+    setTimeout(fire, 110);
+  });
+  await page.waitForFunction(state => document.querySelector("video").paused === state, !playingBeforeDouble);
+  assert.equal(await chrome(), true, "双击之后控件必须保持可见（不自动收起）");
 
-  // 4) 左 1/3 双击 = 退 5s（右 1/3 对称，方向由 tapZone 决定）
+  // 4) 双击不再按区域 seek（三分法整段删除）：左 1/3 双击也只切播放，时间轴不许跳
   await video.evaluate(v => { v.currentTime = 20; });
   await page.waitForFunction(() => document.querySelector("video").currentTime > 18);
-  await page.waitForTimeout(320);
+  await page.waitForTimeout(340);
   const beforeSeek = await video.evaluate(v => v.currentTime);
-  await tapAt(0.15);
-  await page.waitForTimeout(120);
-  await tapAt(0.15);
-  await page.waitForFunction(t => document.querySelector("video").currentTime < t - 3.5, beforeSeek);
+  const playingBeforeLeft = await playing();
+  const box = await stageBox();
+  await page.evaluate(([x, y]) => {
+    const stage = document.querySelector(".player-root [data-mobile-hold-target]");
+    const fire = () => ["pointerdown", "pointerup"].forEach((type, index) => stage.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 93, pointerType: "touch", isPrimary: true,
+      button: 0, buttons: index ? 0 : 1, clientX: x, clientY: y,
+    })));
+    fire();
+    setTimeout(fire, 110);
+  }, [box.x + box.width * 0.15, box.y + box.height / 2]);
+  await page.waitForFunction(state => document.querySelector("video").paused === state, !playingBeforeLeft);
+  await page.waitForTimeout(300);
   const afterSeek = await video.evaluate(v => v.currentTime);
+  /* 只允许播放本身的自然前进（300ms），不允许出现「退 5s」那种跳变 */
+  assert(afterSeek >= beforeSeek - 0.5, `左 1/3 双击把进度跳走了：${beforeSeek} → ${afterSeek}`);
   return {
-    singleTapMs,
-    tap_toggles_playback: true,
-    double_tap_mid_toggles: true,
-    double_tap_left_seek_back: +(beforeSeek - afterSeek).toFixed(2),
+    single_tap_toggles_chrome_only: true,
+    double_tap_mid_toggles_once: true,
+    double_tap_zone_seek_removed: true,
   };
 }
 

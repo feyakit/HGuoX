@@ -1,4 +1,4 @@
-// 手势重分工验收（用户定稿）：单击=播放/暂停、双击=点赞、长按=2x、
+// 手势重分工验收（v3.0.13 第三轮，用户拍定 A 方案）：单击=唤出/收起控件、双击=暂停/播放、长按=2x、
 // 横屏三区（左亮度/右音量/中切集）、控件优先、竖屏不引入亮度音量。
 //
 // 真 EpisodePlayer + 真 CSS；媒体只打桩 paused 与 play/pause 计数（无解码环境里
@@ -79,51 +79,75 @@ const boot = async ({ endless = false, land = false, eps = 5 } = {}) => {
 };
 
 try {
-  /* ═══ 竖屏：单击 / 双击 / 长按 ═══ */
+  /* ═══ 竖屏：单击 / 双击 / 长按（v3.0.13 第三轮重分工，用户拍定 A 方案）═══
+       单击 = 只唤出/收起控件（不再暂停）；双击 = 暂停/播放（不再点赞，红心已删）；
+       长按 = 2x。旧用例守的是重分工之前的映射，这里按现行契约重写，断言比原来更严：
+       每条都同时验「该发生的发生了」和「不该发生的一个都没有」。 */
+  const TAP = { x: 90, y: 200 };                 // 避开中央播放按钮与右侧操作栏，只有舞台
+  const DOUBLE_TAP_MS = 280;                     // playerGestures.ts GESTURE.doubleTapMs
+  const controlsVisible = () => page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length > 0);
+  const mediaPaused = () => page.evaluate(() => document.querySelector("video")?.paused ?? null);
+
   await boot({});
+  const controlsAtStart = await controlsVisible();
   await resetProbe();
-  await tap(180, 320);
-  await page.waitForTimeout(500);
+  await tap(TAP.x, TAP.y);
+  await page.waitForTimeout(DOUBLE_TAP_MS + 350);   // 等单击的双击窗口过去再读
   const single = await probe();
-  await step("单击（竖屏中部）= 播放/暂停一次（播放态 → 暂停）", async () => {
-    assert.equal(single.pause, 1, `play=${single.play} pause=${single.pause}`);
+  const controlsAfterSingle = await controlsVisible();
+  await step("单击 = 只切换控件可见性，不播放也不暂停", async () => {
+    assert.equal(single.play + single.pause, 0, `play=${single.play} pause=${single.pause}`);
+    assert.notEqual(controlsAfterSingle, controlsAtStart, "单击必须把控件从 显示↔隐藏 翻过来");
   });
-  await step("单击暂停后控件亮出来（暂停态不自动收起）", async () => {
-    const vis = await page.evaluate(() => document.querySelectorAll(".player-root .hg-seg").length > 0);
-    assert.ok(vis, "单击后控件不可见");
+  await step("单击不改变媒体播放状态（画面继续走）", async () => {
+    assert.equal(await mediaPaused(), false, "单击后视频被暂停了");
   });
 
-  await page.waitForTimeout(450);   // 让上一步的单击定时器先落定
+  await boot({});                 // 干净页面：双击用例不受上一例的控件状态影响
   await resetProbe();
-  const quickTap = async (x, y) => {
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
-    await page.waitForTimeout(40);
-    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-  };
-  await synth(`fire("pointerdown",180,320); fire("pointerup",180,320);
-    setTimeout(() => { fire("pointerdown",180,320); fire("pointerup",180,320); }, 110);`);
-  await page.waitForTimeout(600);
+  const pausedBefore = await mediaPaused();
+  await synth(`fire("pointerdown",${TAP.x},${TAP.y}); fire("pointerup",${TAP.x},${TAP.y});
+    setTimeout(() => { fire("pointerdown",${TAP.x},${TAP.y}); fire("pointerup",${TAP.x},${TAP.y}); }, 110);`);
+  await page.waitForTimeout(700);
   const dbl = await probe();
-  await step("双击 = 点赞一次，且不触发播放/暂停（双击不再 seek）", async () => {
-    assert.equal(dbl.likes, 1, `likes=${dbl.likes}`);
-    assert.equal(dbl.play + dbl.pause, 0, `play=${dbl.play} pause=${dbl.pause}`);
+  await step("双击 = 播放/暂停切换一次，且不点赞（点赞只由右侧竖排按钮触发）", async () => {
+    assert.equal(dbl.play + dbl.pause, 1, `play=${dbl.play} pause=${dbl.pause}`);
+    assert.equal(dbl.likes, 0, `likes=${dbl.likes}`);
+    assert.notEqual(await mediaPaused(), pausedBefore, "双击必须把播放态翻过来");
   });
-  await step("双击出中央红心动效", async () => {
+  await step("双击不再出中央红心动效（该动效已整段删除）", async () => {
     const has = await page.evaluate(() => !!document.querySelector(".hg-like-burst"));
-    assert.ok(has, "没有 .hg-like-burst");
+    assert.equal(has, false, "双击仍然画出了 .hg-like-burst 红心");
   });
 
+  await boot({});                 // 独立页面：长按用例不受上一例的暂停计数影响
   await resetProbe();
-  await page.waitForTimeout(500);
-  await boot({});            // 独立页面：长按用例不受上一例的点赞/暂停计数影响
-  await page.waitForTimeout(250);
-  await resetProbe();
-  await synth(`fire("pointerdown",180,150); setTimeout(() => fire("pointerup",180,150), 700);`);
-  await page.waitForTimeout(1100);
-  const hold = await probe();
-  await step("长按 = 只走 2x，不算单击也不算双击", async () => {
-    assert.equal(hold.play + hold.pause, 0, `play=${hold.play} pause=${hold.pause}`);
-    assert.equal(hold.likes, 0, `likes=${hold.likes}`);
+  await synth(`fire("pointerdown",${TAP.x},150); setTimeout(() => fire("pointerup",${TAP.x},150), 800);`);
+  await page.waitForTimeout(450); // HOLD_DELAY_MS=380 已经到点，仍在按着
+  const holding = await page.evaluate(() => ({
+    rate: document.querySelector("video")?.playbackRate ?? null,
+    pill: document.body.innerText.includes("倍速中"),
+    paused: document.querySelector("video")?.paused ?? null,
+  }));
+  /* 判定窗口就在按住期间：单击要等 doubleTapMs=280ms 才落定，双击窗口同样是 280ms，
+     450ms 时两者都已经过去 —— 这时候还没变成暂停，才能证明长按没有被误判成单击/双击。
+     （松手之后的 play/pause 计数不可靠：夹具里没有真解码，源恢复会用新的 <video> 重挂画面，
+       重挂时 usePlaybackActivity 的 cleanup 会 pause 一次，那是夹具噪声，不是手势语义。） */
+  const holdDuringHold = await probe();
+  await page.waitForTimeout(900);
+  const afterHold = await page.evaluate(() => ({
+    rate: document.querySelector("video")?.playbackRate ?? null,
+    pill: document.body.innerText.includes("倍速中"),
+  }));
+  await step("长按 = 按住期间 2x（画面出「倍速中」提示），松手恢复 1x", async () => {
+    assert.equal(holding.rate, 2, `按住时 playbackRate=${holding.rate}`);
+    assert.ok(holding.pill, "按住时没有「倍速中」提示");
+    assert.equal(afterHold.pill, false, "松手后「倍速中」提示没消失");
+    assert.equal(afterHold.rate, 1, `松手后 playbackRate=${afterHold.rate}`);
+  });
+  await step("长按不算单击也不算双击（按住期间画面没被暂停、也没点赞）", async () => {
+    assert.equal(holding.paused, false, "按住期间画面被暂停了");
+    assert.equal(holdDuringHold.likes, 0, `likes=${holdDuringHold.likes}`);
   });
 
   /* ═══ 控件优先 ═══ */

@@ -64,13 +64,12 @@ try {
     await openGroup("网络");
     await openGroup("播放诊断");
   };
-  /* 设置页是分组手风琴（components/SettingsSection.tsx），组默认收起时里面的行不在可见 DOM 里。
-     「网络诊断」在「网络」组、「复制播放诊断日志」在「播放诊断」组。
-     旧用例按平铺列表写，断言一条没改，只补了展开这一步。 */
+  /* 设置页现在按分组平铺（settings/SettingsGroup.tsx）：组标题是 <h2>，行直接可见，
+     没有手风琴触发器，也没有 settings-panel-<组名>。这里只等该组的入口行出现；
+     断言一条没改，改动仅限「怎么让行出现在可交互状态」。 */
   const openGroup = async name => {
-    const trigger = page.getByRole("button", { name: `${name}设置` });
-    if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-    await page.locator(`#settings-panel-${name}`).waitFor({ state: "visible" });
+    const entry = name === "网络" ? "网络诊断" : "复制播放日志";
+    await page.getByRole("button").filter({ has: page.getByText(entry, { exact: true }) }).first().waitFor({ state: "visible" });
   };
   const networkButton = () => page.getByRole("button").filter({ has: page.getByText("网络诊断", { exact: true }) });
 
@@ -112,7 +111,7 @@ try {
 
   await load();
   await openGroup("播放诊断");
-  await page.getByRole("button").filter({ has: page.getByText("复制播放诊断日志", { exact: true }) }).click();
+  await page.getByRole("button").filter({ has: page.getByText("复制播放日志", { exact: true }) }).click();
   await page.waitForFunction(() => window.diagnosticCopyFixture.nativeCopies.length === 1);
   assert.equal(await page.evaluate(() => window.diagnosticCopyFixture.nativeCopies[0]), '{"event":"fixture.playback","data":{"unicode":"诊断日志"}}\n');
   assert.equal(await page.evaluate(() => window.diagnosticCopyFixture.webCopies), 0);
@@ -122,7 +121,7 @@ try {
     await load();
     await openGroup("播放诊断");
     await page.evaluate(key => { window.diagnosticCopyFixture[key] = true; }, failure);
-    await page.getByRole("button").filter({ has: page.getByText("复制播放诊断日志", { exact: true }) }).click();
+    await page.getByRole("button").filter({ has: page.getByText("复制播放日志", { exact: true }) }).click();
     await page.getByText(failure === "emptyLog" ? "尚无诊断日志，请开启后复现问题" : "fixture: log unavailable", { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.diagnosticCopyFixture.nativeCopies.length), 0);
   }
@@ -130,7 +129,7 @@ try {
 
   await load();
   await page.evaluate(() => { window.diagnosticCopyFixture.failCopy = true; });
-  await page.getByRole("button").filter({ has: page.getByText("复制播放诊断日志", { exact: true }) }).click();
+  await page.getByRole("button").filter({ has: page.getByText("复制播放日志", { exact: true }) }).click();
   await page.getByText("复制日志失败", { exact: true }).waitFor();
   assert.equal(await page.getByText("播放诊断日志已复制", { exact: true }).count(), 0);
   report.passed.push("Native playback log copy failure displays failure rather than a success message");

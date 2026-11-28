@@ -40,7 +40,10 @@ try {
   await page.goto(`${origin}tests/api-loading.html?page=home`);
   await page.waitForFunction(() => window.apiLoadingFixture.pendingCount("api_feed") >= 1);
   assert((await completeAll("api_feed", "", "404")) >= 1, "home must issue at least one feed request");
-  await visible(page.getByText("首页加载失败", { exact: true }));
+  /* 3.0.14 G 节把首屏错误卡改成「说人话」两档标题（Home.tsx:125）：
+     能拿到 HTTP 状态码（服务端有回答）→ 「加载失败」；纯网络类失败 → 「当前线路连不上」。
+     这里注入的是 HTTP 404（status 有值、networkish=false），所以标题必须是「加载失败」。 */
+  await visible(page.getByText("加载失败", { exact: true }));
   await visible(page.getByText(/服务器请求失败（HTTP 404）/));
   assert.equal(await page.locator(".spinner").count(), 0, "Failed home must stop spinning");
   assert(!await page.locator("body").innerText().then(s => s.includes("<html>")), "Hide gateway HTML from UI");

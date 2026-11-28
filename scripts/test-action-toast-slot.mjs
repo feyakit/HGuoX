@@ -61,14 +61,40 @@ try {
     assert.ok(await center(FAV), "找不到收藏按钮");
   });
 
+  /* 播放器的操作栏是「点一下画面才出来」的（也会自己收起），夹具里媒体地址重试时还会
+     重挂一次播放器，所以固定 sleep 之后去取按钮坐标会拿到 null —— 之前就是这么假绿/假红的。
+     这里改成：点之前先确保按钮在 DOM 里，点完等提示真的换成目标文案再断言。
+     断言口径没变（仍然要求「同槽 1 条 + 文案是最后一次动作」），只是把读取时机做对了。 */
+  const waitToasts = async predicate => {
+    const deadline = Date.now() + 6000;
+    let latest = await toasts();
+    while (Date.now() < deadline) {
+      if (predicate(latest)) return latest;
+      await page.waitForTimeout(80);
+      latest = await toasts();
+    }
+    return latest; // 不满足就把实际状态交给断言报错
+  };
+  const revealControls = async () => {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (await page.locator(LIKE).count() && await page.locator(FAV).count()) return;
+      await page.touchscreen.tap(180, 300); // 单击画面唤出操作栏
+      await page.waitForTimeout(150);
+    }
+    throw new Error("唤不出播放器操作栏（点赞/收藏按钮不在 DOM 里）");
+  };
+  const tapAction = async sel => {
+    await revealControls();
+    const point = await center(sel);
+    assert.ok(point, `找不到 ${sel} 按钮`);
+    await page.touchscreen.tap(point.x, point.y);
+  };
+
   /* 连点：先点赞，120ms 内再收藏 —— 真机上「随手连点」就是这个节奏 */
-  const like = await center(LIKE);
-  await page.touchscreen.tap(like.x, like.y);
+  await tapAction(LIKE);
   await page.waitForTimeout(120);
-  const fav = await center(FAV);
-  await page.touchscreen.tap(fav.x, fav.y);
-  await page.waitForTimeout(500);
-  const after = await toasts();
+  await tapAction(FAV);
+  const after = await waitToasts(t => t.count === 1 && (t.texts[0] || "").includes("收藏"));
   report.data.afterTwoActions = after;
   await page.screenshot({ path: join(output, "two-actions-one-toast.png") });
   report.shots.push(join(output, "two-actions-one-toast.png"));
@@ -81,10 +107,8 @@ try {
   });
 
   /* 再点一次点赞：仍然只占一条，且文案换成点赞 */
-  const like2 = await center(LIKE);
-  await page.touchscreen.tap(like2.x, like2.y);
-  await page.waitForTimeout(500);
-  const third = await toasts();
+  await tapAction(LIKE);
+  const third = await waitToasts(t => t.count === 1 && /喜欢/.test(t.texts[0] || ""));
   report.data.afterThird = third;
   await page.screenshot({ path: join(output, "third-action-still-one.png") });
   report.shots.push(join(output, "third-action-still-one.png"));
@@ -92,6 +116,12 @@ try {
     assert.equal(third.count, 1, `提示 ${third.count} 条：${JSON.stringify(third.texts)}`);
     assert.ok(/喜欢/.test(third.texts[0]), `文案：${JSON.stringify(third.texts)}`);
   });
+} catch (error) {
+  /* 假绿的根因：以前 try/finally 直接落到 process.exit(failed ? 1 : 0)，中途抛异常
+     （典型是 like2 为 null 时读 .x）时这一步根本走不到，Node 带着未处理的 rejection 收尾，
+     runner 拿到 rc=0 —— 用例其实没验完却算通过。现在任何未捕获异常都算失败。 */
+  report.harnessError = String((error && error.stack) || error);
+  console.error(report.harnessError);
 } finally {
   report.errors = errors;
   report.summary = `${report.passed.length} passed / ${report.failed.length} failed`;
@@ -101,4 +131,4 @@ try {
   await browser.close();
   await vite.close();
 }
-process.exit(report.failed.length ? 1 : 0);
+process.exit(report.failed.length || report.harnessError ? 1 : 0);
