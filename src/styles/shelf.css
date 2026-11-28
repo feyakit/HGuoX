@@ -1277,27 +1277,41 @@
    只在首页加这一条，别动吃瓜等共用 .hg-editorial-bar 的页面。 */
 .hg-home-page .hg-editorial-bar { min-height: calc(var(--sat, 0px) + 56px); }
 
-/* 「抖音模式」入口：顶栏最右的品牌强调胶囊（高 32 / 全圆角 / 字 13-600）。
-   本体 32 高，热区用 ::after 外扩 6px 撑到 44，手指不必精准点中那 32px。
+/* 「抖音模式」入口：顶栏最右的入口胶囊（3.0.22 定稿 = S3 玻璃描边）。
+   **无渐变实底**：透明底 + 1px rgba(255,255,255,.18) 描边 + 白字 13-600 + 14×14 描边闪电。
+   选 S3 的理由：渐变实底（S1）是顶栏里视觉重量最大的一块，会和「推荐/上新/热榜」抢眼睛；
+   玻璃描边与这版大字重排印同气质，也不跟高亮 tab（白字）打架。
+   几何来源 = 渲染稿 v-S3.png 的实测值：97 × 32（95 内容 + 左右各 1px 边框）、圆角 999、
+   与搜索按钮间距 8、字号 13-600。
+   热区：视觉只有 32 高，`::after` 的外扩以 **padding box** 为参照，1px 边框会被扣掉 ——
+   所以上下写 -7px（32 + 2×7 − 2×1 = 44），横向 -6px（97 + 2×5 = 107；实测 106，
+   右侧 8px 缝里约 2px 判给搜索按钮自己的 `::after{inset:-4px}`）。
    按下态用 transform/filter：ios.css 里有 0,5,0 的 `.ios-button…:active{scale}` 规则，
-   走 `scale` 属性会被它压掉，改 `transform` 就不在同一个属性上打架。
+   走 `scale` 属性会被它压掉，改 `transform` 就不在同一个属性上打架；
+   透明底按下去 filter 几乎看不出来，再补一层 10% 白填充做触觉反馈（仍然不用 scale 属性）。
    与搜索按钮的间距由 header 的 gap（clamp 6~10）决定，这里补差值把它钉在 8px。 */
 .ios-button.hg-binge-pill {
   position: relative;
   flex: none;
   height: 32px; min-height: 0; min-block-size: 0; min-inline-size: 0;
   margin-inline-end: calc(8px - clamp(6px, 2vw, 10px));
-  padding: 0 12px; border: 0; border-radius: 999px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
   display: inline-flex; align-items: center; justify-content: center; gap: 5px;
   white-space: nowrap;
   font-size: 13px; font-weight: 600; line-height: 1;
-  background: linear-gradient(135deg, #7C5CFF 0%, #5B6BFF 100%);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  background: transparent;
+  box-shadow: none;
   color: #fff;
-  transition: transform 120ms var(--motion-spring), filter 120ms var(--motion-spring);
+  transition: transform 120ms var(--motion-spring), background-color 120ms ease, filter 120ms var(--motion-spring);
 }
-.ios-button.hg-binge-pill::after { content: ""; position: absolute; inset: -6px; }
-.ios-button.hg-binge-pill:active { transform: scale(.96); filter: brightness(1.08); }
+.ios-button.hg-binge-pill::after { content: ""; position: absolute; inset: -7px -6px; }
+.ios-button.hg-binge-pill:active {
+  transform: scale(.96);
+  filter: brightness(1.08);
+  background-color: rgba(255, 255, 255, 0.10);
+}
 .ios-button.hg-binge-pill:focus-visible { outline: 2px solid rgba(255, 255, 255, .85); outline-offset: 2px; }
 .ios-button.hg-binge-pill > svg { display: block; flex: none; }
 @media (prefers-reduced-motion: reduce) {
@@ -2014,12 +2028,11 @@
 .hg-eps-grid > .ios-button { min-inline-size: 0; }
 
 /* ==================================================================
-   按钮品牌统一（v3.0.6）—— 全站唯一基准 = 首页「抖音模式」胶囊
+   按钮品牌统一（v3.0.6）—— 品牌实心基准 = --btn-grad 那套 token
    ------------------------------------------------------------------
-   基准规格（.hg-binge-pill，shelf.css 上方）：
-     高 32 / 全圆角 / 13·600 / linear-gradient(135deg,#7C5CFF,#5B6BFF)
-     / inset 0 0 0 1px rgba(255,255,255,.18) / 按下 scale(.96)+brightness(1.08)
-     / ::after{inset:-6px} 把热区撑到 44
+   ⚠️ 3.0.22 起首页「抖音模式」胶囊改成了 S3 玻璃描边（见 shelf.css 上方 .hg-binge-pill），
+   **它不再是这套实心规格的视觉基准**：基准改成下面的 token 本身（渐变 + 1px 18% 白描边 +
+   按下 scale(.96)+brightness）。尺寸口径不变：胶囊高 32 / 全圆角 / 13·600；主 CTA 高 44。
    本节做三件事：
      ① 把这套值收成 token，一处改全站跟着变；
      ② 视觉高不足 44 的控件用 ::after 外扩热区（视觉不变大，不动布局）；
