@@ -21,6 +21,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,12 +34,45 @@ const HEALTH_FILE: &str = "line-health.json";
 /// 黑名单管「这一轮别优先选它」，拒绝表管「重启后别再白等它」。
 const DENY_FILE: &str = "line-deny.json";
 const DENY_TTL_SECS: u64 = 24 * 60 * 60;
+/// 「纯超时」写表后的有效期（3.0.22）：比 TLS 阻断短得多。
+///
+/// 为什么更短：一条被墙的 origin 是黑洞时，我们只等得到「自己的预算用尽」（首屏 1.5s），
+/// 而 1.5s 也可能只是弱网下的慢请求。30 分钟足够覆盖「这一次冷启动之后连着几次都白等」，
+/// 又不会因为一次基站切换就把一条能用的线路丢掉一整天。
+const TIMEOUT_DENY_TTL_SECS: u64 = 30 * 60;
+/// `refused` 写表后的有效期（3.0.22）：介于 TLS 的 24 小时与超时的 30 分钟之间。
+/// 服务器维护窗口、临时限流都会给 refused，6 小时足够覆盖一次冷启动风暴，又不会丢一天。
+const REFUSED_DENY_TTL_SECS: u64 = 6 * 60 * 60;
+/// 同一 origin 连续几次「纯超时」才判死（3.0.22，可配）。
+///
+/// 真机（小米九 / 2026-11-28）的失败形态是 `err=timeout` 的黑洞：主域 12s 一次、
+/// 一次冷启动能白等三次以上。单次超时不写表（可能只是抖动），连续两次就写。
+static TIMEOUT_DENY_THRESHOLD: AtomicU32 = AtomicU32::new(2);
+/// 默认阈值（`set_timeout_deny_threshold(0)` 复位用）。
+const TIMEOUT_DENY_DEFAULT: u32 = 2;
+
+/// 覆盖「连续几次超时写表」的阈值（0 = 回到默认 2）。返回生效值。
+///
+/// 目前只有单测和排查脚本会调它（真机上看的是默认值 2）；留着是为了现场能改，
+/// 不用重编译就能验证「阈值 1 / 3 会不会更合适」。
+#[allow(dead_code)]
+pub fn set_timeout_deny_threshold(n: u32) -> u32 {
+    let n = if n == 0 { TIMEOUT_DENY_DEFAULT } else { n.clamp(1, 10) };
+    TIMEOUT_DENY_THRESHOLD.store(n, Ordering::Relaxed);
+    n
+}
+
+pub fn timeout_deny_threshold() -> u32 {
+    TIMEOUT_DENY_THRESHOLD.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug)]
 struct Entry {
     fails: u32,
     /// 黑名单到期时间；None = 还没判死。
     until: Option<Instant>,
+    /// 连续「纯超时」次数（成功或别的错误类型都会清零）—— 见 [`TIMEOUT_DENY_THRESHOLD`]。
+    timeouts: u32,
 }
 
 static STATE: RwLock<Option<HashMap<String, Entry>>> = RwLock::new(None);
@@ -158,6 +192,9 @@ pub fn note_success(origin: &str) {
 }
 
 /// 记一次失败；达到阈值进黑名单，返回本次判定出的错误类型。
+///
+/// 3.0.22：顺带维护「连续纯超时」计数 —— 拒绝表要不要写由 [`note_transport_failure`] 定，
+/// 单次超时只累加、不判死。
 pub fn note_failure(origin: &str, message: &str) -> Option<&'static str> {
     let kind = fault_kind(message)?;
     if origin.is_empty() {
@@ -165,13 +202,24 @@ pub fn note_failure(origin: &str, message: &str) -> Option<&'static str> {
     }
     let now = Instant::now();
     with_state(|state| {
-        let entry = state.entry(origin.to_string()).or_insert(Entry { fails: 0, until: None });
+        let entry = state.entry(origin.to_string()).or_insert(Entry { fails: 0, until: None, timeouts: 0 });
         entry.fails = entry.fails.saturating_add(1);
+        if kind == "timeout" {
+            entry.timeouts = entry.timeouts.saturating_add(1);
+        } else {
+            /* 「连续」才计数：中间夹一次别的失败类型就重新数 */
+            entry.timeouts = 0;
+        }
         if entry.fails >= FAIL_THRESHOLD {
             entry.until = Some(now + BLACKLIST_TTL);
         }
     });
     Some(kind)
+}
+
+/// 该 origin 连续超时了几次（没记录为 0）。只在写拒绝表时用。
+fn timeout_streak(origin: &str) -> u32 {
+    with_state(|state| state.get(origin).map(|entry| entry.timeouts).unwrap_or(0))
 }
 
 /// 立即判死（自动换线时对「刚刚失败的那条」用）：不用等第二次。
@@ -181,7 +229,9 @@ pub fn penalize(origin: &str) {
     }
     let until = Instant::now() + BLACKLIST_TTL;
     with_state(|state| {
-        let entry = state.entry(origin.to_string()).or_insert(Entry { fails: FAIL_THRESHOLD, until: Some(until) });
+        let entry = state
+            .entry(origin.to_string())
+            .or_insert(Entry { fails: FAIL_THRESHOLD, until: Some(until), timeouts: 0 });
         entry.fails = entry.fails.max(FAIL_THRESHOLD);
         entry.until = Some(until);
     });
@@ -206,8 +256,18 @@ pub fn blacklisted(origin: &str) -> bool {
  * 不写表），24 小时过期，命中就直接跳过、连探活都不发。
  */
 
-/// origin → 判死时刻（unix 秒）。懒加载自 [`DENY_FILE`]。
-static DENY: RwLock<Option<HashMap<String, u64>>> = RwLock::new(None);
+/// 拒绝表条目：判死时刻（unix 秒）+ 这条记录的有效期（秒）。
+///
+/// 3.0.22 起按「失败形态」给不同有效期：TLS 阻断 / 握手后被 reset 是网络侧的持续封锁，
+/// 24 小时；`refused` 与连续超时可能只是瞬时（服务器重启、基站切换），30 分钟～6 小时。
+#[derive(Clone, Copy, Debug)]
+struct Denied {
+    at: u64,
+    ttl: u64,
+}
+
+/// origin → 判死记录。懒加载自 [`DENY_FILE`]。
+static DENY: RwLock<Option<HashMap<String, Denied>>> = RwLock::new(None);
 /// 本次进程里真的成功过的 origin。「已经成功过的 origin 不降超时」要用它：
 /// 磁盘上的 last_good 只有一条，而一次冷启动里可能有两条线路先后成功过。
 static SUCCEEDED: RwLock<Option<std::collections::HashSet<String>>> = RwLock::new(None);
@@ -226,7 +286,7 @@ fn now_secs() -> u64 {
 }
 
 /// 读拒绝表（丢掉过期条目）。文件坏了就当空的：拒绝表是优化，不该拖垮启动。
-fn read_deny_file() -> HashMap<String, u64> {
+fn read_deny_file() -> HashMap<String, Denied> {
     let Some(path) = deny_path() else { return HashMap::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
     let Ok(value) = serde_json::from_str::<Value>(&text) else { return HashMap::new() };
@@ -240,15 +300,21 @@ fn read_deny_file() -> HashMap<String, u64> {
                 .filter_map(|item| {
                     let origin = crate::net::normalize_base(item.get("origin").and_then(Value::as_str)?)?;
                     let at = item.get("at").and_then(Value::as_u64)?;
-                    /* 时钟回拨（at 比现在还晚）也当成刚判死，别永久钉死一条线路 */
-                    (now.saturating_sub(at) < DENY_TTL_SECS).then_some((origin, at))
+                    /* 老格式（3.0.21）没有 ttl 字段：按 24 小时算。
+                       时钟回拨（at 比现在还晚）也当成刚判死，别永久钉死一条线路 */
+                    let ttl = item
+                        .get("ttl")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(DENY_TTL_SECS)
+                        .min(DENY_TTL_SECS);
+                    (now.saturating_sub(at) < ttl).then_some((origin, Denied { at, ttl }))
                 })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn with_deny<R>(f: impl FnOnce(&mut HashMap<String, u64>) -> R) -> R {
+fn with_deny<R>(f: impl FnOnce(&mut HashMap<String, Denied>) -> R) -> R {
     let mut slot = match DENY.write() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
@@ -263,10 +329,10 @@ fn save_deny() {
     let Some(path) = deny_path() else { return };
     let items: Vec<Value> = with_deny(|table| {
         let now = now_secs();
-        table.retain(|_, at| now.saturating_sub(*at) < DENY_TTL_SECS);
+        table.retain(|_, entry| now.saturating_sub(entry.at) < entry.ttl);
         table
             .iter()
-            .map(|(origin, at)| json!({ "origin": origin, "at": at }))
+            .map(|(origin, entry)| json!({ "origin": origin, "at": entry.at, "ttl": entry.ttl }))
             .collect()
     });
     let body = json!({ "items": items }).to_string();
@@ -278,9 +344,9 @@ fn save_deny() {
 pub fn blocked_age(origin: &str) -> Option<u64> {
     let origin = crate::net::normalize_base(origin)?;
     with_deny(|table| {
-        table.get(&origin).and_then(|at| {
-            let age = now_secs().saturating_sub(*at);
-            (age < DENY_TTL_SECS).then_some(age)
+        table.get(&origin).and_then(|entry| {
+            let age = now_secs().saturating_sub(entry.at);
+            (age < entry.ttl).then_some(age)
         })
     })
 }
@@ -290,16 +356,36 @@ pub fn blocked(origin: &str) -> bool {
 }
 
 /// 写拒绝表 + 落盘 + 打一行 logcat（真机复测就是用这行确认「这次没白等」）。
+///
+/// 24 小时有效期的那一档；`refused` / 连续超时走 [`deny_for`] 用更短的 ttl。
+#[allow(dead_code)]
 pub fn deny(origin: &str, reason: &str) {
+    deny_for(origin, reason, DENY_TTL_SECS);
+}
+
+/// 同 [`deny`]，但可以指定这条记录的有效期（见 [`Denied`]）。
+///
+/// 同一条线路被重新判死时**延长到更长的那个有效期**：先因为超时写 30 分钟、
+/// 后来又观察到 TLS 被断，不该被旧的短 ttl 覆盖掉。
+pub fn deny_for(origin: &str, reason: &str, ttl_secs: u64) {
     let Some(origin) = crate::net::normalize_base(origin) else { return };
+    let ttl = ttl_secs.clamp(60, DENY_TTL_SECS);
     let at = now_secs();
-    let already = with_deny(|table| {
-        let previous = table.insert(origin.clone(), at);
-        previous.is_some()
+    let first = with_deny(|table| {
+        let previous = table.insert(origin.clone(), Denied { at, ttl });
+        match previous {
+            None => true,
+            Some(old) if old.ttl >= ttl => {
+                /* 旧记录有效期更长：保留旧的到期时间，只刷新写入时刻会造成「永久续期」 */
+                table.insert(origin.clone(), Denied { at: old.at, ttl: old.ttl });
+                false
+            }
+            Some(_) => true,
+        }
     });
     save_deny();
-    /* 第一次写才打日志：同一条线路每次失败都打会刷屏 */
-    if !already {
+    /* 第一次写（或升级成更硬的判断）才打日志：同一条线路每次失败都打会刷屏 */
+    if first {
         crate::netlog::deny_origin(&origin, reason);
     }
 }
@@ -326,13 +412,21 @@ pub fn ever_succeeded(origin: &str) -> bool {
     session || last_good().as_deref().is_some_and(|last| last == origin)
 }
 
-/// 「经过完整协议」的失败：TCP 已接通、TLS 握手被断。
+/// 「经过完整协议」或「快失败」的失败：TCP 已接通但 TLS 握手被断、或连接被立刻拒绝。
 ///
-/// 纯 DNS 污染、连接超时、连接被拒都**不算** —— 它们可能只是临时抖动（尤其 DNS
-/// 在移动网络里一分钟能变三次），拿它们写 24 小时的拒绝表会把线路白丢一天。
+/// 3.0.22 补充真机（小米九 / 2026-11-28，同一家宽带，主域黑洞 + 镜像多 `refused`）：
+/// 只认 `tls` / `SendRequest` 阶段的 `reset` 时，拒绝表在这类网络里**永远是空的**
+/// —— 表空 → 冷启动每次都从最坏的那条撞起。
+///
+/// 所以把 `refused` 也算进来：TCP 层 0.08 秒就回 RST，说明对端/中间设备明确不让连，
+/// 大概率不是瞬时抖动。纯 DNS 污染仍不写（移动网络里 DNS 一分钟能变三次）。
+///
+/// `timeout` **不能**只看一句错误文案就写表：一次超时可能只是弱网慢请求，阈值判断
+/// （同一 origin 连续 N 次）在 [`note_transport_failure`] 里做，这里不认。
 pub fn complete_protocol_failure(message: &str) -> bool {
     match fault_kind(message) {
         Some("tls") => true,
+        Some("refused") => true,
         /* SendRequest 阶段的 reset 说明 TCP 已经通了（握手之后才断）；
            Connect 阶段的 reset / 纯 timeout 不算 */
         Some("reset") => {
@@ -347,12 +441,19 @@ pub fn complete_protocol_failure(message: &str) -> bool {
 
 /// 失败样本收口：内存黑名单 + 拒绝表，一处判定。
 ///
-/// 调用方（`net.rs` 的 `edge_inner`）已经拿到 `fault_kind` 的结论；这里再加一层
-/// 「是不是完整协议失败」的判断，决定要不要写拒绝表。
+/// 调用方（`net.rs` 的 `edge_route`）已经拿到 `fault_kind` 的结论；这里再加一层
+/// 「要不要写 24 小时拒绝表」的判断：
+///   * `tls` / 握手后 `reset` / `refused` → 立刻写；
+///   * `timeout` → 同一 origin 连续 [`timeout_deny_threshold`] 次才写（30 分钟有效期）；
+///   * 其余（dns / connect / unreachable）→ 不写，可能只是临时。
 pub fn note_transport_failure(origin: &str, message: &str) -> Option<&'static str> {
     let kind = note_failure(origin, message)?;
     if complete_protocol_failure(message) {
-        deny(origin, kind);
+        /* refused 也可能只是服务器重启/维护窗口：比 TLS 阻断短一个量级 */
+        let ttl = if kind == "refused" { REFUSED_DENY_TTL_SECS } else { DENY_TTL_SECS };
+        deny_for(origin, kind, ttl);
+    } else if kind == "timeout" && timeout_streak(origin) >= timeout_deny_threshold() {
+        deny_for(origin, kind, TIMEOUT_DENY_TTL_SECS);
     }
     Some(kind)
 }
@@ -433,7 +534,7 @@ pub fn snapshot() -> Value {
     let denied = with_deny(|table| {
         table
             .iter()
-            .map(|(origin, at)| json!({ "origin": origin, "age_s": now_secs().saturating_sub(*at) }))
+            .map(|(origin, entry)| json!({ "origin": origin, "age_s": now_secs().saturating_sub(entry.at), "ttl_s": entry.ttl }))
             .collect::<Vec<_>>()
     });
     json!({ "blacklist": blocked, "deny": denied, "last_good": last_good(), "last_good_age_s": last_good_info().map(|last| last.age.as_secs()) })
@@ -522,14 +623,17 @@ mod tests {
         super::test_state_lock()
     }
 
-    /// 3.0.21 A1：只有「TCP 通了、TLS 握手被断」才写拒绝表；
-    /// 纯 DNS 污染 / 连接超时 / 连接被拒都不写（那可能只是临时）。
+    /// 3.0.21 A1（3.0.22 扩充）：`tls` / 握手后被 reset / **`refused`** 才写拒绝表；
+    /// 纯 DNS 污染 / 连接超时 / 连不上（connect）不写 —— 那可能只是临时。
     #[test]
     fn only_complete_protocol_failures_enter_the_deny_table() {
         for message in [
             "error sending request ← client error (SendRequest) ← tls handshake eof",
             "tls handshake eof",
             "error sending request for url (https://x/) ← client error (SendRequest) ← connection closed before message completed",
+            /* 3.0.22 真机失败形态（小米九 / 2026-11-28）：TCP 立刻被拒，0.08–1.3s */
+            "error sending request ← connection refused",
+            "error sending request for url (https://x/api/edge/request) ← client error (Connect) ← tcp connect error ← Connection refused (os error 111)",
         ] {
             assert!(complete_protocol_failure(message), "应当写拒绝表：{message}");
         }
@@ -537,14 +641,78 @@ mod tests {
             "error sending request ← client error (Connect) ← dns error",
             "DNS 解析失败",
             "error sending request ← client error (Connect) ← tcp connect error ← deadline has elapsed",
-            "connection refused",
             "请求超时",
+            "operation timed out",
             "HTTP 403: forbidden",
             "connection reset by peer (os error 104)",
             "",
         ] {
             assert!(!complete_protocol_failure(message), "不该写拒绝表：{message}");
         }
+    }
+
+    /// 3.0.22 A2：`refused` 立刻写表（真机这类网络的主失败形态），并且带上比 TLS 更短的有效期。
+    #[test]
+    fn refused_enters_the_deny_table_immediately_with_a_shorter_ttl() {
+        let _guard = disk_guard();
+        let dir = temp_dir("deny-refused");
+        bind(&dir);
+        let origin = "https://qnv.example.cc";
+        assert!(!blocked(origin), "空表：不该命中");
+        note_transport_failure(origin, "error sending request ← connection refused");
+        assert!(blocked(origin), "连接被拒一次就该写表（0.08s 的失败，不值得再撞一轮）");
+
+        /* 有效期是 6 小时：读回来带 ttl 字段，且比 TLS 的 24 小时短 */
+        let text = std::fs::read_to_string(dir.join(DENY_FILE)).expect("要落盘");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let ttl = value["items"][0]["ttl"].as_u64().unwrap();
+        assert_eq!(ttl, REFUSED_DENY_TTL_SECS, "{text}");
+        assert!(ttl < DENY_TTL_SECS);
+
+        /* 6 小时零 1 分之后再读：过期丢弃 */
+        let stale = now_secs().saturating_sub(REFUSED_DENY_TTL_SECS + 60);
+        std::fs::write(
+            dir.join(DENY_FILE),
+            json!({ "items": [{ "origin": origin, "at": stale, "ttl": REFUSED_DENY_TTL_SECS }] }).to_string(),
+        )
+        .unwrap();
+        bind(&dir);
+        assert!(!blocked(origin), "refused 的记录只留 6 小时");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 3.0.22 A3：单次超时**不**写表（可能只是弱网慢请求），同一 origin 连续两次才写，
+    /// 中间夹一次别的失败类型就重新计数；阈值可配。
+    #[test]
+    fn consecutive_timeouts_deny_at_the_configured_threshold() {
+        let _guard = disk_guard();
+        let dir = temp_dir("deny-timeout");
+        bind(&dir);
+        let origin = "https://blackhole.example.cc";
+        let timeout = "error sending request ← client error (Connect) ← tcp connect error ← deadline has elapsed";
+
+        note_transport_failure(origin, timeout);
+        assert!(!blocked(origin), "一次超时不能判死（可能只是瞬时抖动）");
+        note_transport_failure(origin, "error sending request ← client error (Connect) ← dns error");
+        note_transport_failure(origin, timeout);
+        assert!(!blocked(origin), "中间夹了别的失败类型：连续计数要重新数");
+
+        note_transport_failure(origin, timeout);
+        assert!(blocked(origin), "连续两次超时才写表");
+        assert!(blocked_age(origin).is_some());
+
+        /* 阈值可配：改成 1 次 */
+        assert_eq!(set_timeout_deny_threshold(1), 1);
+        let other = "https://one-shot.example.cc";
+        note_transport_failure(other, timeout);
+        assert!(blocked(other), "阈值改成 1 之后，一次超时就写表");
+        set_timeout_deny_threshold(0);
+        assert_eq!(timeout_deny_threshold(), 2, "0 = 回到默认阈值");
+
+        /* 成功一次立刻解除（超时记录的短 ttl 不能让它赖着） */
+        note_success(origin);
+        assert!(!blocked(origin), "通了就必须从拒绝表里删掉");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
