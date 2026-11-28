@@ -190,6 +190,9 @@ fn apply_base(url: &str, custom: bool, manual: bool) -> Result<String, String> {
         && !crate::lines::is_fixed(&next)
         && !crate::lines::is_trusted_mirror(&next)
         && !crate::lines::is_cached_mirror(&next)
+        /* 3.0.22：本次进程里**探活通过**的候选也允许（内置种子就在这一档）。
+           只影响「能不能当线路用」，凭据信任仍只看 `trusted_auth_origin`。 */
+        && !crate::lines::is_verified_candidate(&next)
     {
         return Err("线路不在固定线路或可信发布页清单中".into());
     }
@@ -1650,7 +1653,24 @@ pub async fn edge(
     body: Option<Value>,
     token: Option<&str>,
 ) -> Result<Value, String> {
-    edge_inner(origin, method, path, body, token, true).await
+    edge_inner(origin, method, path, body, token, true, None).await
+}
+
+/// 带「单次请求预算」的 [`edge`]（3.0.22 首屏首枪用）。
+///
+/// 为什么需要显式传：冷启动的短预算（`net_boot_budget`）是**进程级开关**，
+/// 首屏一旦失败重试超过 20 秒兜底就自动放开回 12 秒；真机日志里 `api_feed` 就是这么
+/// 在 46 秒处又等满 `ms=12001 err=timeout` 的。首屏第一个请求必须自带预算，
+/// 「谁来释放全局开关」都不影响它。
+pub async fn edge_with_budget(
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    token: Option<&str>,
+    budget_ms: Option<u64>,
+) -> Result<Value, String> {
+    edge_inner(origin, method, path, body, token, true, budget_ms).await
 }
 
 /// 单次探测用边缘信封：不做 3 次重试与退避等待，避免死线路拖慢自动选线。
@@ -1661,7 +1681,7 @@ pub async fn edge_once(
     body: Option<Value>,
     token: Option<&str>,
 ) -> Result<Value, String> {
-    edge_inner(origin, method, path, body, token, false).await
+    edge_inner(origin, method, path, body, token, false, None).await
 }
 
 async fn edge_inner(
@@ -1671,11 +1691,12 @@ async fn edge_inner(
     body: Option<Value>,
     token: Option<&str>,
     allow_retry: bool,
+    budget_ms: Option<u64>,
 ) -> Result<Value, String> {
     /* 一行 `[net] req …` 在这里收口：所有出口（信封 / 直连 / 登录策略拒绝）都过它，
        真机上就能把「这次到底走了哪条路、花了多久」一次看清。 */
     let started = Instant::now();
-    let (result, via) = edge_route(origin, method, path, body, token, allow_retry).await;
+    let (result, via) = edge_route(origin, method, path, body, token, allow_retry, budget_ms).await;
     log_net_req(origin, method, path, via, started.elapsed().as_millis(), &result);
     result
 }
@@ -1687,6 +1708,7 @@ async fn edge_route(
     body: Option<Value>,
     token: Option<&str>,
     allow_retry: bool,
+    budget_ms: Option<u64>,
 ) -> (Result<Value, String>, &'static str) {
     let cur = match normalize_base(origin) {
         Some(cur) => cur,
@@ -1752,7 +1774,12 @@ async fn edge_route(
     /* 总预算（3.0.14 真机）：被墙的 IP 常常是「黑洞丢包」而不是 RST —— 一次尝试会一直
        挂到客户端的 20 秒超时，3 次重试就是 60 秒，首页 50 秒还在转圈。
        这里给整个逻辑请求封顶，超时按链路层失败返回，让前端立刻换线重试。 */
-    let budget = request_budget_for(&cur);
+    let budget = match budget_ms {
+        /* 3.0.22：首屏首枪自带预算（真机 1.5s 就够露馅），且只跟「全局预算」取小 —— 不会因为
+           全局开关被放开就退回 12 秒。下界 300ms 防止调用方传 0 把请求直接掐死。 */
+        Some(ms) => request_budget_for(&cur).min(Duration::from_millis(ms.clamp(300, 30_000))),
+        None => request_budget_for(&cur),
+    };
     let value = match tokio::time::timeout(budget, with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
