@@ -15,7 +15,7 @@
 
 减少动态效果时关闭过渡；减少透明度、提高对比度或不支持 backdrop-filter 时，核心玻璃面板使用实色背景。没有依赖持续渲染的 canvas 动效。
 
-运行 `pnpm build`、`pnpm test:ios-ui`、`pnpm test:ios-overlays`，并执行现有播放、加载、分页、移动布局、诊断复制和存储迁移回归。浏览器安装使用 `pnpm exec playwright-core install chromium`；可通过 `BROWSER_EXECUTABLE` 指定本机浏览器。报告和截图写入忽略目录 `test-results/`。
+运行 `pnpm build`、`pnpm test:app-smoke`、`pnpm test:ios-overlays`，并执行现有播放、加载、分页、移动布局、诊断复制和存储迁移回归。浏览器安装使用 `pnpm exec playwright-core install chromium`；可通过 `BROWSER_EXECUTABLE` 指定本机浏览器。报告和截图写入忽略目录 `test-results/`。
 
 浏览器回归使用真实 App 与模拟 Tauri IPC，不能替代原生 iOS WKWebView、Android 系统返回键及 Windows/macOS 窗口的设备验收。发布前需核对这些设备上的视频合成、模糊材质和安全区。
 
