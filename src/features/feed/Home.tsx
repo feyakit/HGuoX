@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { prefetchDetails } from "../../shared/api/detailFast";
 import { useTabSwipe } from "./useTabSwipe";
-import { ApiError, api, fmt, hostOf, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
+import { ApiError, api, fmt, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
 import type { HomeBanner } from "../../shared/api/api";
 import { withLineRetries } from "../../shared/network/firstScreen";
@@ -162,8 +162,6 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const [errorRaw, setErrorRaw] = useState("");
   const [errorNetworkish, setErrorNetworkish] = useState(false);
   const [lineOpen, setLineOpen] = useState(false);
-  /* 当前线路（左上角胶囊只在不是主站时出现） */
-  const [lineHost, setLineHost] = useState("");
   /* 官网首页 banners（C 节）：非空时 hero 只按它来，空则回落到原来的口碑榜规则 */
   const [banners, setBanners] = useState<HomeBanner[]>([]);
   const bannersAt = useRef(0);
@@ -627,21 +625,6 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     return picked;
   }, [bannerHeroes, visibleRecRanks, visibleRanks, visible]);
 
-  /* 左上角线路胶囊（G 节）：只有当前不在主站时才出现，告诉用户「你现在走的是备用线路」。
-     lineEpoch 每次换线都 +1，所以这里顺便在换线后重新读一次。 */
-  const backupLine = !!lineHost && !/(^|\.)huangguoai\.com$/i.test(lineHost);
-  useEffect(() => {
-    let live = true;
-    const read = () => {
-      api.lineState()
-        .then(state => { if (live) setLineHost(hostOf(state.base)); })
-        .catch(() => { /* 读不到就不显示胶囊，不影响首屏 */ });
-    };
-    read();
-    window.addEventListener("hg:line-changed", read);
-    return () => { live = false; window.removeEventListener("hg:line-changed", read); };
-  }, [lineEpoch]);
-
   const safeHeroIdx = Math.min(heroIndex, Math.max(heroes.length - 1, 0));
   const hero = heroes[safeHeroIdx];
 
@@ -728,16 +711,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     <div className="ios-page hg-home-page hg-canvas absolute inset-0 flex flex-col">
       <span className="hg-aura" aria-hidden="true" />
 
-      {/* 一级大字重流光顶栏：品牌徽标 + 推荐/上新/热榜 大字排版 + 全局搜索（省掉整排胶囊栏） */}
+      {/* 一级大字重流光顶栏：品牌徽标 + 推荐/上新/热榜 大字排版 + 抖音模式 + 全局搜索（省掉整排胶囊栏） */}
       <header className="shrink-0 hg-page-x hg-editorial-bar relative z-10">
         <Logo size={23} className="shrink-0 mr-1" />
-        {backupLine && (
-          <Button card className="hg-line-chip" onClick={() => setLineOpen(true)}
-            aria-label={`当前走备用线路 ${lineHost}，点按切换`} title={lineHost}>
-            <span className="hg-line-chip-dot" aria-hidden="true" />
-            <span className="hg-line-chip-text">{lineHost}</span>
-          </Button>
-        )}
         <div className="hg-ed-tabs" role="tablist" aria-label="首页分栏">
           {TABS.map(t => (
             <Button key={t.key} card role="tab" aria-selected={t.key === tab}
@@ -1177,7 +1153,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
         </div>
       )}
 
-      {/* 播放源面板：首页线路胶囊与错误页的「换个线路」都走这里，切完 reload 由 lineEpoch 驱动 */}
+      {/* 播放源面板：错误页的「换个线路」都走这里，切完 reload 由 lineEpoch 驱动 */}
       <LinePicker open={lineOpen} onClose={() => setLineOpen(false)} />
     </div>
   );

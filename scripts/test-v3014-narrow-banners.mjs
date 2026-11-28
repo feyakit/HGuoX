@@ -179,22 +179,32 @@ try {
   await page.setViewportSize({ width: widths[1], height: 844 });
   await page.screenshot({ path: join(output, "home-banners.png") });
 
-  // ── 2b. 备用线路胶囊：切到镜像后顶栏在 360dp 仍然不溢出 ──────────
+  // ── 2b. 备用线路下顶栏仍不溢出，且不再显示线路域名胶囊（3.0.22 用户拍定） ──
   await page.setViewportSize({ width: 360, height: 844 });
   await page.evaluate(() => { window.v3014.switched = true; window.dispatchEvent(new Event("hg:line-changed")); });
-  await page.waitForSelector(".hg-line-chip", { timeout: 5000 });
-  const chip = await page.evaluate(() => {
-    const bar = document.querySelector(".hg-editorial-bar");
-    const chip = document.querySelector(".hg-line-chip");
-    return {
-      chip: chip ? { w: Math.round(chip.getBoundingClientRect().width), text: chip.textContent?.trim(), scrollW: chip.scrollWidth, clientW: chip.clientWidth } : null,
-      headerOverflow: bar ? bar.scrollWidth - bar.clientWidth : null,
-      pageOverflow: document.documentElement.scrollWidth - window.innerWidth,
-    };
-  });
-  report.cases.push({ case: "360dp + 备用线路胶囊：顶栏不溢出", ...chip, pass: (chip.headerOverflow ?? 0) <= 1 && chip.pageOverflow <= 0 && !!chip.chip });
-  assert.ok((chip.headerOverflow ?? 0) <= 1 && chip.pageOverflow <= 0 && !!chip.chip, "备用线路胶囊不能把顶栏挤溢出");
-  await page.screenshot({ path: join(output, "home-line-chip-360.png") });
+  await page.waitForTimeout(300);
+  for (const width of [320, 360]) {
+    await page.setViewportSize({ width, height: 844 });
+    await page.waitForTimeout(200);
+    const topbar = await page.evaluate(() => {
+      const bar = document.querySelector(".hg-editorial-bar");
+      const tabs = bar.querySelector(".hg-ed-tabs");
+      return {
+        chip: document.querySelectorAll(".hg-line-chip, .hg-line-chip-dot, .hg-line-chip-text").length,
+        tabsClientW: tabs ? Math.round(tabs.clientWidth * 10) / 10 : null,
+        tabsOverflow: tabs ? tabs.scrollWidth - tabs.clientWidth : null,
+        pill: !!bar.querySelector(".hg-binge-pill"),
+        headerOverflow: bar ? bar.scrollWidth - bar.clientWidth : null,
+        pageOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      };
+    });
+    report.cases.push({ case: `${width}dp + 备用线路：无线路域名胶囊、顶栏不溢出`, ...topbar, pass: topbar.chip === 0 && (topbar.headerOverflow ?? 0) <= 1 && topbar.pageOverflow <= 0 && topbar.pill });
+    assert.equal(topbar.chip, 0, `${width}dp 备用线路下顶栏不应再有 .hg-line-chip`);
+    assert.ok((topbar.headerOverflow ?? 0) <= 1, `${width}dp 顶栏溢出 ${topbar.headerOverflow}`);
+    assert.ok(topbar.pageOverflow <= 0, `${width}dp 页面横向溢出 ${topbar.pageOverflow}`);
+    assert.ok(topbar.pill, `${width}dp 抖音模式胶囊必须还在`);
+  }
+  await page.screenshot({ path: join(output, "home-no-line-chip-360.png") });
 
   // ── 2c. 详情页窄屏几何（长标题 + 多标签） ──────────────────────────
   await page.locator(".hg-spotlight").first().click();
