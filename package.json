@@ -39,7 +39,7 @@
     "test:startup-lock": "node scripts/test-startup-lock.mjs",
     "test:glow-crossorigin": "node scripts/test-glow-crossorigin.mjs",
     "test:mobile-layout": "node scripts/test-mobile-layout.mjs",
-    "test:ios-ui": "node scripts/test-ios-ui.mjs",
+    "test:app-smoke": "node scripts/test-app-smoke.mjs",
     "test:ios-icons": "node scripts/test-ios-icons.mjs",
     "test:score-badge": "node scripts/test-score-badge-position.mjs",
     "test:ui-performance": "node scripts/test-ui-performance.mjs",
