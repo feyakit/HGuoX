@@ -41,6 +41,13 @@ const AUTO_MIRROR_MAX: usize = 10;
 /// 主域 2 + 镜像 4 + 兜底种子 2 就够判断「这一轮谁能用」了，因为 SETTLE_GRACE
 /// 拿到第一个成功就收工。
 const PROBE_BUDGET: usize = 8;
+/// 3.0.22：**整个进程**（一次冷启动）允许多少条自动探活。
+///
+/// 3.0.21 把 8 条当成「一次选线的预算」，但一次冷启动里会自动选线好几次
+/// （boot 的 `line_auto` + 每次硬错误的 `line_failover` + 首屏 1s/3s/7s 重试），
+/// 每建一次 gate 就又拿满 8 条 —— 真机 5 秒内发出 24 条 probe（17 个 origin）。
+/// 现在这条预算挂在全进程上，用尽即停，并且打一行 `[net] probe budget exhausted n=8`。
+const PROCESS_PROBE_BUDGET: usize = PROBE_BUDGET;
 /// 探测并发上限（个位数）。被墙网络里 4 条并发足够在 2–4 秒内出结果，
 /// 又不会像以前那样一次把 40+ 条请求塞进连接池排队。
 const PROBE_CONCURRENCY: usize = 4;
@@ -171,6 +178,45 @@ pub fn is_cached_mirror(origin: &str) -> bool {
         .read()
         .map(|known| known.iter().any(|value| value == origin))
         .unwrap_or(false)
+}
+
+/// 本次进程里**真探活通过**的 origin（3.0.22 A5）。
+///
+/// 为什么需要第三档：内置种子（`SEED_MIRRORS`）刻意不进 `TRUSTED_MIRRORS`（凭据信任），
+/// 也不在落盘缓存里，于是 `net::apply_base` 的允许清单把它们全挡了 —— 真机上就成了
+/// 「探活明明返回 ok（thu.wsaditmwl.cc 连续 7 次 1.0–1.9s ok），换线却一次都没成，
+/// `[net] switch` 一行都没有，最后停在错误页」。
+///
+/// 这一档只是「**我们亲手从自己的候选表里探通过的地址**」，可以当线路用（游客浏览），
+/// 但**不授予凭据信任**：`trusted_auth_origin` 不看它，切过去之后
+/// `session.rebase_if_trusted` 仍为假 → 会话照样清掉，token 不会带过去。
+static VERIFIED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+const VERIFIED_MAX: usize = 32;
+
+/// 探活通过（拿到健康视频列表）时登记。只在内存里，进程重启即清空。
+pub fn remember_verified(origin: &str) {
+    let Some(origin) = crate::net::normalize_base(origin) else { return };
+    let mut known = VERIFIED.write().unwrap_or_else(|error| error.into_inner());
+    if known.iter().any(|value| value == &origin) {
+        return;
+    }
+    if known.len() >= VERIFIED_MAX {
+        known.remove(0);
+    }
+    known.push(origin);
+}
+
+/// 这条 origin 是不是本次进程里探活通过的候选（可以自动切过去，但**不带凭据**）。
+pub fn is_verified_candidate(origin: &str) -> bool {
+    VERIFIED
+        .read()
+        .map(|known| known.iter().any(|value| value == origin))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn clear_verified() {
+    VERIFIED.write().unwrap_or_else(|error| error.into_inner()).clear();
 }
 
 fn remember_cached(items: &[Value]) {
@@ -825,48 +871,128 @@ impl Hit {
 }
 
 async fn probe_hit(tier: &'static str, raw: &str) -> Hit {
-    probe_hit_with(tier, raw, AUTO_PROBE_TIMEOUT, &ProbeGate::new(MIRROR_MAX.max(PROBE_BUDGET))).await
+    probe_hit_with(tier, raw, AUTO_PROBE_TIMEOUT, &ProbeGate::process()).await
 }
 
-/// 探测预算 + 并发闸门（3.0.21 A 节）。
+/// 探测预算 + 并发闸门（3.0.21 A 节，3.0.22 改成**按进程**计）。
 ///
 /// 以前每条候选自己重试 3 次，一次冷启动能刷出 47–108 条 `cmd=probe`；被墙网络里
-/// 这些请求全是白撞，还把首屏挤在后面。现在**一次选线共用一张预算**（默认 8 条），
-/// 并且并发不超过 `PROBE_CONCURRENCY`：预算用尽 / 拿不到并发槽的候选直接放弃，
-/// 但已经有一个成功的就照旧立刻收工（`SETTLE_GRACE`）。
+/// 这些请求全是白撞，还把首屏挤在后面。
+///
+/// 3.0.21 的「一次选线共用一张预算（8 条）」**不够**：真机（小米九 / 2026-11-28）
+/// 一次冷启动里 `line_auto` + `line_failover` + 首屏 1s/3s/7s 重试会各建一张 gate，
+/// 5 秒内就发出 24 条探测（17 个不同 origin）。所以现在自动选线一律用
+/// [`ProbeGate::process`]：**整个进程共享 8 条预算、共享 4 个并发槽**，用尽就停，
+/// 并打一行 `[net] probe budget exhausted n=8`。
+/// 手动测速（设置页「测速」）是用户显式点的，仍用 [`ProbeGate::new`] 自带预算。
 #[derive(Clone)]
 struct ProbeGate {
-    left: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    /// `None` = 用全进程共享的那一份（自动选线）；`Some` = 自己一份（手动测速 / 单测）。
+    left: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    sem: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+}
+
+/// 全进程共用的探测预算（3.0.22）：一次冷启动最多 8 条自动探活。
+static PROCESS_PROBES_LEFT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(PROCESS_PROBE_BUDGET);
+/// `[net] probe budget exhausted` 只打一次（否则每条被放弃的候选都刷一行）。
+static PROBE_EXHAUSTED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn process_sem() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY)))
 }
 
 impl ProbeGate {
+    /// 自带预算的闸门（手动测速 / 单测）：预算与并发都只属于这一次调用。
     fn new(budget: usize) -> Self {
         Self {
-            left: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(budget.min(MIRROR_MAX + 4))),
-            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY)),
+            left: Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                budget.min(MIRROR_MAX + 4),
+            ))),
+            sem: None,
         }
+    }
+
+    /// 全进程共享的闸门（所有自动选线路径都用它）。
+    fn process() -> Self {
+        Self { left: None, sem: None }
+    }
+
+    fn left_of(&self) -> usize {
+        match &self.left {
+            Some(left) => left.load(std::sync::atomic::Ordering::Relaxed),
+            None => PROCESS_PROBES_LEFT.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// 用掉一个名额；用光了返回 false（并保证日志只打一次）。
+    fn take_one(&self) -> bool {
+        let shared = self.left.is_none();
+        let taken = match &self.left {
+            Some(left) => try_take(left),
+            None => try_take(&PROCESS_PROBES_LEFT),
+        };
+        if !taken {
+            note_probe_exhausted(shared);
+        }
+        taken
     }
 
     /// 拿一个探测名额（同时占一个并发槽）。预算用尽返回 None。
     async fn slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        use std::sync::atomic::Ordering;
-        if self.left.load(Ordering::Relaxed) == 0 {
+        if self.left_of() == 0 {
+            note_probe_exhausted(self.left.is_none());
             return None;
         }
-        let permit = self.sem.clone().acquire_owned().await.ok()?;
+        let sem = match &self.sem {
+            Some(sem) => sem.clone(),
+            None => process_sem().clone(),
+        };
+        let permit = sem.acquire_owned().await.ok()?;
         /* 抢到槽之后再扣预算：并发下不能先扣后排队，否则排队的一进来就把预算吃光 */
-        let taken = self
-            .left
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1))
-            .is_ok();
-        taken.then_some(permit)
+        self.take_one().then_some(permit)
     }
 
     /// 剩余预算（单测用：验证「20 个并发只放行 8 个」）。
     #[cfg(test)]
     fn left(&self) -> usize {
-        self.left.load(std::sync::atomic::Ordering::Relaxed)
+        self.left_of()
+    }
+}
+
+/// 原子地扣一个名额（用光返回 false）。
+///
+/// `fetch_update` 在新版 rustc 上标了 deprecated（指 `try_update`），但 `try_update`
+/// 在旧 stable 上还不存在，CI 用哪版不确定 —— 这里显式关掉这条告警，保持与基线同一写法。
+#[allow(deprecated)]
+fn try_take(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    counter.fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1)).is_ok()
+}
+
+/// 预算用尽时打一行（全进程只打一次）：`[net] probe budget exhausted n=8`。
+fn note_probe_exhausted(shared: bool) {
+    if !shared {
+        return;
+    }
+    if !PROBE_EXHAUSTED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let used = PROCESS_PROBE_BUDGET.saturating_sub(
+            PROCESS_PROBES_LEFT.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        crate::netlog::probe_budget_exhausted(used);
+    }
+}
+
+/// 单测用：把全进程预算恢复成满额（`cargo test` 同进程跑多个用例）。
+#[cfg(test)]
+fn reset_process_probe_budget() {
+    use std::sync::atomic::Ordering;
+    PROCESS_PROBES_LEFT.store(PROCESS_PROBE_BUDGET, Ordering::Relaxed);
+    PROBE_EXHAUSTED_LOGGED.store(false, Ordering::Relaxed);
+    if let Some(sem) = process_sem().try_acquire_many(PROBE_CONCURRENCY as u32).ok() {
+        sem.forget();
+        process_sem().add_permits(PROBE_CONCURRENCY);
     }
 }
 
@@ -879,7 +1005,7 @@ fn exhausted_hit(tier: &'static str, origin: &str) -> Hit {
         reachable: false,
         ms: 0,
         status: None,
-        error: Some("探测预算已用尽（3.0.21：一次选线 ≤8 条探活）".into()),
+        error: Some("探测预算已用尽（3.0.22：一次冷启动全进程 ≤8 条探活）".into()),
     }
 }
 
@@ -923,7 +1049,7 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration, gate: 
             break;
         }
         let Some(_permit) = gate.slot().await else {
-            hit.error.get_or_insert_with(|| "探测预算已用尽（3.0.21：一次选线 ≤8 条探活）".into());
+            hit.error.get_or_insert_with(|| "探测预算已用尽（3.0.22：一次冷启动全进程 ≤8 条探活）".into());
             break;
         };
         match tokio::time::timeout(
@@ -972,6 +1098,11 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration, gate: 
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
     hit.ms = started.elapsed().as_millis() as u64;
+    if hit.ok {
+        /* 3.0.22 A5：探活通过的地址登记成「可用候选」——内置种子不在发布页清单里，
+           以前会被 `net::apply_base` 的允许清单挡掉（探通了也用不上）。 */
+        remember_verified(&origin);
+    }
     hit
 }
 
@@ -1113,7 +1244,7 @@ pub async fn auto_pick() -> Value {
             });
         }
     }
-    let gate = ProbeGate::new(PROBE_BUDGET);
+    let gate = ProbeGate::process();
     let mut carried: Vec<Hit> = Vec::new();
     if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
         if last.origin != current && usable(&last.origin) {
@@ -1311,10 +1442,17 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
     /* 发布页在后台先抓起来 —— 真机上它常常是唯一还能拿到「当前族」的来源，
        和第一阶段的探活并行，省掉 5~10 秒。 */
     let published = tokio::spawn(async { mirrors().await });
-    let gate = ProbeGate::new(PROBE_BUDGET);
+    let gate = ProbeGate::process();
     let mut excluded: HashSet<String> = HashSet::new();
     for raw in excludes {
-        if let Some(origin) = crate::net::normalize_base(raw) {
+        /* 3.0.22：前端传的是 `hostOf()` 出来的**裸主机名**（`thu.x.cc`），
+           `normalize_base` 只认带 https:// 的完整 origin —— 以前这里对裸主机名一律
+           返回 None，于是「每次换一条没试过的候选」其实从没生效过：换线还是会
+           挑回刚失败的那条，白白多烧探测预算。这里补一次补全。 */
+        let candidate = raw.trim();
+        let normalized = crate::net::normalize_base(candidate)
+            .or_else(|| crate::net::normalize_base(&format!("https://{candidate}")));
+        if let Some(origin) = normalized {
             excluded.insert(origin);
         }
     }
@@ -1605,7 +1743,7 @@ mod tests {
     }
 
 
-    /// 3.0.21 A3：一次选线的探测**条数**有上限（目标 ≤8），
+    /// 3.0.21 A3（3.0.22 扩到**按进程**）：探测**条数**有上限（目标 ≤8），
     /// 并发不超过 4 —— 以前 10 条候选 × 3 次重试 + 9 条种子能刷出 47–108 条。
     #[tokio::test]
     async fn probe_gate_caps_the_batch_at_eight_requests_and_four_at_a_time() {
@@ -1636,6 +1774,75 @@ mod tests {
         assert_eq!(granted, PROBE_BUDGET, "20 个候选并发抢，只应放行 8 条探活");
         assert_eq!(gate.left(), 0, "预算应当被扣干净");
         assert!(peak.load(Ordering::SeqCst) <= PROBE_CONCURRENCY, "并发峰值 {} 超过 {}", peak.load(Ordering::SeqCst), PROBE_CONCURRENCY);
+    }
+
+    /// 3.0.22 A4：探测预算挂在**全进程**上 —— 一次冷启动里「多次选线」共用 8 条。
+    ///
+    /// 真机证据（小米九 / 2026-11-28）：18:55:09–18:55:15 的 5 秒内 24 条 `cmd=probe`
+    /// （17 个不同 origin），因为 boot 的 line_auto、每次硬错误的 line_failover、
+    /// 首屏 1s/3s/7s 重试各自建了一张 gate，每张都拿满 8 条。
+    #[tokio::test]
+    async fn process_probe_budget_is_shared_across_batches() {
+        let _guard = crate::line_health::test_state_lock();
+        reset_process_probe_budget();
+        let first = ProbeGate::process();
+        let mut granted = 0;
+        for _ in 0..6 {
+            if first.slot().await.is_some() {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 6, "第一轮选线先花掉 6 条");
+
+        /* 第二次选线（新的 gate，但同一次冷启动）：只剩 2 条 */
+        let second = ProbeGate::process();
+        let mut more = 0;
+        for _ in 0..6 {
+            if second.slot().await.is_some() {
+                more += 1;
+            }
+        }
+        assert_eq!(more, 2, "全进程总共只放行 8 条探活，第二次选线只剩 2 条");
+        assert_eq!(second.left(), 0, "预算扣干净");
+        assert!(ProbeGate::process().slot().await.is_none(), "用尽之后一条都不再发");
+        reset_process_probe_budget();
+        assert_eq!(ProbeGate::process().left(), PROBE_BUDGET, "复位后预算回到满额");
+    }
+
+    /// 3.0.22 A5：探活通过的内置种子可以被切成线路，但**不带凭据**。
+    ///
+    /// 真机证据（小米九 / 2026-11-28，net2–net5.log）：`thu.wsaditmwl.cc` 探活连续
+    /// 7 次 ok（1.0–1.9s），但 `[net] switch` 一行都没有 —— 它不在发布页清单/落盘缓存里，
+    /// `apply_base` 直接拒绝，于是「有可用线路却停在错误页」。
+    #[test]
+    fn verified_candidate_can_become_the_base_without_credential_trust() {
+        let _guard = crate::line_health::test_state_lock();
+        let dir = std::env::temp_dir().join(format!("hguox-verified-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::net::bind_base(&dir);
+        clear_verified();
+        let seed = "https://thu.seed.example";
+        assert!(crate::net::set_base(seed).is_err(), "没探活通过的地址不能当线路（挡住伪造 origin）");
+        remember_verified(seed);
+        assert!(crate::lines::is_verified_candidate(seed));
+        let applied = crate::net::set_base(seed).expect("探活通过的候选必须能切过去");
+        assert_eq!(applied, seed);
+        assert!(!crate::net::trusted_auth_origin(seed), "探活通过 ≠ 凭据信任：token 不会带到这条线路上");
+        /* 收尾：把 base 还回主站，别影响别的用例 */
+        let _ = crate::net::set_base(crate::net::DEFAULT_BASE);
+        clear_verified();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「换一条没试过的候选」以前对裸主机名无效（`hostName` 不是合法 origin）。
+    #[test]
+    fn bare_hosts_in_the_exclude_list_are_understood() {
+        assert_eq!(crate::net::normalize_base("thu.example.cc"), None, "裸主机名本身不是合法 origin");
+        assert_eq!(
+            crate::net::normalize_base(&format!("https://{}", "thu.example.cc")).as_deref(),
+            Some("https://thu.example.cc"),
+            "补上 https:// 之后就能进排除集合（failover_excluding 现在这么补）"
+        );
     }
 
     /// 3.0.21 A1：拒绝表命中的镜像不再先撞；但**全被拒绝时退回原列表**，

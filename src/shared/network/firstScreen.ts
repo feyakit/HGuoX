@@ -13,6 +13,27 @@ import { ApiError } from "../api/api";
 /** 三次重试的退避间隔（毫秒），与需求 1s / 3s / 7s 一一对应。 */
 export const FIRST_SCREEN_RETRY_DELAYS: readonly number[] = [1000, 3000, 7000];
 
+/** 首屏首枪的单次请求预算（毫秒，3.0.22）。
+ *
+ *  真机（小米九 / 2026-11-28）`[net] req cmd=api_feed origin=huangguoai.com ms=12001 err=timeout`：
+ *  首屏第一个请求在主域黑洞上等满 12 秒才失败，而这段时间里候选线路一条都没被试过。
+ *  首枪只给 1.5 秒 —— 被墙的线路一秒半就露馅，立刻换候选。 */
+export const FIRST_SCREEN_BUDGET_MS = 1500;
+
+/** 这一次首屏尝试该用多短的预算（毫秒）；`undefined` = 用后端常规 12 秒。
+ *
+ *  规则（少而可解释）：
+ *   * 第一次尝试（首枪）：1.5 秒；
+ *   * 之后的尝试：只要「上一次是快速失败形态（refused/reset/tls/dns）」或者「刚换过线路」，
+ *     仍然 1.5 秒 —— 换了一条线路还等满 12 秒，等于把整条重试链拖到分钟级；
+ *   * 上一次是**纯超时**且没换过线路：`undefined`。那可能只是弱网 / 镜像本身慢，
+ *     1.5 秒会把一条其实能用的线路误杀（这是短预算唯一真正的风险）。 */
+export function firstScreenBudget(ctx: { attempt: number; switched: boolean; lastKind: string }): number | undefined {
+  if (ctx.attempt <= 1) return FIRST_SCREEN_BUDGET_MS;
+  if (ctx.lastKind === "timeout" && !ctx.switched) return undefined;
+  return FIRST_SCREEN_BUDGET_MS;
+}
+
 export type RetryDeps = {
   /** 覆盖退避间隔（测试用短延迟） */
   delays?: readonly number[];
@@ -45,16 +66,23 @@ export function faultKindOf(error: unknown): string {
 /**
  * 跑一次首屏请求；失败就换线 + 退避重试，最多 `delays.length` 次。
  * 全部失败后把**最后一次**的错误原样抛出去（错误页还是拿同一份文案）。
+ *
+ * 3.0.22：`run` 收到这次尝试的上下文（第几次 / 刚换过线没 / 上一次失败类型），
+ * 调用方据此给每次尝试不同的请求预算（见 [`firstScreenBudget`]）。
  */
-export async function withLineRetries<T>(run: () => Promise<T>, deps: RetryDeps = {}): Promise<T> {
+export async function withLineRetries<T>(
+  run: (ctx: { attempt: number; switched: boolean; lastKind: string }) => Promise<T>,
+  deps: RetryDeps = {},
+): Promise<T> {
   const delays = deps.delays ?? FIRST_SCREEN_RETRY_DELAYS;
   const sleep = deps.sleep ?? defaultSleep;
   const shouldRetry = deps.shouldRetry ?? (() => true);
   const tried = [...(deps.tried ?? [])];
 
   let last: unknown;
+  let switched = false;
   try {
-    return await run();
+    return await run({ attempt: 1, switched: false, lastKind: "" });
   } catch (error) {
     last = error;
   }
@@ -72,10 +100,11 @@ export async function withLineRetries<T>(run: () => Promise<T>, deps: RetryDeps 
       }
     }
     if (host) tried.push(host);
+    switched = !!host;
     deps.onRetry?.({ n, delay, err: last, host });
     await sleep(delay);
     try {
-      return await run();
+      return await run({ attempt: n + 1, switched, lastKind: faultKindOf(last) });
     } catch (error) {
       last = error;
     }

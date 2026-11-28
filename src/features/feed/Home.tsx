@@ -4,7 +4,7 @@ import { useTabSwipe } from "./useTabSwipe";
 import { ApiError, api, fmt, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
 import type { HomeBanner } from "../../shared/api/api";
-import { withLineRetries } from "../../shared/network/firstScreen";
+import { FIRST_SCREEN_RETRY_DELAYS, firstScreenBudget, withLineRetries } from "../../shared/network/firstScreen";
 import { useStore } from "../../shared/model/store";
 import { Button } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
@@ -188,6 +188,9 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   /* hero 文字补全只跑一次（阶段二） */
   const detailsAt = useRef(0);
   const aliveRef = useRef(true);
+  /* 3.0.22 错误页后台自救：`load` 里只能「触发」，真正的链条在它下面定义（要复用 load） */
+  const rescueRef = useRef<(tabKey: FeedTab) => void>(() => {});
+  const rescueSeq = useRef(0);
   useEffect(() => { aliveRef.current = true; return () => { aliveRef.current = false; }; }, []);
   const fresh = useFreshness();
   const [rankSignal, setRankSignal] = useState(0);
@@ -242,15 +245,21 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     const silent = opts?.silent === true;
     const force = opts?.force === true;
     if (loadingRef.current && !force) return;
+    /* 3.0.22：用户自己发起的首屏加载（点重试 / 下拉 / 换 tab）要立刻作废后台自救链，
+       否则两条链会互相抢「谁能写回界面」。静默加载（自救自己发的）不算。 */
+    if (!silent && p === 1) rescueSeq.current += 1;
     loadingRef.current = true;
     if (!silent) setLoading(true);
     if (replaceBatch) setShuffling(true);
     if (!silent) setError("");
     const my = ++seq.current;
     loadedTab.current = key;
-    const fetchFeed = () => (key === "new"
-      ? api.feed(p, 21, "new", force)
-      : api.feed(p, 21, undefined, force));
+    const fetchFeed = (attempt?: { attempt: number; switched: boolean; lastKind: string }) => {
+      /* 3.0.22 首枪预算：第一次尝试只给 1.5 秒（被墙线路一秒半露馅），后续按
+         `firstScreenBudget` 的规则给；静默刷新 / 第 2 页不带（照常 12 秒）。 */
+      const opts = attempt ? { budgetMs: firstScreenBudget(attempt) } : undefined;
+      return key === "new" ? api.feed(p, 21, "new", force, opts) : api.feed(p, 21, undefined, force, opts);
+    };
     /* 首屏（第 1 页、非静默）失败不再直接停在错误页：换线 + 1s / 3s / 7s 各重试一次，
        三次都失败才让错误页出现（文案与按钮沿用原样）。
        HTTP 4xx/5xx 是站点在回答 —— 换线没用，仍按旧行为直接上错误页。 */
@@ -304,6 +313,10 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
         /* G 节：原始错误（tls handshake eof / connection reset…）只进「详情」，默认不展示 */
         setErrorRaw(typeof failure?.raw === "string" ? failure.raw : ((e as Error)?.message || ""));
         setErrorNetworkish(!!failure?.networkish);
+        /* 3.0.22 自救：错误页已经出现，但不等用户点「重试」——后台按 1s / 3s / 7s
+           再各试一次，每次换一条**还没试过**的候选；成功就把首屏自动换上
+           （错误页文案与两个按钮一个都不动，用户随时可以自己点）。 */
+        if (firstScreen) rescueRef.current(key);
       }
       if (silent) throw e;
     } finally {
@@ -314,6 +327,50 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
       }
     }
   }, [fresh, mergeBannerText]);
+
+  /* 3.0.22：错误页出现之后的后台自救（四条根因里的第 4 条）。
+     *
+     * 真机事实（小米九 / 2026-11-28，清数据冷启 5 次）：4 次全程停在「当前线路连不上」，
+     * 60 秒内一次都没自己再试 —— 而同一台机、同一条 WiFi 上 curl 是有镜像能通的。
+     * 用户只能自己点「重试」，点了才出内容。
+     *
+     * 现在的形态：错误页照常出现（文案/按钮不变），后台继续按 1s / 3s / 7s 各试一次，
+     * 每次换一条**还没试过**的候选；某一次成功就把首屏自动换上，错误页自己消失。
+     * 任何新的首屏加载（用户点重试、下拉刷新、换 tab）都会让这条链立刻作废。 */
+  const rescue = useCallback(async (tabKey: FeedTab) => {
+    if (!aliveRef.current || firstContentAt.current) return;
+    const id = ++rescueSeq.current;
+    const tried: string[] = [];
+    for (let index = 0; index < FIRST_SCREEN_RETRY_DELAYS.length; index += 1) {
+      const delay = FIRST_SCREEN_RETRY_DELAYS[index];
+      await new Promise<void>((resolve) => { window.setTimeout(resolve, delay); });
+      if (!aliveRef.current || rescueSeq.current !== id) return;
+      if (firstContentAt.current) return;
+      let host = "";
+      try {
+        host = await switchLineForRetry("rescue", tried);
+      } catch {
+        host = "";
+      }
+      if (host) tried.push(host);
+      netLog(`[net] rescue n=${index + 1} delay=${delay} host=${host || "-"}`);
+      logLine(`[feed] 错误页后台自救第 ${index + 1}/${FIRST_SCREEN_RETRY_DELAYS.length} 次（${delay}ms 后，换到 ${host || "原线路"}）`);
+      try {
+        /* 静默加载：不闪骨架、不报错，成功就 item/error 一起被替换 */
+        await load(1, tabKey, false, { silent: true });
+        if (aliveRef.current && !firstContentAt.current) {
+          firstContentAt.current = Math.max(1, Math.round(performance.now()));
+          netLog(`[net] first content ms=${firstContentAt.current}`);
+          releaseBootBudget();
+        }
+        return;
+      } catch { /* 这一轮也失败：等下一个退避间隔 */ }
+    }
+    netLog(`[net] rescue exhausted n=${FIRST_SCREEN_RETRY_DELAYS.length}`);
+  }, [load]);
+  useEffect(() => {
+    rescueRef.current = (tabKey) => { void rescue(tabKey); };
+  }, [rescue]);
 
   /* 推荐页专属异构货架数据（官方口碑推荐榜 + 热播榜 TOP10 + 独家原创宽画幅）。
      每次进页/回前台超过 30s 就重拉（force 绕过缓存），不再是"一个线路只拉一次"。

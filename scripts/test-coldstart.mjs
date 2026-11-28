@@ -195,6 +195,90 @@ try {
   assert.equal(nextCallsAfter, nextCallsBefore, "HTTP 404 不该触发换线重试");
   report.passed.push("边界：HTTP 4xx 不换线、不重试，直接按原文案出错误页");
 
+  /* ── D. 首枪预算（3.0.22 A2）：首屏第一个请求自带 1.5s，后续请求不带 ── */
+  await page.goto(`${origin}tests/coldstart.html`);
+  await page.waitForFunction(() => window.coldstartFixture?.ready);
+  await page.waitForFunction(() => window.coldstartFixture.pendingCount("api_feed") >= 1);
+  const firstArgs = await fx(() => window.coldstartFixture.history
+    .filter((row) => row.cmd === "api_feed").map((row) => row.args));
+  assert.equal(firstArgs.length, 1, `首屏只该发一条 api_feed（实际 ${firstArgs.length} 条：${JSON.stringify(firstArgs)}）`);
+  assert.equal(firstArgs[0].budgetMs, 1500, `首屏第一个请求必须自带 1.5s 预算，实际 ${JSON.stringify(firstArgs[0])}`);
+
+  const budgetPolicy = await fx(() => {
+    const { firstScreenBudget, FIRST_SCREEN_BUDGET_MS } = window.coldstartFixture.retryPolicy;
+    return {
+      constant: FIRST_SCREEN_BUDGET_MS,
+      first: firstScreenBudget({ attempt: 1, switched: false, lastKind: "" }),
+      afterSwitch: firstScreenBudget({ attempt: 2, switched: true, lastKind: "timeout" }),
+      slowNoSwitch: firstScreenBudget({ attempt: 2, switched: false, lastKind: "timeout" }) ?? null,
+      refused: firstScreenBudget({ attempt: 2, switched: false, lastKind: "refused" }),
+    };
+  });
+  assert.equal(budgetPolicy.constant, 1500, "首枪预算常量必须是 1.5s");
+  assert.equal(budgetPolicy.first, 1500, "第一次尝试（首枪）用 1.5s");
+  assert.equal(budgetPolicy.afterSwitch, 1500, "换过线路之后的尝试仍然 1.5s（换条线还等 12s 等于白等）");
+  assert.equal(budgetPolicy.slowNoSwitch, null, "纯超时且没换过线：退回常规预算（保护慢网，别误杀能用的线路）");
+  assert.equal(budgetPolicy.refused, 1500, "快速失败形态（refused）继续用 1.5s");
+  report.passed.push("A2：首屏第一个请求自带 1.5s 预算；换过线仍短预算，纯超时且没换线时退回常规预算（慢网保护）");
+
+  /* 内容出现之后：第 2 页预取不带首屏预算（照常 12s） */
+  await fx(() => window.coldstartFixture.resolveFeed(3));
+  await page.locator(".hg-spotlight").first().waitFor({ timeout: 3000 });
+  await fx(() => window.coldstartFixture.resolveAll("api_home", window.coldstartFixture.banners(2)));
+  await wait(1600);
+  const laterBudgets = await fx(() => window.coldstartFixture.history
+    .filter((row) => row.cmd === "api_feed" && row.args && row.args.page === 2)
+    .map((row) => row.args.budgetMs ?? null));
+  for (const value of laterBudgets) {
+    assert.equal(value, null, `第 2 页请求不该带首屏预算（实际 ${value}）`);
+  }
+  const firstPageCalls = await fx(() => window.coldstartFixture.history
+    .filter((row) => row.cmd === "api_feed" && row.args && row.args.page === 1).length);
+  assert.equal(firstPageCalls, 1, `首屏 api_feed 不许翻倍（实际 ${firstPageCalls} 条）`);
+
+  /* ── E. 错误页后台自救（3.0.22 A4）：错误页出现后仍自动换线重试 3 次 ── */
+  await page.goto(`${origin}tests/coldstart.html`);
+  await page.waitForFunction(() => window.coldstartFixture?.ready);
+  let rounds = 0;
+  while (rounds < 8 && (await page.getByText("当前线路连不上", { exact: false }).count()) === 0) {
+    await page.waitForFunction(() => window.coldstartFixture.pendingCount("api_feed") >= 1, null, { timeout: 12000 });
+    rounds += await fx(() => window.coldstartFixture.rejectAll("api_feed", "NET:tls · tls handshake eof"));
+    await wait(120);
+  }
+  await page.getByText("当前线路连不上", { exact: false }).first().waitFor({ timeout: 8000 });
+  report.passed.push(`A4：首屏 ${rounds} 次尝试全失败后错误页照旧出现（文案不变）`);
+
+  /* 自救第 1 轮：1s 后自动换线 + 重试；这一轮仍然失败 */
+  await page.waitForFunction(() => window.coldstartFixture.nets.some((line) => line.startsWith("[net] rescue n=1")), null, { timeout: 6000 });
+  const rescueOne = await fx(() => window.coldstartFixture.nets.filter((line) => line.startsWith("[net] rescue")));
+  assert(rescueOne.some((line) => line.includes("delay=1000")), `自救第 1 轮必须 1s 后开始：${JSON.stringify(rescueOne)}`);
+  assert.equal(await page.getByText("当前线路连不上", { exact: false }).count() > 0, true, "自救进行中错误页仍在（用户仍可自己点重试）");
+
+  /* 自救第 2 轮：3s 后开始，这次成功 → 首屏自动换上、错误页自己消失。
+     第 1 轮的自救请求什么时候发出取决于上一轮 reject 的时刻，所以这里一边把在途的
+     api_feed 都打掉（让自救链一路往下走），一边等 `[net] rescue n=2` 这行取证。 */
+  let sawSecond = false;
+  const secondDeadline = Date.now() + 30000;
+  while (Date.now() < secondDeadline && !sawSecond) {
+    sawSecond = await fx(() => window.coldstartFixture.nets.some((line) => line.startsWith("[net] rescue n=2")));
+    if (sawSecond) break;
+    if (await fx(() => window.coldstartFixture.pendingCount("api_feed") >= 1)) {
+      await fx(() => window.coldstartFixture.rejectAll("api_feed", "NET:tls · tls handshake eof"));
+    }
+    await wait(200);
+  }
+  assert(sawSecond, `自救必须走到第 2 轮（nets=${JSON.stringify(await fx(() => window.coldstartFixture.nets.filter((line) => line.startsWith("[net] rescue"))))}）`);
+  await page.waitForFunction(() => window.coldstartFixture.pendingCount("api_feed") >= 1, null, { timeout: 10000 });
+  await fx(() => window.coldstartFixture.resolveFeed(4, "自救"));
+  await page.locator(".hg-spotlight").first().waitFor({ timeout: 5000 });
+  await page.getByText("当前线路连不上", { exact: false }).first().waitFor({ state: "detached", timeout: 5000 }).catch(() => {});
+  assert.equal(await page.getByText("当前线路连不上", { exact: false }).count(), 0, "自救成功后错误页必须自己消失");
+  const rescueAll = await fx(() => window.coldstartFixture.nets.filter((line) => line.startsWith("[net] rescue")));
+  assert(rescueAll.some((line) => line.includes("delay=3000")), `自救第 2 轮必须 3s 后开始：${JSON.stringify(rescueAll)}`);
+  const rescuedAt = await fx(() => window.coldstartFixture.nets.filter((line) => line.startsWith("[net] first content ms=")));
+  assert(rescuedAt.length >= 1, "自救出内容也要留 [net] first content ms= 取证行");
+  report.passed.push("A4：错误页出现后按 1s / 3s 自动换线重试，成功即自动刷新首屏（错误页自己消失）");
+
   assert.deepEqual(errors, [], `页面不该有未捕获异常：${errors.join(" | ")}`);
 
   await page.screenshot({ path: join(output, "coldstart.png"), fullPage: false });

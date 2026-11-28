@@ -1,6 +1,6 @@
 //! 业务命令：登录 / 列表 / 详情 / 播放 / 互动。
 
-use crate::net::{base, edge};
+use crate::net::{base, edge, edge_with_budget};
 use crate::session::{Session, SessionStore};
 use serde_json::{json, Value};
 use tauri::State;
@@ -27,11 +27,16 @@ impl Api {
     }
 
     async fn get(&self, path: &str) -> Result<Value, String> {
+        self.get_budget(path, None).await
+    }
+
+    /// 同 [`Self::get`]，但可以给这一次请求一个自己的预算上限（3.0.22 首屏首枪）。
+    async fn get_budget(&self, path: &str, budget_ms: Option<u64>) -> Result<Value, String> {
         let origin = base();
         let token = self.session.token(&origin).filter(|_| {
             !crate::network_policy::strict_security() || crate::net::trusted_auth_origin(&origin)
         });
-        edge(&origin, "GET", path, None, token.as_deref()).await
+        edge_with_budget(&origin, "GET", path, None, token.as_deref(), budget_ms).await
     }
 
     async fn authed(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
@@ -969,14 +974,17 @@ pub async fn api_feed(
     page: u32,
     size: u32,
     sort: Option<String>,
+    budget_ms: Option<u64>,
 ) -> Result<Value, String> {
     // sort=new 是站点支持的「最新上架」，首页「最新」胶囊与最新上架横滑都用它
     let sort = match sort.as_deref() {
         Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
         _ => String::new(),
     };
+    /* 3.0.22：首屏第一个请求由前端带 1.5s 预算（`budgetMs`），失败就立刻换候选；
+       第 2 页 / 详情 / 搜索之类的后续请求不带，照常吃 12 秒总预算。 */
     state
-        .get(&format!("/api/videos?page={page}&size={size}{sort}"))
+        .get_budget(&format!("/api/videos?page={page}&size={size}{sort}"), budget_ms)
         .await
 }
 
