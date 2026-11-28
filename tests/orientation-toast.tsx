@@ -23,6 +23,10 @@ import "../src/index.css";
 
 const q = new URLSearchParams(location.search);
 const FAIL = q.get("fail") !== "0";
+/* 3.0.22 方案 B：iOS 现在会真下发；失败原因由 Rust 返回错误码前缀。
+   ?reject=locked → 「被系统竖排方向锁定拦住」（orientation_locked_by_user，走方案 C）
+   ?reject=other  → 其它失败（老口径兜底） */
+const REJECT = q.get("reject") === "other" ? "other" : "locked";
 const SRC_KIND = q.get("src") === "land" ? "land" : "port";
 const EPS = Math.max(2, Number(q.get("eps") || 6));
 const PLAY_SRC = "http://127.0.0.1:9/never.m3u8";
@@ -33,7 +37,10 @@ const calls: Call[] = [];
 const invoke = (cmd: string, args: Record<string, unknown> = {}) => {
   calls.push({ cmd, args });
   if (cmd === "set_orientation") {
-    return FAIL ? Promise.reject(new Error("系统未允许转屏：orientation is locked")) : Promise.resolve(null);
+    if (!FAIL) return Promise.resolve(null);
+    return REJECT === "locked"
+      ? Promise.reject(new Error("orientation_locked_by_user: 系统方向锁拦下了转屏（UISceneError code=101: orientation locked）"))
+      : Promise.reject(new Error("系统未允许转屏：orientation is locked"));
   }
   if (cmd === "app_boot") return Promise.resolve({ user: { id: 7, nickname: "验收" }, logged_in: true, base: "https://fixture.invalid" });
   if (cmd === "debug_log" || cmd === "playback_log_write") return Promise.resolve();
@@ -58,26 +65,37 @@ const DETAIL = {
   counts: { like: 0, collect: 0, comment: 0, hot: 0 },
 };
 
-/* 方向相关的提示条：只数这几类，别的提示（播放失败等）不算。 */
-const HINT_RE = /锁定|横屏|竖屏/;
+/* 提示计数（3.0.22 方案 C 之后分两类，不能混在一起数）：
+     · toast：真的弹在 .ios-toast-host 里的临时提示；
+     · card：播放页里那张可操作的「方向锁」说明卡（data-hg-control="orientation-lock-hint"，
+       它自己是 role=status，但**不是** toast，不能算进 toast 条数）。
+   只保留与方向相关的文案，播放失败等其它提示不算。 */
+const HINT_RE = /锁定|横屏|竖屏|转屏|方向/;
 const toasts: { text: string }[] = [];
+const cards: { text: string }[] = [];
 const observeToasts = () => {
   const seen = new Set<Element>();
   new MutationObserver((records) => {
     for (const r of records) {
       for (const node of Array.from(r.addedNodes)) {
         if (!(node instanceof Element)) continue;
-        const host = node.closest('[role="status"]');
-        if (!host || seen.has(node)) continue;
+        if (seen.has(node)) continue;
+        const toastHost = node.closest(".ios-toast-host");
+        /* 说明卡是「条件渲染的外层容器」插进来的，data 属性在内层节点上：
+           所以既看 node 自己（closest），也看它子树（querySelector）。 */
+        const card = node.closest('[data-hg-control="orientation-lock-hint"]')
+          || node.querySelector('[data-hg-control="orientation-lock-hint"]');
+        if (!toastHost && !card) continue;
         seen.add(node);
         const text = (node.textContent || "").replace(/\s+/g, " ").trim();
-        if (text && HINT_RE.test(text)) toasts.push({ text });
+        if (!text || !HINT_RE.test(text)) continue;
+        (card ? cards : toasts).push({ text });
       }
     }
   }).observe(document.body, { childList: true, subtree: true });
 };
 
-Object.assign(window, { __TAURI_INTERNALS__: { invoke }, orientFixture: { calls, toasts } });
+Object.assign(window, { __TAURI_INTERNALS__: { invoke }, orientFixture: { calls, toasts, cards } });
 
 /* 媒体打桩：无解码环境里 paused 恒 true，否则画面正中会渲染「继续播放」按钮挡点按。 */
 const media = { paused: false };
