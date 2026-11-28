@@ -632,17 +632,23 @@ pub async fn set_orientation(
         /* run_on_main_thread 的闭包没有返回值，用 channel 把结果带回来才算真的知道成没成。 */
         let (tx, rx) = std::sync::mpsc::channel();
         let ios_mode = mode.map(|m| m.to_string());
+        let ios_mode_for_verify = ios_mode.clone();
         app.run_on_main_thread(move || {
             let _ = tx.send(request_ios_orientation(landscape, ios_mode.as_deref()));
         })
         .map_err(|error| format!("转屏请求没能派发到主线程：{error}"))?;
         match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
-            Ok(Ok(())) => eprintln!("[orientation] iOS 已下发几何更新(landscape={landscape})"),
+            Ok(Ok(())) => {
+                /* 下发成功 ≠ 转过去了：iOS 被「竖排方向锁定」拦下时既不转也不报错。
+                   这里用实际 interfaceOrientation 收尾（最多再等 900ms，成功通常 150ms 内返回）。 */
+                verify_ios_orientation(&app, ios_mode_for_verify).await?;
+                eprintln!("[orientation] iOS 已转屏并确认(landscape={landscape})");
+            }
             Ok(Err(reason)) => {
                 eprintln!("[orientation] iOS 下发失败：{reason}");
                 return Err(reason);
             }
-            Err(_) => return Err("系统转屏无响应（主线程 1.5s 未回应）".to_string()),
+            Err(_) => return Err("orientation_unsupported: 系统转屏无响应（主线程 1.5s 未回应）".to_string()),
         }
     }
     #[cfg(target_os = "android")]
@@ -685,36 +691,213 @@ pub fn set_text_interaction(app: tauri::AppHandle, enabled: bool) -> Result<(), 
     Ok(())
 }
 
+/* ── iOS 方向：mask + 几何更新（3.0.22 方案 B）─────────────────────────
+   背景（W113 查实）：iOS 从 3.0.5 起就有 set_orientation，但那条实现只是「请求一次转场」：
+     · errorHandler 传的是 NULL —— 被系统竖排方向锁定拦下时，前端永远收不到失败；
+     · 没有维护 supportedInterfaceOrientations —— 转过去之后传感器一歪又转回来，等于没锁。
+   这一版补的正是这两点，不新增插件、不改命令接口：
+     ① 进程级 mask（原子量）+ 给根 VC 装一层返回该 mask 的 -supportedInterfaceOrientations。
+        portrait / landscape / unspecified → mask 2 / 24 / 26。iOS 15 没有几何更新时，
+        mask 就是降级路径（配合 attemptRotationToDeviceOrientation 触发一次重算）。
+     ② iOS 16+ 仍然用 requestGeometryUpdate 主动转过去，但 errorHandler 换成**真的 block**
+        （_NSConcreteGlobalBlock，不捕获变量），把 (domain, code, description) 记进进程级槽位。
+     ③ 成败判定**不只看 errorHandler**（它可能根本不回调）：转场后读一次
+        [UIWindowScene interfaceOrientation]，没落到目标方向就返回
+        `orientation_locked_by_user` —— 前端据此走方案 C（说清原因、不伪造全屏）。
+   ⚠️ 本机没有 iOS 工具链：这段只过了 Rust 语法/类型检查，真机行为待 Mac 开机验证，
+      检查清单见 /opt/data/workspace/v3022-rotation-fs.md。 */
+#[cfg(target_os = "ios")]
+pub(crate) mod ios_orientation_lock {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /* UIInterfaceOrientationMask：Portrait = 1<<1；LandscapeLeft = 1<<3；LandscapeRight = 1<<4。 */
+    pub const MASK_PORTRAIT: usize = 1 << 1;
+    pub const MASK_LANDSCAPE: usize = (1 << 3) | (1 << 4);
+    pub const MASK_ALL: usize = MASK_PORTRAIT | MASK_LANDSCAPE;
+
+    /// 当前生效的方向 mask：-supportedInterfaceOrientations 的实现直接读它。
+    static MASK: AtomicUsize = AtomicUsize::new(MASK_ALL);
+    /// 根 VC 上的实现只装一次（装过就不再 class_addMethod）。
+    static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+    /// requestGeometryUpdate 的 errorHandler 写这里。全局 block 不能捕获变量，所以只能走
+    /// 进程级槽位；同一时刻只会有一次转场在飞，够用。
+    static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+    pub fn set_mask(mask: usize) {
+        MASK.store(mask, Ordering::Relaxed);
+    }
+    pub fn mask() -> usize {
+        MASK.load(Ordering::Relaxed)
+    }
+    pub fn installed() -> bool {
+        INSTALLED.load(Ordering::Relaxed) == 1
+    }
+    pub fn mark_installed() {
+        INSTALLED.store(1, Ordering::Relaxed);
+    }
+    pub fn clear_error() {
+        if let Ok(mut slot) = LAST_ERROR.lock() {
+            *slot = None;
+        }
+    }
+    pub fn take_error() -> Option<String> {
+        LAST_ERROR.lock().ok().and_then(|mut slot| slot.take())
+    }
+    fn record_error(text: String) {
+        if let Ok(mut slot) = LAST_ERROR.lock() {
+            *slot = Some(text);
+        }
+    }
+
+    /// objc 的 -supportedInterfaceOrientations：签名固定 (self, _cmd) -> NSUInteger，
+    /// 所以必须是 extern "C" 的裸函数指针（objc 运行时按 IMP 调用）。
+    pub extern "C" fn supported_orientations(_this: *mut c_void, _sel: *mut c_void) -> usize {
+        MASK.load(Ordering::Relaxed)
+    }
+
+    /// requestGeometryUpdate 的 errorHandler。签名固定 (block, NSError*)。
+    pub extern "C" fn geometry_error(_block: *mut c_void, error: *mut c_void) {
+        record_error(describe_error(error));
+    }
+
+    /* 全局 block 的静态布局（struct Block_layout，64 位）。
+       只放一个不捕获变量的 invoke：_NSConcreteGlobalBlock + BLOCK_IS_GLOBAL，
+       系统不会 copy/retain 它，所以这块内存必须是静态的。 */
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: usize,
+        size: usize,
+    }
+
+    #[repr(C)]
+    struct BlockLayout {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: *const c_void,
+        descriptor: *const BlockDescriptor,
+    }
+
+    unsafe impl Sync for BlockLayout {}
+    unsafe impl Sync for BlockDescriptor {}
+
+    static ERROR_BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<BlockLayout>(),
+    };
+    static mut ERROR_BLOCK: BlockLayout = BlockLayout {
+        isa: std::ptr::null(),
+        flags: 1 << 28, // BLOCK_IS_GLOBAL
+        reserved: 0,
+        invoke: std::ptr::null(),
+        descriptor: &ERROR_BLOCK_DESCRIPTOR,
+    };
+
+    /// 取（惰性初始化一次）errorHandler 的 block 指针。取不到 _NSConcreteGlobalBlock 时返回 NULL，
+    /// 调用方就退回「不传 handler」的旧行为 —— 判定仍由转场后的方向读取兜底。
+    pub fn error_handler() -> *mut c_void {
+        extern "C" {
+            static _NSConcreteGlobalBlock: u8;
+        }
+        let isa = std::ptr::addr_of!(_NSConcreteGlobalBlock) as *const c_void;
+        if isa.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            let block = std::ptr::addr_of_mut!(ERROR_BLOCK);
+            (*block).isa = isa;
+            (*block).invoke = geometry_error as *const c_void;
+            block as *mut c_void
+        }
+    }
+
+    /// 把 NSError 读成一行可读文本（domain / code / localizedDescription）。
+    fn describe_error(error: *mut c_void) -> String {
+        use std::ffi::{c_char, CStr};
+        extern "C" {
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
+            fn objc_msgSend();
+        }
+        if error.is_null() {
+            return "unknown error (nil)".to_string();
+        }
+        unsafe {
+            let msg0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg0_isize: unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize =
+                std::mem::transmute(objc_msgSend as *const ());
+            let code = msg0_isize(error, sel_registerName(b"code\0".as_ptr() as *const c_char));
+            let domain = msg0(error, sel_registerName(b"domain\0".as_ptr() as *const c_char));
+            let mut label = "no description".to_string();
+            let desc = msg0(error, sel_registerName(b"localizedDescription\0".as_ptr() as *const c_char));
+            if !desc.is_null() {
+                let utf8 = msg0(desc, sel_registerName(b"UTF8String\0".as_ptr() as *const c_char));
+                if !utf8.is_null() {
+                    label = CStr::from_ptr(utf8 as *const c_char).to_string_lossy().to_string();
+                }
+            }
+            let mut domain_text = String::new();
+            if !domain.is_null() {
+                let utf8 = msg0(domain, sel_registerName(b"UTF8String\0".as_ptr() as *const c_char));
+                if !utf8.is_null() {
+                    domain_text = CStr::from_ptr(utf8 as *const c_char).to_string_lossy().to_string();
+                }
+            }
+            format!("{domain_text} code={code}: {label}")
+        }
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn request_ios_orientation(landscape: bool, mode: Option<&str>) -> Result<(), String> {
     /* iOS 16+ 的正确转屏姿势：拿前台活跃的 UIWindowScene，调
        -[UIWindowScene requestGeometryUpdateWithPreferences:errorHandler:]。
        参数用 +[UIWindowSceneGeometryPreferencesIOS preferencesWithInterfaceOrientations:]。
 
-       ⚠️ 这里**故意不做**旧系统的 KVC 兜底（`UIDevice setValue:forKey:@"orientation"` +
-       `attemptRotationToDeviceOrientation`）：
+       ⚠️ 这里**仍然不做**旧系统的 KVC 兜底（`UIDevice setValue:forKey:@"orientation"`）：
          · 那条路在 iOS 16+ 会抛 NSInternalInconsistencyException
            （"Supported orientations has gone out of sync..."）；
          · Rust 侧接不住 ObjC 异常，异常会直接把进程带走（和安卓 SIGABRT 同类事故）。
-       旧系统拿不到 UIWindowSceneGeometryPreferencesIOS 时返回 Err（前端弹一条
-       playback-hint 并停在竖屏沉浸全屏）—— 宁可转不过去，也不能崩。
+       iOS 15 的降级只走 mask + attemptRotationToDeviceOrientation（不碰 KVC）。
 
        另外：Info.plist 的 UISupportedInterfaceOrientations 必须包含横屏，
        否则系统会拒绝几何更新（控制台报 "Supported orientations has gone out of sync"）。
        见 `src-tauri/Info.ios.plist`（被 Tauri 合并进工程，CI 也生效）。 */
+    use crate::api::ios_orientation_lock as lock;
     use std::ffi::{c_char, c_void};
     extern "C" {
         fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn sel_registerName(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
+        fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        fn class_addMethod(cls: *mut c_void, name: *mut c_void, imp: *mut c_void, types: *const c_char) -> i8;
+        fn class_getInstanceMethod(cls: *mut c_void, name: *mut c_void) -> *mut c_void;
+        fn method_setImplementation(method: *mut c_void, imp: *mut c_void) -> *mut c_void;
     }
 
-    /* UIInterfaceOrientationMask：Portrait = 1<<1 = 2；LandscapeLeft = 1<<3 = 8；
-       LandscapeRight = 1<<4 = 16；UIInterfaceOrientationMaskLandscape = 8|16 = 24。
-       这里横屏用 24（两个方向都允许），避免只因某个方向在 plist 里被允许而请求落空。 */
-    const MASK_PORTRAIT: usize = 2;
-    const MASK_LANDSCAPE: usize = 24;
-    const ACTIVE_FOREGROUND: usize = 0; // UIApplicationStateActive / UIScene.ActivationState.foregroundActive
+    const ACTIVE_FOREGROUND: usize = 0; // UIScene.ActivationState.foregroundActive
+
+    /* mode 优先：unspecified = 两个方向都允许（26），等于把方向还给系统。
+       旧调用方只传 landscape 时行为与以前一致。 */
+    let mask = match mode {
+        Some("portrait") => lock::MASK_PORTRAIT,
+        Some("landscape") => lock::MASK_LANDSCAPE,
+        Some("unspecified") => lock::MASK_ALL,
+        /* 旧调用方只传 landscape；任何其它值都按布尔走。 */
+        _ => {
+            if landscape {
+                lock::MASK_LANDSCAPE
+            } else {
+                lock::MASK_PORTRAIT
+            }
+        }
+    };
+    /* 先落 mask：即便下面几何更新那条路走不通（iOS 15 / 场景拿不到），
+       支持方向也已经改过，iOS 会按它重算。 */
+    lock::set_mask(mask);
+    lock::clear_error();
 
     unsafe {
         let msg0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
@@ -730,40 +913,22 @@ fn request_ios_orientation(landscape: bool, mode: Option<&str>) -> Result<(), St
 
         let prefs_cls = objc_getClass(b"UIWindowSceneGeometryPreferencesIOS\0".as_ptr() as *const c_char);
         let app_cls = objc_getClass(b"UIApplication\0".as_ptr() as *const c_char);
-        /* iOS < 16 没有这个类：直接返回 Err（不调会抛异常的旧 API） */
-        if prefs_cls.is_null() || app_cls.is_null() {
-            return Err("系统没有 UIWindowSceneGeometryPreferencesIOS（iOS 16 以下不支持几何更新）".to_string());
+        if app_cls.is_null() {
+            return Err("orientation_unsupported: 取不到 UIApplication".to_string());
         }
 
-        let sel_prefs = sel_registerName(b"preferencesWithInterfaceOrientations:\0".as_ptr() as *const c_char);
         let responds = sel_registerName(b"respondsToSelector:\0".as_ptr() as *const c_char);
-        if !msg1_bool(prefs_cls, responds, sel_prefs) {
-            return Err("系统不响应 preferencesWithInterfaceOrientations:".to_string());
-        }
-        /* mode 优先：unspecified = 两个方向都允许（26），等于把方向还给系统。
-           旧调用方只传 landscape 时行为与以前一致。 */
-        let mask = match mode {
-            Some("portrait") => MASK_PORTRAIT,
-            Some("landscape") => MASK_LANDSCAPE,
-            Some("unspecified") => MASK_PORTRAIT | MASK_LANDSCAPE,
-            _ => if landscape { MASK_LANDSCAPE } else { MASK_PORTRAIT },
-        };
-        let prefs = msg1_usize(prefs_cls, sel_prefs, mask);
-        if prefs.is_null() {
-            return Err("几何偏好对象创建失败".to_string());
-        }
-
         let app = msg0(app_cls, sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char));
         if app.is_null() {
-            return Err("取不到 UIApplication".to_string());
+            return Err("orientation_unsupported: 取不到 UIApplication".to_string());
         }
         let scenes_set = msg0(app, sel_registerName(b"connectedScenes\0".as_ptr() as *const c_char));
         if scenes_set.is_null() {
-            return Err("取不到 connectedScenes".to_string());
+            return Err("orientation_unsupported: 取不到 connectedScenes".to_string());
         }
         let arr = msg0(scenes_set, sel_registerName(b"allObjects\0".as_ptr() as *const c_char));
         if arr.is_null() {
-            return Err("取不到场景列表".to_string());
+            return Err("orientation_unsupported: 取不到场景列表".to_string());
         }
 
         let sel_count = sel_registerName(b"count\0".as_ptr() as *const c_char);
@@ -773,11 +938,12 @@ fn request_ios_orientation(landscape: bool, mode: Option<&str>) -> Result<(), St
             sel_registerName(b"requestGeometryUpdateWithPreferences:errorHandler:\0".as_ptr() as *const c_char);
         let count = msg0_usize(arr, sel_count);
 
-        /* 优先前台活跃的那个 scene（多窗口/iPad 场景下不一定只有一个） */
+        /* 优先前台活跃的那个 scene（多窗口/iPad 场景下不一定只有一个）。
+           注意：iOS 15 的 scene 不响应 requestGeometryUpdate，但仍要拿它装 mask。 */
         let mut target: *mut c_void = std::ptr::null_mut();
         for i in 0..count {
             let scene = msg1_usize(arr, sel_at, i);
-            if scene.is_null() || !msg1_bool(scene, responds, sel_req) {
+            if scene.is_null() || !msg1_bool(scene, responds, sel_state) {
                 continue;
             }
             if msg0_usize(scene, sel_state) == ACTIVE_FOREGROUND {
@@ -789,14 +955,196 @@ fn request_ios_orientation(landscape: bool, mode: Option<&str>) -> Result<(), St
             }
         }
         if target.is_null() {
-            return Err("没有可请求几何更新的前台场景".to_string());
+            return Err("orientation_unsupported: 没有前台场景".to_string());
         }
-        /* errorHandler 传 NULL：这里只代表「请求已交给系统」，真正被系统拒绝只会在
-           系统日志里留一行，不会抛异常、不会崩（前端仍是竖屏沉浸全屏，可再次点全屏重试）。 */
-        msg2_void(target, sel_req, prefs, std::ptr::null_mut());
+
+        /* ① 给根 VC 装 -supportedInterfaceOrientations → 读进程级 mask。
+           只装一次；类上已经有实现（Tauri 的 VC / 系统）就覆盖它。 */
+        if !lock::installed() {
+            let windows = msg0(target, sel_registerName(b"windows\0".as_ptr() as *const c_char));
+            let window = if windows.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg0(windows, sel_registerName(b"firstObject\0".as_ptr() as *const c_char))
+            };
+            let vc = if window.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg0(window, sel_registerName(b"rootViewController\0".as_ptr() as *const c_char))
+            };
+            if vc.is_null() {
+                return Err("orientation_unsupported: 取不到根 ViewController".to_string());
+            }
+            let cls = object_getClass(vc);
+            let sel = sel_registerName(b"supportedInterfaceOrientations\0".as_ptr() as *const c_char);
+            /* "Q@:" = 返回 NSUInteger，入参 (self, _cmd)。 */
+            let imp = lock::supported_orientations as *const c_void as *mut c_void;
+            let added = class_addMethod(cls, sel, imp, b"Q@:\0".as_ptr() as *const c_char);
+            if added == 0 {
+                let existing = class_getInstanceMethod(cls, sel);
+                if existing.is_null() {
+                    return Err("orientation_unsupported: 装不上 supportedInterfaceOrientations".to_string());
+                }
+                method_setImplementation(existing, imp);
+            }
+            lock::mark_installed();
+        }
+
+        /* ② 让 UIKit 重新问一遍支持方向。iOS 16+ 有 setNeedsUpdateOfSupportedInterfaceOrientations；
+           iOS 15 只有已废弃但仍可调用的 attemptRotationToDeviceOrientation（不抛异常）。 */
+        let root_cls = objc_getClass(b"UIViewController\0".as_ptr() as *const c_char);
+        let sel_needs = sel_registerName(b"setNeedsUpdateOfSupportedInterfaceOrientations\0".as_ptr() as *const c_char);
+        if !root_cls.is_null() && msg1_bool(root_cls, responds, sel_needs) {
+            let vc = ios_root_view_controller(target);
+            if !vc.is_null() {
+                let _: () = msg_send_void(vc, sel_needs);
+            }
+        } else if !root_cls.is_null() {
+            let sel_attempt = sel_registerName(b"attemptRotationToDeviceOrientation\0".as_ptr() as *const c_char);
+            if msg1_bool(root_cls, responds, sel_attempt) {
+                let _ = msg0(root_cls, sel_attempt);
+            }
+        }
+
+        /* ③ iOS 16+：requestGeometryUpdate 立刻转过去（errorHandler 是真的 block，
+           失败原因会落到 lock::LAST_ERROR，由 set_orientation 负责判读）。 */
+        if prefs_cls.is_null() {
+            /* iOS 15：没有几何更新类。mask 已经换过、也请求了一次方向重算，
+               转不转得过去由 set_orientation 的方向校验给结论。 */
+            return Ok(());
+        }
+        let sel_prefs = sel_registerName(b"preferencesWithInterfaceOrientations:\0".as_ptr() as *const c_char);
+        if !msg1_bool(prefs_cls, responds, sel_prefs) {
+            return Err("orientation_unsupported: 系统不响应 preferencesWithInterfaceOrientations:".to_string());
+        }
+        let prefs = msg1_usize(prefs_cls, sel_prefs, mask);
+        if prefs.is_null() {
+            return Err("orientation_unsupported: 几何偏好对象创建失败".to_string());
+        }
+        if !msg1_bool(target, responds, sel_req) {
+            return Err("orientation_unsupported: 场景不支持几何更新".to_string());
+        }
+        let handler = lock::error_handler();
+        msg2_void(target, sel_req, prefs, handler);
         Ok(())
     }
 }
+
+/// 取 scene 的根 ViewController（拿不到返回空指针）。
+#[cfg(target_os = "ios")]
+unsafe fn ios_root_view_controller(scene: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    use std::ffi::{c_char, c_void};
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    let msg0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    let windows = msg0(scene, sel_registerName(b"windows\0".as_ptr() as *const c_char));
+    if windows.is_null() {
+        return std::ptr::null_mut();
+    }
+    let window = msg0(windows, sel_registerName(b"firstObject\0".as_ptr() as *const c_char));
+    if window.is_null() {
+        return std::ptr::null_mut();
+    }
+    msg0(window, sel_registerName(b"rootViewController\0".as_ptr() as *const c_char))
+}
+
+#[cfg(target_os = "ios")]
+unsafe fn msg_send_void(target: *mut std::ffi::c_void, sel: *mut std::ffi::c_void) {
+    extern "C" {
+        fn objc_msgSend();
+    }
+    let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(target, sel);
+}
+
+/// 读当前界面方向：1=portrait / 2=倒置竖 / 3=横左 / 4=横右；0=读不到。
+#[cfg(target_os = "ios")]
+fn ios_interface_orientation(app: &tauri::AppHandle) -> Result<usize, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(unsafe { ios_read_interface_orientation() });
+    })
+    .map_err(|error| format!("读方向没能派发到主线程：{error}"))?;
+    rx.recv_timeout(std::time::Duration::from_millis(800))
+        .map_err(|_| "读方向超时".to_string())
+}
+
+#[cfg(target_os = "ios")]
+unsafe fn ios_read_interface_orientation() -> usize {
+    use std::ffi::{c_char, c_void};
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    let msg0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    let msg0_usize: unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize =
+        std::mem::transmute(objc_msgSend as *const ());
+    let msg1_usize: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    let app_cls = objc_getClass(b"UIApplication\0".as_ptr() as *const c_char);
+    if app_cls.is_null() {
+        return 0;
+    }
+    let app = msg0(app_cls, sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char));
+    if app.is_null() {
+        return 0;
+    }
+    let scenes = msg0(app, sel_registerName(b"connectedScenes\0".as_ptr() as *const c_char));
+    if scenes.is_null() {
+        return 0;
+    }
+    let arr = msg0(scenes, sel_registerName(b"allObjects\0".as_ptr() as *const c_char));
+    if arr.is_null() {
+        return 0;
+    }
+    let count = msg0_usize(arr, sel_registerName(b"count\0".as_ptr() as *const c_char));
+    if count == 0 {
+        return 0;
+    }
+    /* 第一个 scene 就是前台那个（单窗口 App）。 */
+    let scene = msg1_usize(arr, sel_registerName(b"objectAtIndex:\0".as_ptr() as *const c_char), 0);
+    if scene.is_null() {
+        return 0;
+    }
+    msg0_usize(scene, sel_registerName(b"interfaceOrientation\0".as_ptr() as *const c_char))
+}
+
+/// 转场之后核对方向（3.0.22 方案 B ③）。
+///
+/// 判据是**实际界面方向**，不是 errorHandler：被系统竖排方向锁定拦下时，iOS 可能既不转、
+/// 也不回调 handler。等最多 900ms（每 150ms 读一次），没落到目标方向就返回
+/// `orientation_locked_by_user`，前端据此走方案 C（说清原因、不伪造全屏）。
+#[cfg(target_os = "ios")]
+async fn verify_ios_orientation(app: &tauri::AppHandle, mode: Option<String>) -> Result<(), String> {
+    let expect_landscape = match mode.as_deref() {
+        Some("landscape") => true,
+        Some("portrait") => false,
+        /* unspecified：方向还给系统，转不转都对。 */
+        _ => return Ok(()),
+    };
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let Ok(current) = ios_interface_orientation(app) else { continue };
+        if current == 0 {
+            continue;
+        }
+        if (current == 3 || current == 4) == expect_landscape {
+            return Ok(());
+        }
+    }
+    let detail = ios_orientation_lock::take_error()
+        .unwrap_or_else(|| "转场未生效（errorHandler 没有回调）".to_string());
+    Err(format!(
+        "orientation_locked_by_user: 系统方向锁拦下了转屏（{detail}）"
+    ))
+}
+
 
 /* ───────────────────────── 会话 ───────────────────────── */
 

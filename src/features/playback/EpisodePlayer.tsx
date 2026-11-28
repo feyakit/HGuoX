@@ -44,16 +44,41 @@ const PLAYER_SCHEME: AccentScheme = {
   accent: "#7C5CFF", second: "#3B82F6", deep: "#000000", tag: "#26263A", source: "fallback", luma: 0,
 };
 
-/* 系统方向请求的**唯一出口**（进全屏转横屏、退全屏回竖屏都走它）。
-   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation）；
-   iOS：调 objc 锁方向。
-   失败**不再退回 CSS 伪横屏**（那条路已整条删除）：只记日志 + 交给调用方弹一条 playback-hint，
-   画面停在竖屏沉浸全屏 —— 宁可黑边多一点，也不要「转了 90° 但坐标没转」的半横屏。
+/* 系统方向请求的**唯一出口**（进全屏转横屏、退全屏回竖屏、按片源锁竖都走它）。
+   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation）—— 系统级真锁；
+   iOS：Rust 给根 VC 装 supportedInterfaceOrientations + setNeedsUpdateOfSupportedInterfaceOrientations，
+        再 iOS 16+ 请求一次 requestGeometryUpdate —— 同样是**真锁**（3.0.22 方案 B）。
+   失败**不退回 CSS 伪横屏**（那条路已整条删除）：只记日志，提示由调用方按语义决定，
+   画面停在原方向 —— 宁可黑边多一点，也不要「转了 90° 但坐标没转」的半横屏。
    调用一律带日志，真机用「播放诊断」/logcat 分流「JS 没发」还是「发了没成」。 */
 /** 方向请求的三种语义（3.0.13）：
     portrait / landscape = 锁死这一种（传感器转不动）；
     unspecified = 还给系统（离开播放页用，别把整个 App 钉在竖屏）。 */
 export type OrientationMode = "portrait" | "landscape" | "unspecified";
+
+/** 失败语义（3.0.22 方案 C）：Rust 侧的 Err 字符串以这两个前缀开头，前端只认前缀。
+    · locked_by_user：系统「竖排方向锁定」开着（iOS 控制中心 / 安卓自动旋转关闭）——
+      用户自己能修，要告诉他在哪里关，**不是** App 出错；
+    · unsupported：平台/系统版本不具备真锁能力（如 iOS 16 以下的几何更新缺失）。 */
+export type OrientationFailure = "orientation_locked_by_user" | "orientation_unsupported" | "unknown";
+export function orientationFailureOf(error: unknown): OrientationFailure {
+  const text = String(error ?? "");
+  if (text.includes("orientation_locked_by_user")) return "orientation_locked_by_user";
+  if (text.includes("orientation_unsupported")) return "orientation_unsupported";
+  return "unknown";
+}
+
+/* 方向提示的会话级闸门（用户：每切一级都弹一条没法用）。
+   模块级而不是 ref：进出播放页会把 EpisodePlayer 卸载重建，ref 会跟着清零 —— 那样又变成
+   每进一次播放页弹一次。切集 / 进出播放页 / 切后台这些**静默路径一律不弹**，
+   只有用户主动点「全屏观看」失败才可能弹，且每会话最多一条。 */
+let orientationHintShown = false;
+/* iOS：转不过去基本都是控制中心开了「竖排方向锁定」，要告诉他关哪个开关。 */
+const HINT_IOS_LOCKED = "系统「竖排方向锁定」已开启：先在控制中心关掉它，再点「全屏观看」";
+/* 安卓：自动旋转关掉时锁不了横屏，文案沿用 3.0.20。 */
+const HINT_ANDROID_LOCKED = "系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）";
+/* 兜底：说不清原因时不猜，只说不支持。 */
+const HINT_UNSUPPORTED = "这台设备暂不支持强制转屏：请手动横置手机观看";
 
 function requestOrientation(
   landscape: boolean,
@@ -61,12 +86,12 @@ function requestOrientation(
   mode: OrientationMode = landscape ? "landscape" : "portrait",
 ) {
   const fail = (error: unknown) => {
-    logLine(`[orientation] set_orientation(${mode}) 失败：${String(error)}`);
+    logLine(`[orientation] set_orientation(${mode}) 失败：${String(error).slice(0, 200)}`);
     try { onFail?.(error); } catch { /* ignore */ }
   };
   try {
     void invoke("set_orientation", { landscape, mode })
-      .then(() => logLine(`[orientation] set_orientation(${mode}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : ""}`))
+      .then(() => logLine(`[orientation] set_orientation(${mode}) 已下发（${platform}）`))
       .catch(fail);
   } catch (error) { fail(error); }
 }
@@ -239,6 +264,12 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
   /* 「转屏被系统拒绝」的唯一标记：只有它能让移动端在竖屏下保持沉浸全屏（失败兜底）。
      移动端 fs 的**唯一写入口**是下面那条由实际方向推导的 effect，任何地方都不再直接 setFs。 */
   const [fsDenied, setFsDenied] = useState(false);
+  /* 方向被系统锁死（3.0.22 方案 C）：iOS 控制中心「竖排方向锁定」开着 / 安卓关掉自动旋转时，
+     点「全屏观看」什么都不会发生。这个标记只改入口的说明文字和图标（仍然可点 = 重试），
+     **不置灰**：iOS 在请求之前根本查不出锁没锁，只有试过一次才知道。 */
+  const [orientationLocked, setOrientationLocked] = useState(false);
+  /* 「全屏观看」被拦时那张可操作提示卡（每会话最多一次，点「知道了」收起）。 */
+  const [lockHintOpen, setLockHintOpen] = useState(false);
   const clean = store.clean;
   const setClean = store.setClean;
   const setFs = store.setFs;
@@ -347,6 +378,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (isDesktop) return;
     setFs(vpLandscape || fsDenied);
   }, [isDesktop, vpLandscape, fsDenied, setFs]);
+
+  /* 真转过去了（视口变横）就说明系统方向锁已经不拦人：把入口的锁状态和提示卡一起收掉。
+     用户去控制中心关掉方向锁后重新点一次「全屏观看」成功，走的就是这条。 */
+  useEffect(() => {
+    if (!vpLandscape) return;
+    setOrientationLocked(false);
+    setLockHintOpen(false);
+  }, [vpLandscape]);
 
   /* 进出全屏过渡期多次续播，防止 iOS 把播放打断 */
   const keepAliveTimers = useRef<number[]>([]);
@@ -1756,16 +1795,33 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       playEnter(root, fromRect ? { left: fromRect.left, top: fromRect.top, width: fromRect.width, height: fromRect.height } : null, !willRotate);
     }));
     if (!isDesktop) {
-      /* 只做一件事：系统转屏（安卓 Kotlin setRequestedOrientation / iOS objc）。
+      /* 只做一件事：系统转屏（安卓 Kotlin setRequestedOrientation / iOS 根 VC mask + 几何更新）。
          这里**不能再调 requestFullscreen / orientation.lock** —— 安卓 WebView 收到全屏请求会走
          WebChromeClient.onShowCustomView 把 WebView 挪进全屏容器，等于重建一次视图：
          真机实测点全屏时 CDP 连续 RemoteDisconnected，播放进度有丢失风险。 */
       try { logLine("[orientation] 全屏 → 请求系统横屏"); } catch { /* ignore */ }
-      /* 失败兜底：停在竖屏沉浸（fsDenied=true 把 fs 顶起来），只提示、不伪造横屏 */
-      requestOrientation(true, () => {
+      /* 失败按语义分两条（3.0.22 方案 C）：
+         · 被系统方向锁拦住（iOS 控制中心「竖排方向锁定」/ 安卓关掉自动旋转）→ **不伪造全屏**，
+           停在原画面，把「全屏观看」入口改成锁状态并给一条可操作提示（每会话一次）；
+         · 其它失败（系统版本不支持 / 未知）→ 旧口径兜底成竖屏沉浸全屏，同样只提示一次。
+         两条都不弹重复 toast：orientationHintShown 是模块级的，切集/进出播放页不会重置。 */
+      requestOrientation(true, (error) => {
+        const failure = orientationFailureOf(error);
+        if (failure === "orientation_locked_by_user") {
+          setOrientationLocked(true);
+          if (!orientationHintShown) {
+            orientationHintShown = true;
+            setLockHintOpen(true);
+          }
+          try { logLine("[orientation] 全屏被系统方向锁拦住：入口改为锁状态，不伪造横屏"); } catch { /* ignore */ }
+          return;
+        }
         setFsDenied(true);
-        toast("系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）", "info", "playback-hint");
-      });
+        if (!orientationHintShown) {
+          orientationHintShown = true;
+          toast(platform === "ios" ? HINT_UNSUPPORTED : HINT_ANDROID_LOCKED, "info", "playback-hint");
+        }
+      }, "landscape");
       /* 800ms 后量一次视口，真机取证用：真转成功的判据是 innerWidth > innerHeight。
          只记日志不弹提示 —— 慢设备旋转可能超过 1s，误报比不报更烦。 */
       window.setTimeout(() => {
@@ -1829,12 +1885,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     };
   }, [isDesktop, active]);
 
-  /* 按片源宽高锁方向（3.0.13，用户定稿）：
+  /* 按片源宽高锁方向（3.0.13 定稿，3.0.22 起两端同契约）：
        · 竖版片源（宽高比 ≤ 1）→ 锁 portrait：看竖屏剧时手一歪不会整页转成横屏；
        · 横版片源 → 竖屏下**不主动转**（发 unspecified，跟随系统/用户的旋转，转过去就是全屏）；
        · 横版的「全屏观看」→ enterFs 里锁 landscape；exitFs 里重新锁 portrait；
-       · 离开播放页 / 切后台 → unspecified（见下面那个 effect）。
-     插件失败不静默：一条 playback-hint，画面停在竖屏（不伪造横屏）。 */
+       · 离开播放页 / 切后台 → unspecified（见上面那个 effect）。
+     **这条是静默路径**：失败只记日志、不弹提示 —— 否则每切一级片源弹一次（用户实测过）。
+     失败时画面停在竖屏，不伪造横屏。 */
   useEffect(() => {
     if (isDesktop || !active) return;
     if (!videoSize.w || !videoSize.h) return;   // 宽高未到：按竖版处理，先不锁
@@ -1843,10 +1900,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (orientationApplied.current === key) return;
     orientationApplied.current = key;
     logLine(`[orientation] 片源 ${videoSize.w}x${videoSize.h} → ${want}`);
-    requestOrientation(false, () => {
-      toast("系统未允许锁定屏幕方向：转动手机可能会横屏", "info", "playback-hint");
-    }, want);
-  }, [isDesktop, active, curId, videoSize.w, videoSize.h, toast]);
+    requestOrientation(false, undefined, want);
+  }, [isDesktop, active, curId, videoSize.w, videoSize.h]);
 
   /* 物理横置手机时自动进入全屏，竖回时自动退出全屏（对齐 LNPANDY 版）。
      只同步 fs 这**一个**状态：要不要转屏由 fs 单方面决定，不看设备上报。 */
@@ -2264,25 +2319,61 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                   · stopPropagation：这一层在舞台手势面上，不拦的话点击会冒泡成「单击唤出控件」。
                   抖音/剧场两种模式共用同一段（只差手势语义，见 mode 分支）。 */}
               {isActive && !isDesktop && !fs && !vpLandscape && landscapeVideo && !clean && (
-                <Button
-                  type="button"
-                  data-hg-control="fullscreen-entry"
-                  aria-label="全屏观看"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    logLine(`[orientation] 点击「全屏观看」 id=${curId} src=${videoSize.w}x${videoSize.h}`);
-                    enterFs();
-                  }}
-                  className="absolute left-0 right-0 z-20 flex items-center justify-center gap-1.5 pressable"
-                  style={{
-                    top: `calc((var(--vp-h, 100vh) + var(--vp-w, 100vw) * ${srcAspect.toFixed(4)}) / 2 + 8px)`,
-                    height: 44,
-                  }}
-                >
-                  <IExpand size={16} className="hg-ink-2" />
-                  <span className="text-[13px] font-medium hg-ink-2">全屏观看</span>
-                </Button>
+                <>
+                  <Button
+                    type="button"
+                    data-hg-control="fullscreen-entry"
+                    data-orientation-locked={orientationLocked ? "true" : "false"}
+                    aria-label={orientationLocked ? "全屏观看（需先关闭系统竖排方向锁定）" : "全屏观看"}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      logLine(`[orientation] 点击「全屏观看」 id=${curId} src=${videoSize.w}x${videoSize.h} locked=${orientationLocked}`);
+                      enterFs();
+                    }}
+                    className="absolute left-0 right-0 z-20 flex items-center justify-center gap-1.5 pressable"
+                    style={{
+                      top: `calc((var(--vp-h, 100vh) + var(--vp-w, 100vw) * ${srcAspect.toFixed(4)}) / 2 + 8px)`,
+                      height: 44,
+                    }}
+                  >
+                    {orientationLocked ? <ILockF size={15} className="hg-ink-2" /> : <IExpand size={16} className="hg-ink-2" />}
+                    <span className="text-[13px] font-medium hg-ink-2">
+                      {orientationLocked ? "需关闭系统竖排方向锁定" : "全屏观看"}
+                    </span>
+                  </Button>
+
+                  {/* 被系统方向锁拦住的那一次解释（3.0.22 方案 C）：只出现一次/会话，点「知道了」收起。
+                      放在入口下方 10px（竖屏 contain 时那里一定是黑边，不压画面），
+                      不抢播放提示槽、也不是 toast —— 用户想读多久读多久。 */}
+                  {orientationLocked && lockHintOpen && (
+                    <div
+                      className="absolute left-0 right-0 z-20 flex justify-center px-6"
+                      style={{ top: `calc((var(--vp-h, 100vh) + var(--vp-w, 100vw) * ${srcAspect.toFixed(4)}) / 2 + 62px)` }}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div
+                        data-hg-control="orientation-lock-hint"
+                        role="status"
+                        className="flex flex-col items-center gap-2.5 rounded-[14px] px-4 py-3"
+                        style={{ background: "rgba(255,255,255,.07)", border: "1px solid rgba(255,255,255,.12)", maxWidth: 330 }}
+                      >
+                        <span className="text-[12.5px] leading-[1.45] hg-ink-2 text-center">
+                          {platform === "ios" ? HINT_IOS_LOCKED : HINT_ANDROID_LOCKED}
+                        </span>
+                        <Button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setLockHintOpen(false); }}
+                          className="h-8 px-4 rounded-full text-[12.5px] font-semibold pressable"
+                          style={{ background: "rgba(255,255,255,.92)", color: "#0b0e15" }}
+                        >
+                          知道了
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
 
               {/* 图文帖：没有视频就给个正文入口 */}
