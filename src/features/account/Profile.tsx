@@ -653,6 +653,12 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
     onMore: () => setLimits(prev => ({ ...prev, [favTab]: prev[favTab] + 12 })),
   });
 
+  /* 3.0.21 B：换「短剧 / 吃瓜」tab 回顶部（同级内容视图，与榜单一致）。 */
+  const pickFavTab = (next: "video" | "post") => {
+    setFavTab(next);
+    clearSelection();
+    if (favoriteScrollRef.current) favoriteScrollRef.current.scrollTop = 0;
+  };
   const selectionMode = selectedIds.length > 0;
   const toggleSelected = (id: number) => setSelectedIds(cur => cur.includes(id) ? cur.filter(item => item !== id) : [...cur, id]);
   const beginSelection = (id: number) => setSelectedIds(cur => cur.includes(id) ? cur : [...cur, id]);
@@ -669,7 +675,7 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
     tabIndex: favTab === "video" ? 0 : 1,
     tabCount: 2,
     enabled: !selectionMode,
-    onTabChange: index => { setFavTab(index === 0 ? "video" : "post"); clearSelection(); },
+    onTabChange: index => pickFavTab(index === 0 ? "video" : "post"),
   });
   const confirmRemoveSelected = async () => {
     if (removalPending.current || !selectedIds.length) return;
@@ -805,9 +811,9 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
       <div className="shrink-0 hg-page-x pt-2.5 pb-3 relative z-10">
         <SegmentedControl className="hg-seg-track" role="tablist" aria-label="收藏分类" activeIndex={favTab === "video" ? 0 : 1}>
           <Button role="tab" aria-selected={favTab === "video"} className="ios-segmented-item"
-            onClick={() => { setFavTab("video"); clearSelection(); }}>短剧 ({favs.length})</Button>
+            onClick={() => pickFavTab("video")}>短剧 ({favs.length})</Button>
           <Button role="tab" aria-selected={favTab === "post"} className="ios-segmented-item"
-            onClick={() => { setFavTab("post"); clearSelection(); }}>吃瓜 ({postFavs.length})</Button>
+            onClick={() => pickFavTab("post")}>吃瓜 ({postFavs.length})</Button>
         </SegmentedControl>
         {favTab === "video" && favs.length > 0 && (
           <div className="mt-2.5 flex flex-wrap items-center gap-1.5" role="group" aria-label="收藏状态筛选">

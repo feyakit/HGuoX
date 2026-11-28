@@ -34,6 +34,16 @@ const AUTO_PROBE_PATH: &str = "/api/videos?page=1&size=1";
 /// 一次成功要 1.5–3s，所以预算放宽到 8 秒（内含最多 3 次尝试）。
 const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const AUTO_MIRROR_MAX: usize = 10;
+/// 3.0.21：一次选线/换线的**探测总预算**（按「探测请求条数」算，不是按 origin 算）。
+///
+/// 真机证据（小米九，被墙网络）：一次冷启动里有 **47–108 条 `cmd=probe`** ——
+/// 10 条候选 × 最多 3 次重试 + 9 条种子 + 主域，全都在白撞。目标是 ≤ 8 条：
+/// 主域 2 + 镜像 4 + 兜底种子 2 就够判断「这一轮谁能用」了，因为 SETTLE_GRACE
+/// 拿到第一个成功就收工。
+const PROBE_BUDGET: usize = 8;
+/// 探测并发上限（个位数）。被墙网络里 4 条并发足够在 2–4 秒内出结果，
+/// 又不会像以前那样一次把 40+ 条请求塞进连接池排队。
+const PROBE_CONCURRENCY: usize = 4;
 const MIRROR_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAIN_HEAD_START: Duration = Duration::from_millis(1000);
 const SETTLE_GRACE: Duration = Duration::from_millis(350);
@@ -815,12 +825,67 @@ impl Hit {
 }
 
 async fn probe_hit(tier: &'static str, raw: &str) -> Hit {
-    probe_hit_with(tier, raw, AUTO_PROBE_TIMEOUT).await
+    probe_hit_with(tier, raw, AUTO_PROBE_TIMEOUT, &ProbeGate::new(MIRROR_MAX.max(PROBE_BUDGET))).await
+}
+
+/// 探测预算 + 并发闸门（3.0.21 A 节）。
+///
+/// 以前每条候选自己重试 3 次，一次冷启动能刷出 47–108 条 `cmd=probe`；被墙网络里
+/// 这些请求全是白撞，还把首屏挤在后面。现在**一次选线共用一张预算**（默认 8 条），
+/// 并且并发不超过 `PROBE_CONCURRENCY`：预算用尽 / 拿不到并发槽的候选直接放弃，
+/// 但已经有一个成功的就照旧立刻收工（`SETTLE_GRACE`）。
+#[derive(Clone)]
+struct ProbeGate {
+    left: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl ProbeGate {
+    fn new(budget: usize) -> Self {
+        Self {
+            left: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(budget.min(MIRROR_MAX + 4))),
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY)),
+        }
+    }
+
+    /// 拿一个探测名额（同时占一个并发槽）。预算用尽返回 None。
+    async fn slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        use std::sync::atomic::Ordering;
+        if self.left.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let permit = self.sem.clone().acquire_owned().await.ok()?;
+        /* 抢到槽之后再扣预算：并发下不能先扣后排队，否则排队的一进来就把预算吃光 */
+        let taken = self
+            .left
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1))
+            .is_ok();
+        taken.then_some(permit)
+    }
+
+    /// 剩余预算（单测用：验证「20 个并发只放行 8 个」）。
+    #[cfg(test)]
+    fn left(&self) -> usize {
+        self.left.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 这次探测没发出去（预算用尽 / 已经成功过不需要再问）时的占位结果。
+fn exhausted_hit(tier: &'static str, origin: &str) -> Hit {
+    Hit {
+        tier,
+        url: origin.to_owned(),
+        ok: false,
+        reachable: false,
+        ms: 0,
+        status: None,
+        error: Some("探测预算已用尽（3.0.21：一次选线 ≤8 条探活）".into()),
+    }
 }
 
 /// 同 [`probe_hit`]，超时可调：硬错误后的紧急换线只给 4 秒，
 /// 不能让一条被墙的镜像把首屏拖到 5 秒以上。
-async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit {
+async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration, gate: &ProbeGate) -> Hit {
     let mut hit = Hit {
         tier,
         url: raw.to_owned(),
@@ -836,10 +901,18 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
     };
     hit.url = origin.clone();
     let started = Instant::now();
+    /* 拒绝表命中：连探活都不发（真机复测看 `[net] skip …` 这行）。 */
+    if let Some(age) = crate::line_health::blocked_age(&origin) {
+        crate::netlog::skip_origin(&origin, "blocked", age);
+        hit.error = Some("本地拒绝表：这条线路的 TLS 握手被断过，本轮跳过".into());
+        return hit;
+    }
     /* 3.0.14 真机结论：这类网络对 TLS 握手是**概率性**阻断 —— 同一域名同一条线路
        一次 curl 三分之一的尝试 TLS 能过（实测 3 次里 1 次 200）。探活只打一枪的话，
        一条其实能用的镜像会被判死，用户看到的就是「线路全部不可用」。
-       所以探活在总预算内重试到成功（或预算用尽），不再单发一次定生死。 */
+       所以探活在总预算内重试到成功（或预算用尽），不再单发一次定生死。
+       3.0.21：重试次数受共用预算约束（见 [`ProbeGate`]），不再是无上限地 ×3。 */
+    let attempts = if crate::line_health::ever_succeeded(&origin) { 3 } else { 2 };
     let deadline = started + timeout;
     let mut attempt = 0;
     loop {
@@ -849,6 +922,10 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
             hit.error.get_or_insert_with(|| format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
             break;
         }
+        let Some(_permit) = gate.slot().await else {
+            hit.error.get_or_insert_with(|| "探测预算已用尽（3.0.21：一次选线 ≤8 条探活）".into());
+            break;
+        };
         match tokio::time::timeout(
             remaining,
             crate::net::edge_once(&origin, "GET", AUTO_PROBE_PATH, None, None),
@@ -879,12 +956,17 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
                 if crate::line_health::fault_kind(hit.error.as_deref().unwrap_or("")).is_none() {
                     break;
                 }
+                /* 刚被判死（写进拒绝表）的 origin 不必再试：这一轮它已经不可能通了，
+                   再试只是多刷一条 cmd=probe。 */
+                if crate::line_health::blocked(&origin) {
+                    break;
+                }
             }
             Err(_) => {
                 hit.error = Some(format!("视频接口探测超时（{} 秒）", timeout.as_secs()));
             }
         }
-        if attempt >= 3 {
+        if attempt >= attempts {
             break;
         }
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -894,15 +976,20 @@ async fn probe_hit_with(tier: &'static str, raw: &str, timeout: Duration) -> Hit
 }
 
 /// Manual checks retain their JSON API and never change trust or active line.
+///
+/// 手动测速是用户显式点的，不受 `PROBE_BUDGET` 限制；但并发仍走同一个闸门
+/// （个位数），免得一次手动测速把连接池塞满、把首屏挤在后面。
 pub async fn probe(urls: Vec<String>) -> Value {
     let mut out = Vec::new();
-    for chunk in urls[..urls.len().min(MIRROR_MAX)].chunks(6) {
+    let gate = ProbeGate::new(MIRROR_MAX);
+    for chunk in urls[..urls.len().min(MIRROR_MAX)].chunks(PROBE_CONCURRENCY) {
         let mut handles = Vec::new();
         for origin in chunk {
             let origin = origin.clone();
-            handles.push(tokio::spawn(
-                async move { probe_hit("mirror", &origin).await },
-            ));
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                probe_hit_with("mirror", &origin, AUTO_PROBE_TIMEOUT, &gate).await
+            }));
         }
         for handle in handles {
             if let Ok(hit) = handle.await {
@@ -911,6 +998,27 @@ pub async fn probe(urls: Vec<String>) -> Value {
         }
     }
     json!(out)
+}
+
+/// 拒绝表命中的 origin 不再先撞（3.0.21 A 节）。
+///
+/// 但**全被判死时退回原列表**：本地拒绝表是「别白等」的优化，不是「什么都不能试」的
+/// 判决。全部候选都在表里时仍然探一轮，总比直接告诉用户「线路全部不可用」好。
+fn probe_list(candidates: Vec<String>) -> Vec<String> {
+    let skipped: Vec<(String, u64)> = candidates
+        .iter()
+        .filter_map(|origin| crate::line_health::blocked_age(origin).map(|age| (origin.clone(), age)))
+        .collect();
+    if skipped.len() >= candidates.len() {
+        return candidates;
+    }
+    for (origin, age) in skipped {
+        crate::netlog::skip_origin(&origin, "blocked", age);
+    }
+    candidates
+        .into_iter()
+        .filter(|origin| crate::line_health::blocked_age(origin).is_none())
+        .collect()
 }
 
 /// A display recommendation is not proof of publication. Candidates are built
@@ -988,24 +1096,28 @@ pub async fn auto_pick() -> Value {
          ① base 本来就是 24h 内成功过的那条 → 直接认，零探活；
          ② 上次成功的不是当前这条 → 只探它（2.5 秒），通了就用，**完全不碰主域**；
          ③ 它也不通，才进入原来的完整流程（主域 + 发布页镜像 + 种子 + 自定义）。
-       超过 24h 的 last_good 不进 ①②（只在这一轮候选里降级参与），见 load 逻辑。 */
+       超过 24h 的 last_good 不进 ①②（只在这一轮候选里降级参与），见 load 逻辑。
+       3.0.21：①② 都要先过一遍本地拒绝表 —— 上次成功过但现在被墙的线路，
+       不该因为「它是 last_good」再白等一次。 */
     let current = crate::net::base();
+    let usable = |origin: &str| {
+        !is_fixed(origin)
+            && !crate::line_health::blacklisted(origin)
+            && !crate::line_health::blocked(origin)
+    };
     if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
-        let usable_origin = !is_fixed(&last.origin) && !crate::line_health::blacklisted(&last.origin);
-        if usable_origin && last.origin == current {
+        if usable(&last.origin) && last.origin == current {
             return json!({
                 "base": last.origin, "tier": "last-good", "ms": 0,
                 "reason": "last-good-keep", "candidates": [],
             });
         }
     }
+    let gate = ProbeGate::new(PROBE_BUDGET);
     let mut carried: Vec<Hit> = Vec::new();
     if let Some(last) = crate::line_health::last_good_info().filter(|last| last.fresh()) {
-        if last.origin != current
-            && !is_fixed(&last.origin)
-            && !crate::line_health::blacklisted(&last.origin)
-        {
-            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE).await;
+        if last.origin != current && usable(&last.origin) {
+            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE, &gate).await;
             if hit.ok {
                 let mut result = pick_from_hits(std::slice::from_ref(&hit));
                 result["reason"] = json!("last-good-first");
@@ -1015,15 +1127,26 @@ pub async fn auto_pick() -> Value {
             carried.push(hit);
         }
     }
-    let main_handle = tokio::spawn(probe_hit("main", FIXED[0].1));
+    /* 主域在拒绝表里就**一个请求都不发**：以前这里要白等 4.5 秒再灌几十条探活。 */
+    let main_handle = match crate::line_health::blocked_age(FIXED[0].1) {
+        Some(age) => {
+            crate::netlog::skip_origin(FIXED[0].1, "blocked", age);
+            tokio::spawn(async move { exhausted_hit("main", FIXED[0].1) })
+        }
+        None => {
+            let gate = gate.clone();
+            tokio::spawn(async move { probe_hit_with("main", FIXED[0].1, AUTO_PROBE_TIMEOUT, &gate).await })
+        }
+    };
     let mirrors_handle = tokio::spawn(mirrors_cached());
-    auto_pick_full(main_handle, mirrors_handle, carried).await
+    auto_pick_full(main_handle, mirrors_handle, carried, gate).await
 }
 
 async fn auto_pick_full(
     main_handle: tokio::task::JoinHandle<Hit>,
     mirrors_handle: tokio::task::JoinHandle<Result<Value, String>>,
     mut hits: Vec<Hit>,
+    gate: ProbeGate,
 ) -> Value {
     let mut main_handle = main_handle;
     let mut main_pending = true;
@@ -1055,7 +1178,8 @@ async fn auto_pick_full(
     /* 自定义线路永远先探：发布页列表拿不到（`listing` 是 Err）时它照样要参与，
        否则「镜像列表抓不到 + 主站不通」会直接把用户的可用自定义线路判死。 */
     if let Some(origin) = custom_candidate(&crate::net::base()) {
-        set.spawn(async move { Some(probe_hit("custom", &origin).await) });
+        let gate = gate.clone();
+        set.spawn(async move { Some(probe_hit_with("custom", &origin, AUTO_PROBE_TIMEOUT, &gate).await) });
     }
     let mut published = 0usize;
     if let Ok(listing) = &listing {
@@ -1077,16 +1201,25 @@ async fn auto_pick_full(
         let candidates = auto_candidates(items, &crate::net::base(), |origin| {
             is_trusted_mirror(origin) || cached.contains(origin)
         });
+        /* 3.0.21：拒绝表里的镜像不再先撞（全都命中时退回原列表，见 probe_list）。 */
+        let candidates = probe_list(candidates);
         published = candidates.len();
         for origin in candidates {
-            set.spawn(async move { Some(probe_hit("mirror", &origin).await) });
+            let gate = gate.clone();
+            set.spawn(async move {
+                Some(probe_hit_with("mirror", &origin, AUTO_PROBE_TIMEOUT, &gate).await)
+            });
         }
     }
     /* 发布页拿不到（`listing` 是 Err）或候选太少时，用内置种子兜底。
        种子同样逐条真探活，不通就不会被选中；也绝不进信任集合。 */
     if published < SEED_MIN {
-        for origin in SEED_MIRRORS {
-            set.spawn(async move { Some(probe_hit("seed", origin).await) });
+        let seeds = probe_list(SEED_MIRRORS.iter().map(|origin| origin.to_string()).collect());
+        for origin in seeds {
+            let gate = gate.clone();
+            set.spawn(async move {
+                Some(probe_hit_with("seed", &origin, AUTO_PROBE_TIMEOUT, &gate).await)
+            });
         }
     }
     /* 3.0.20：上次成功过但已经超过 24h 的线路 —— 只当普通候选，优先级降到
@@ -1096,9 +1229,13 @@ async fn auto_pick_full(
         if !known
             && !is_fixed(&last.origin)
             && !crate::line_health::blacklisted(&last.origin)
+            && !crate::line_health::blocked(&last.origin)
             && last.origin != crate::net::base()
         {
-            set.spawn(async move { Some(probe_hit("last-good-stale", &last.origin).await) });
+            let gate = gate.clone();
+            set.spawn(async move {
+                Some(probe_hit_with("last-good-stale", &last.origin, AUTO_PROBE_TIMEOUT, &gate).await)
+            });
         }
     }
 
@@ -1139,10 +1276,15 @@ async fn auto_pick_full(
 /// 候选顺序：上次可用（磁盘 line-health.json）→ 发布页缓存 → 内置种子；
 /// 黑名单里的（刚失败过）与 `exclude` 本身直接跳过。
 /// 并发探一批候选，第一个真的能用的就返回（其余立刻取消）。
-async fn race_candidates(candidates: Vec<(String, &'static str)>, budget: Duration) -> (Option<Hit>, Vec<Hit>) {
+async fn race_candidates(
+    candidates: Vec<(String, &'static str)>,
+    budget: Duration,
+    gate: &ProbeGate,
+) -> (Option<Hit>, Vec<Hit>) {
     let mut set = tokio::task::JoinSet::new();
     for (origin, tier) in candidates {
-        set.spawn(async move { probe_hit_with(tier, &origin, budget).await });
+        let gate = gate.clone();
+        set.spawn(async move { probe_hit_with(tier, &origin, budget, &gate).await });
     }
     let mut hits: Vec<Hit> = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -1169,6 +1311,7 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
     /* 发布页在后台先抓起来 —— 真机上它常常是唯一还能拿到「当前族」的来源，
        和第一阶段的探活并行，省掉 5~10 秒。 */
     let published = tokio::spawn(async { mirrors().await });
+    let gate = ProbeGate::new(PROBE_BUDGET);
     let mut excluded: HashSet<String> = HashSet::new();
     for raw in excludes {
         if let Some(origin) = crate::net::normalize_base(raw) {
@@ -1186,8 +1329,9 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
         if !excluded.contains(&last.origin)
             && !is_fixed(&last.origin)
             && !crate::line_health::blacklisted(&last.origin)
+            && !crate::line_health::blocked(&last.origin)
         {
-            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE).await;
+            let hit = probe_hit_with("last-good", &last.origin, LAST_GOOD_PROBE, &gate).await;
             if hit.ok {
                 hits.push(hit);
                 crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
@@ -1225,7 +1369,7 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
         push(origin.to_string(), "seed", &mut candidates, &mut seen);
     }
 
-    let (winner, raced) = race_candidates(candidates, FAILOVER_PROBE).await;
+    let (winner, raced) = race_candidates(candidates, FAILOVER_PROBE, &gate).await;
     hits.extend(raced);
     if let Some(hit) = winner {
         crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
@@ -1250,7 +1394,7 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
                 push(url.to_string(), "published", &mut fresh, &mut seen);
             }
         }
-        let (winner, more) = race_candidates(fresh, FAILOVER_PROBE).await;
+        let (winner, more) = race_candidates(fresh, FAILOVER_PROBE, &gate).await;
         hits.extend(more);
         if let Some(hit) = winner {
             crate::line_health::record_probe(hits.iter().map(Hit::json).collect());
@@ -1458,6 +1602,73 @@ mod tests {
         ] {
             assert!(!healthy_video_data(&invalid), "{invalid}");
         }
+    }
+
+
+    /// 3.0.21 A3：一次选线的探测**条数**有上限（目标 ≤8），
+    /// 并发不超过 4 —— 以前 10 条候选 × 3 次重试 + 9 条种子能刷出 47–108 条。
+    #[tokio::test]
+    async fn probe_gate_caps_the_batch_at_eight_requests_and_four_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = ProbeGate::new(PROBE_BUDGET);
+        let inflight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let gate = gate.clone();
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            set.spawn(async move {
+                let Some(_permit) = gate.slot().await else { return false };
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                true
+            });
+        }
+        let mut granted = 0;
+        while let Some(joined) = set.join_next().await {
+            if joined.ok() == Some(true) {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, PROBE_BUDGET, "20 个候选并发抢，只应放行 8 条探活");
+        assert_eq!(gate.left(), 0, "预算应当被扣干净");
+        assert!(peak.load(Ordering::SeqCst) <= PROBE_CONCURRENCY, "并发峰值 {} 超过 {}", peak.load(Ordering::SeqCst), PROBE_CONCURRENCY);
+    }
+
+    /// 3.0.21 A1：拒绝表命中的镜像不再先撞；但**全被拒绝时退回原列表**，
+    /// 不能因为一张「别白等」的表把候选清空、直接判 all-down。
+    #[test]
+    fn blocked_mirrors_are_skipped_unless_every_candidate_is_blocked() {
+        let _guard = crate::line_health::test_state_lock();
+        let blocked = "https://denied-mirror.example";
+        let open = "https://open-mirror.example";
+        crate::line_health::deny(blocked, "tls");
+        assert_eq!(
+            probe_list(vec![blocked.to_string(), open.to_string()]),
+            vec![open.to_string()],
+            "被墙镜像不该再进探测列表"
+        );
+        assert_eq!(
+            probe_list(vec![blocked.to_string()]),
+            vec![blocked.to_string()],
+            "全都命中拒绝表时仍然探一轮（总比直接说「线路全部不可用」好）"
+        );
+    }
+
+    /// 拒绝表命中时探测立即返回、**一个请求都不发**（`cmd=probe` 不再灌水）。
+    #[tokio::test]
+    async fn denied_origin_is_not_probed_at_all() {
+        let _guard = crate::line_health::test_state_lock();
+        let origin = "https://denied-probe.example";
+        crate::line_health::deny(origin, "tls");
+        let gate = ProbeGate::new(PROBE_BUDGET);
+        let hit = probe_hit_with("mirror", origin, AUTO_PROBE_TIMEOUT, &gate).await;
+        assert!(!hit.ok);
+        assert_eq!(hit.error.as_deref(), Some("本地拒绝表：这条线路的 TLS 握手被断过，本轮跳过"));
+        assert_eq!(gate.left(), PROBE_BUDGET, "跳过的 origin 不消耗探测预算");
     }
 
     fn hit(url: &str, ok: bool, ms: u64) -> Hit {

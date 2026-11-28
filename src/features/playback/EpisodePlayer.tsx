@@ -781,6 +781,14 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
         episodes: detail?.episodes || [],
       };
 
+  /* 3.0.21 E：评论面板加载后回传真实总数（`onTotalChange`）。
+     以前这个回调**没有人传**，是死代码：打开评论面板后，画面上的评论数永远停在
+     打开前那个值（详情接口给的可能早就过期了）。这里接一个「面板回传值优先」的
+     本地覆盖，换剧/换集就清掉，不写 store、不触发详情重拉。 */
+  const [commentLive, setCommentLive] = useState<number | null>(null);
+  useEffect(() => { setCommentLive(null); }, [curId, curEp, kind]);
+  const commentCount = commentLive ?? meta.comment;
+
   const posterUrl = cover(meta.cover, 900);
   /* 封面色链路：这一屏的主视觉决定了全站强调色（换剧才换色） */
   const accentScheme = PLAYER_SCHEME;
@@ -2362,9 +2370,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                     {collected ? <IStarF size={24} className="hg-gold" /> : <IStar size={24} className="hg-ink hg-ov-shadow" />}
                     <span className="text-[12px] text-white/90 tabular-nums leading-none">{fmt(collectCount)}</span>
                   </Button>
-                  <Button onClick={() => setPanel("comments")} className="w-11 h-11 flex flex-col items-center justify-center gap-0.5 pressable" aria-label={`评论 ${fmt(meta.comment)} 条`}>
+                  <Button onClick={() => setPanel("comments")} className="w-11 h-11 flex flex-col items-center justify-center gap-0.5 pressable" aria-label={`评论 ${fmt(commentCount)} 条`}>
                     <ICommentF size={24} className="hg-ink hg-ov-shadow" />
-                    <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums leading-none">{fmt(meta.comment)}</span>
+                    <span className="text-[12px] hg-ink-2 hg-ov-shadow tabular-nums leading-none">{fmt(commentCount)}</span>
                   </Button>
                 </div>
               )}
@@ -2391,9 +2399,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
                       <span className="text-[12px] text-white/90 tabular-nums">{fmt(likeCount)}</span>
                     </Button>
 
-                    <Button onClick={() => setPanel("comments")} aria-label={`评论 ${fmt(meta.comment)} 条`} className="flex flex-col items-center gap-1 pressable">
+                    <Button onClick={() => setPanel("comments")} aria-label={`评论 ${fmt(commentCount)} 条`} className="flex flex-col items-center gap-1 pressable">
                       <ICommentF size={27} className="text-white tsh" />
-                      <span className="text-[12px] text-white/90 tabular-nums">{fmt(meta.comment)}</span>
+                      <span className="text-[12px] text-white/90 tabular-nums">{fmt(commentCount)}</span>
                     </Button>
 
                     <Button onClick={() => void onFav()} disabled={collectPending} aria-busy={collectPending} aria-label="收藏" className="flex flex-col items-center gap-1 pressable" aria-pressed={collected}>
@@ -2901,7 +2909,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
               <EpisodesPanel videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)}
                 onRetry={() => setProxyRetry(v => v + 1)} />
             ) : panel === "comments" ? (
-              <CommentsPanel videoId={curId} ep={curEp} total={meta.comment} kind={kind} onClose={() => setPanel(null)} />
+              <CommentsPanel videoId={curId} ep={curEp} total={commentCount} kind={kind}
+                onTotalChange={setCommentLive} onClose={() => setPanel(null)} />
             ) : null}
           </div>
         </div>
@@ -2910,7 +2919,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
           {/* 评论：移动端底部弹层（右侧操作栏「评论」入口） */}
           <Sheet open={active && panel === "comments"} onClose={() => setPanel(null)}>
             <div className="flex flex-col" style={{ height: "72dvh" }}>
-              <CommentsPanel videoId={curId} ep={curEp} total={meta.comment} kind={kind} onClose={() => setPanel(null)} />
+              <CommentsPanel videoId={curId} ep={curEp} total={commentCount} kind={kind}
+                onTotalChange={setCommentLive} onClose={() => setPanel(null)} />
             </div>
           </Sheet>
 

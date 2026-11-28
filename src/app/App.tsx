@@ -8,6 +8,7 @@ import { accentTokens, FALLBACK_SCHEME } from "../shared/ui/accent";
 import { isMobile, selfTest } from "../shared/api/api";
 import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { runBack } from "../shared/lib/back";
+import { backgroundOrExit } from "../shared/lib/androidBack";
 import Home from "../features/feed/Home";
 import LoginModal from "../features/account/LoginModal";
 import GuestMergePrompt from "../features/account/GuestMergePrompt";
@@ -478,8 +479,10 @@ export default function App() {
     if (loginOpen) { setLoginOpen(false); return; }
     if (stack.length) { pop(); return; }
     if (tab !== "home") { setTab("home"); return; }
-    const moved = (window as Window & { __HG_ANDROID__?: { moveToBackground?: () => boolean } }).__HG_ANDROID__?.moveToBackground?.();
-    if (!moved) invoke("plugin:app|exit", { code: 0 }).catch(() => {});
+    /* 3.0.21 F：桥「不存在 / 返回 false / 抛异常」三种情况都必须真的退出应用
+       （实现在 shared/lib/androidBack.ts，harness 三种情况都跑过）。
+       以前这里是裸调用：Kotlin 侧一抛异常整个回调就抛出去，返回键**完全没反应**。 */
+    backgroundOrExit(invoke);
   };
 
   useEffect(() => {
