@@ -50,6 +50,7 @@
     "test:line-session-keep": "node scripts/test-line-session-keep.mjs",
     "test:network-settings": "node scripts/test-network-settings.mjs",
     "test:coldstart": "node scripts/test-coldstart.mjs",
+    "test:firstscreen-dup": "node scripts/test-firstscreen-dup.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",

@@ -54,7 +54,11 @@ export function useVisibilityRefresh(run: () => void, opts: {
       if (document.visibilityState !== "visible") return;
       if (busyRef.current) return;
       const last = Math.max(lastRef.current?.() ?? 0, 0);
-      if (last && Date.now() - last < minGap) return;
+      /* 0 = 这一屏还从没成功拉过。冷启动时 WebView 一拿到焦点就会走到这里，
+         而首屏那条请求本来就在飞 —— 再 force 一遍就是「同一页两条 api_feed」。
+         首屏出内容之后 fresh.mark() 会把 lastAt 写正，之后的回前台刷新照旧。 */
+      if (last === 0) return;
+      if (Date.now() - last < minGap) return;
       runRef.current();
     };
     document.addEventListener("visibilitychange", handler);
