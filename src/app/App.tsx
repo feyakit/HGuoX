@@ -478,7 +478,8 @@ export default function App() {
     if (loginOpen) { setLoginOpen(false); return; }
     if (stack.length) { pop(); return; }
     if (tab !== "home") { setTab("home"); return; }
-    invoke("plugin:app|exit", { code: 0 }).catch(() => {});
+    const moved = (window as Window & { __HG_ANDROID__?: { moveToBackground?: () => boolean } }).__HG_ANDROID__?.moveToBackground?.();
+    if (!moved) invoke("plugin:app|exit", { code: 0 }).catch(() => {});
   };
 
   useEffect(() => {

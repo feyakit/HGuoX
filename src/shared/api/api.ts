@@ -426,7 +426,7 @@ export const api = {
     }),
   topics: (force = false) => call<{ items: TopicCard[] }>("api_topics", undefined, force),
   topic: (slug: string, page = 1, size = 20, force = false) => call<TopicDetail>("api_topic", { slug, page, size }, force),
-  tags: () => call<{ categories: TagGroup[] }>("api_tags"),
+  tags: (force = false) => call<{ categories: TagGroup[] }>("api_tags", {}, force),
   /** 官网首页 SSR 的热门题材（slug + name，顺序即官网顺序）；失败时前端回退 tags()。 */
   hotTags: (force = false) => call<{ items: { name: string; slug: string }[] }>("api_hot_tags", undefined, force),
   /* 默认 latest：官网标签页默认就是「最新」，省略 sort 时后端按 hot 出（上游 42d7d71） */

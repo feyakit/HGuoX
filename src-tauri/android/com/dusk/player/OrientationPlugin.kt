@@ -37,8 +37,26 @@ class OrientationPlugin(private val activity: Activity) : Plugin(activity) {
      * 不会出现「写到一个还不存在的文档上」那种静默丢失。
      * 同一个已注册插件里做，不再加一个 Rust 端注册点。
      */
+    private inner class AppBridge {
+        @android.webkit.JavascriptInterface
+        fun moveToBackground(): Boolean {
+            if (activity.isFinishing || activity.isDestroyed) return false
+            activity.runOnUiThread {
+                try {
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        activity.moveTaskToBack(true)
+                    }
+                } catch (_: Throwable) {}
+            }
+            return true
+        }
+    }
+
     override fun load(webView: android.webkit.WebView) {
         super.load(webView)
+        try {
+            webView.addJavascriptInterface(AppBridge(), "__HG_ANDROID__")
+        } catch (_: Throwable) {}
         try {
             SafeArea.install(activity, webView)
         } catch (error: Throwable) {
