@@ -195,6 +195,14 @@ if (typeof window !== "undefined") {
 }
 const cacheKey = (cmd: string, args?: Record<string, unknown>) =>
   `L${lineScope}|@${accountScope}|${cmd}:${args ? JSON.stringify(args) : ""}`;
+/** 缓存键里剔掉「只是实现细节」的参数（3.0.22 的 `budgetMs`）：
+ *  首屏首枪带 1.5s 预算、后续/静默刷新不带，它们必须是同一个键，否则同一页会被判成两次不同请求
+ *  （缓存不命中 → api_feed 白白多打一次，用户能看见「首屏翻倍」）。 */
+const keyArgs = (args?: Record<string, unknown>) => {
+  if (!args || !("budgetMs" in args)) return args;
+  const { budgetMs: _ignored, ...rest } = args;
+  return rest;
+};
 /** 页面订阅 `hg:api-data` 时要自己算同一个 key，所以把它导出去（别各写一份）。 */
 export const apiCacheKey = (cmd: string, args?: Record<string, unknown>) => cacheKey(cmd, args);
 
@@ -347,7 +355,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>, force = fals
     clearApiReadCache();
   }
   const ttl = CACHE_TTL[cmd] ?? 0;
-  const key = ttl ? cacheKey(cmd, args) : "";
+  const key = ttl ? cacheKey(cmd, keyArgs(args)) : "";
   /* 1) 缓存命中：没过期直接给；过期但还在 STALE_WINDOW 内 —— 先给旧内容、后台悄悄刷新。
         这就是"先给缓存后静默刷新"：返回首页/详情不再空屏等网络，刷新结果由
         publishData 广播回页面，界面自己换新（旧代码刷新完把结果丢了）。 */
@@ -411,8 +419,13 @@ export const api = {
   accountHistoryDelete: (identity: AccountIdentity, ids: number[]) => call<unknown>("api_account_history_delete", { expectedUserId: identity.expectedUserId, expectedOrigin: identity.expectedOrigin, ids }),
 
   /** `sort="new"` = 站点「最新上架」（/api/videos?sort=new，实测有效）。
-   *  最后一个参数 `force=true` 表示刷新语义（绕过读缓存），下拉刷新/回前台/切 tab 用。 */
-  feed: (page = 1, size = 20, sort?: "new", force = false) => call<Paged<VideoCard>>("api_feed", { page, size, sort: sort ?? null }, force),
+   *  最后一个参数 `force=true` 表示刷新语义（绕过读缓存），下拉刷新/回前台/切 tab 用。
+   *
+   *  `opts.budgetMs`（3.0.22）：给**这一次**请求一个自己的预算上限。首屏第一个请求传
+   *  `FIRST_SCREEN_BUDGET_MS`（1.5s）—— 被墙的线路一秒半就露馅，立刻换候选；
+   *  后续页 / 详情照常吃 12 秒总预算。它不受 `net_boot_budget` 全局开关是否已放开影响。 */
+  feed: (page = 1, size = 20, sort?: "new", force = false, opts?: { budgetMs?: number }) =>
+    call<Paged<VideoCard>>("api_feed", { page, size, sort: sort ?? null, budgetMs: opts?.budgetMs ?? null }, force),
   /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。
    *  3.0.20 起**只发一条请求**（`/api/home` 原样返回，不做详情补全）—— 首屏只等它和 feed。 */
   home: (force = false) => call<{ banners: HomeBanner[]; source: string }>("api_home", undefined, force),
