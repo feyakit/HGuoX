@@ -4,7 +4,7 @@ import { useTabSwipe } from "./useTabSwipe";
 import { ApiError, api, fmt, hostOf, isMobile, logLine, netLog, releaseBootBudget, switchLineForRetry } from "../../shared/api/api";
 import type { Detail, RankItem, TopicCard, VideoCard } from "../../shared/api/types";
 import type { HomeBanner } from "../../shared/api/api";
-import { FIRST_SCREEN_BUDGET_MS, FIRST_SCREEN_RETRY_DELAYS, firstScreenBudget, withLineRetries } from "../../shared/network/firstScreen";
+import { FIRST_SCREEN_RETRY_DELAYS, firstScreenBudget, withLineRetries } from "../../shared/network/firstScreen";
 import { useStore } from "../../shared/model/store";
 import { Button } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
