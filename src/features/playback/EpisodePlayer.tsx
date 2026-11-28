@@ -45,28 +45,49 @@ const PLAYER_SCHEME: AccentScheme = {
 };
 
 /* 系统方向请求的**唯一出口**（进全屏转横屏、退全屏回竖屏都走它）。
-   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation）；
-   iOS：调 objc 锁方向。
-   失败**不再退回 CSS 伪横屏**（那条路已整条删除）：只记日志 + 交给调用方弹一条 playback-hint，
+   安卓：Rust 把请求转给 Kotlin 插件 OrientationPlugin（activity.requestedOrientation）—— 真能锁；
+   iOS：Rust 侧走 UIWindowScene 几何更新，**只请求一次转场，不是锁**（iOS 没有 requestOrientation
+         那种系统级方向锁）。所以「按片源宽高锁方向 / 还方向给系统」这类静默路径在 iOS 上一律不下发
+         （3.0.22，`opts.allowIos` 才放行「用户主动点全屏观看」）—— 否则每个片源、每次切集都失败一次、
+         弹一条「系统未允许锁定屏幕方向」，用户实测「每切一级都弹」。
+   失败**不再退回 CSS 伪横屏**（那条路已整条删除）：只记日志 + 交给调用方决定要不要提示，
    画面停在竖屏沉浸全屏 —— 宁可黑边多一点，也不要「转了 90° 但坐标没转」的半横屏。
    调用一律带日志，真机用「播放诊断」/logcat 分流「JS 没发」还是「发了没成」。 */
 /** 方向请求的三种语义（3.0.13）：
-    portrait / landscape = 锁死这一种（传感器转不动）；
-    unspecified = 还给系统（离开播放页用，别把整个 App 钉在竖屏）。 */
+   portrait / landscape = 锁死这一种（传感器转不动）；
+   unspecified = 还给系统（离开播放页用，别把整个 App 钉在竖屏）。 */
 export type OrientationMode = "portrait" | "landscape" | "unspecified";
+
+/* 方向提示的会话级闸门（3.0.22 用户：切一集弹一次没法用）。
+   用模块级而不是 ref：进出播放页会把 EpisodePlayer 卸载重建，ref 会跟着清零 —— 那样又变成每进一次
+   播放页弹一次。每会话只留一条，文案必须能照着做（见下两条）。 */
+let orientationHintShown = false;
+/* iOS：转不过去基本都是用户在控制中心开了「竖排方向锁定」，此时 App 没错、系统也没错 ——
+   要告诉他去关哪个开关，而不是报「系统未允许」。 */
+const ORIENTATION_HINT_IOS = "已保持竖屏（系统方向锁定已开启）。如需横屏，请在控制中心关闭「竖排方向锁定」";
+/* 安卓：真能锁，失败就是没被允许（多为系统关掉了自动旋转）。文案沿用 3.0.20，不新增概念。 */
+const ORIENTATION_HINT_ANDROID = "系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）";
 
 function requestOrientation(
   landscape: boolean,
   onFail?: (error: unknown) => void,
   mode: OrientationMode = landscape ? "landscape" : "portrait",
+  /* `allowIos`：iOS 上唯一值得真下发的场景是「用户主动点全屏观看」（要真的转一次横屏）。 */
+  opts: { allowIos?: boolean } = {},
 ) {
+  /* 非安卓的静默路径：不下发、不报错，只留一行日志（真机取证用）。 */
+  if (platform !== "android" && !opts.allowIos) {
+    logLine(`[orientation] skip on ${platform}（mode=${mode}：该系统没有可用的方向锁）`);
+    return;
+  }
   const fail = (error: unknown) => {
-    logLine(`[orientation] set_orientation(${mode}) 失败：${String(error)}`);
+    /* 失败不静默也不能刷屏：日志照写（带 mode 与错误摘要），提示交给调用方按会话限频。 */
+    logLine(`[orientation] set_orientation(${mode}) 失败：${String(error).slice(0, 200)}`);
     try { onFail?.(error); } catch { /* ignore */ }
   };
   try {
     void invoke("set_orientation", { landscape, mode })
-      .then(() => logLine(`[orientation] set_orientation(${mode}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : ""}`))
+      .then(() => logLine(`[orientation] set_orientation(${mode}) 已下发${platform === "android" ? "（安卓走 Kotlin 插件）" : "（iOS 几何更新）"}`))
       .catch(fail);
   } catch (error) { fail(error); }
 }
@@ -1728,6 +1749,13 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     }
   }, []);
 
+  /* 方向提示只在「用户主动点全屏观看」失败时说一次，且每会话最多一次（3.0.22）。 */
+  const hintOrientationOnce = useCallback((msg: string) => {
+    if (orientationHintShown) return;
+    orientationHintShown = true;
+    toast(msg, "info", "playback-hint");
+  }, [toast]);
+
   /* 进全屏（报告 17 撤回：这个入口不能删）。
      **只有一条路**：fs 沉浸层（.fs-immersive）+ 请求系统真转屏（安卓 Kotlin 插件 / iOS objc）。
      CSS 旋转兜底已整条删除：插件失败时停在竖屏沉浸全屏并弹一条 playback-hint ——
@@ -1761,18 +1789,26 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
          WebChromeClient.onShowCustomView 把 WebView 挪进全屏容器，等于重建一次视图：
          真机实测点全屏时 CDP 连续 RemoteDisconnected，播放进度有丢失风险。 */
       try { logLine("[orientation] 全屏 → 请求系统横屏"); } catch { /* ignore */ }
-      /* 失败兜底：停在竖屏沉浸（fsDenied=true 把 fs 顶起来），只提示、不伪造横屏 */
-      requestOrientation(true, () => {
-        setFsDenied(true);
-        toast("系统未允许横屏：保持竖屏全屏（打开系统「自动旋转」后可重试）", "info", "playback-hint");
-      });
+      /* 安卓真能锁：失败才兜底成竖屏沉浸（fsDenied）+ 一条提示。
+         iOS 只会「请求一次几何更新」，用户在控制中心锁了竖屏时系统照样忽略，**不代表 App 出错** ——
+         所以 iOS 不按 invoke 成败弹提示，判据只能是 800ms 后视口是否真的转过去（见下面那个定时器）。 */
+      if (platform === "android") {
+        requestOrientation(true, () => {
+          setFsDenied(true);
+          hintOrientationOnce(ORIENTATION_HINT_ANDROID);
+        }, "landscape");
+      } else {
+        requestOrientation(true, undefined, "landscape", { allowIos: true });
+      }
       /* 800ms 后量一次视口，真机取证用：真转成功的判据是 innerWidth > innerHeight。
-         只记日志不弹提示 —— 慢设备旋转可能超过 1s，误报比不报更烦。 */
+         慢设备旋转可能超过 1s，所以这条只证明「没转」（并据此在 iOS 上说一句实话），不证明「转了」。 */
       window.setTimeout(() => {
-        try { logLine(`[orientation] 全屏后视口 ${window.innerWidth}x${window.innerHeight} landscape=${window.innerWidth > window.innerHeight}`); } catch { /* ignore */ }
+        const turned = window.innerWidth > window.innerHeight;
+        try { logLine(`[orientation] 全屏后视口 ${window.innerWidth}x${window.innerHeight} landscape=${turned}`); } catch { /* ignore */ }
+        if (!turned && platform !== "android") hintOrientationOnce(ORIENTATION_HINT_IOS);
       }, 800);
     }
-  }, [isDesktop, keepAlive, resolveSwipe, effectiveVideoIds.length, setClean, setFs, showControls, toast]);
+  }, [isDesktop, keepAlive, resolveSwipe, effectiveVideoIds.length, setClean, setFs, showControls, hintOrientationOnce]);
 
   /* 退出全屏：再点一次回到竖屏（并解除系统方向锁/全屏） */
   const exitFs = useCallback(() => {
@@ -1787,7 +1823,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
       playExit(root, fromRect ? { left: fromRect.left, top: fromRect.top, width: fromRect.width, height: fromRect.height } : null, true);
     }));
     if (!isDesktop) {
-      requestOrientation(false);
+      /* 退还方向：iOS 上也要下发（全屏时请求过 landscape，退出必须请求回 portrait）。 */
+      requestOrientation(false, undefined, "portrait", { allowIos: true });
       try { screen.orientation?.unlock?.(); } catch { /* ignore */ }
       try { if (document.fullscreenElement) void document.exitFullscreen?.()?.catch(() => {}); } catch { /* ignore */ }
     }
@@ -1818,7 +1855,7 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (isDesktop) return undefined;
     const onVisibility = () => {
       if (document.visibilityState === "hidden") requestOrientation(false, undefined, "unspecified");
-      else if (orientationRef.current.fs) requestOrientation(true);
+      else if (orientationRef.current.fs) requestOrientation(true, undefined, "landscape", { allowIos: true });
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
@@ -1834,7 +1871,9 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
        · 横版片源 → 竖屏下**不主动转**（发 unspecified，跟随系统/用户的旋转，转过去就是全屏）；
        · 横版的「全屏观看」→ enterFs 里锁 landscape；exitFs 里重新锁 portrait；
        · 离开播放页 / 切后台 → unspecified（见下面那个 effect）。
-     插件失败不静默：一条 playback-hint，画面停在竖屏（不伪造横屏）。 */
+     3.0.22：这条**静默路径不再弹任何提示**（用户：每切一级都弹「系统未允许锁定屏幕方向」）。
+     它只是「顺手把方向钉住」，钉不住不影响观看；iOS 上更是直接 skip（没有方向锁能力）。
+     真要提示只有一种场合 —— 用户主动点「全屏观看」却转不过去，见 enterFs。 */
   useEffect(() => {
     if (isDesktop || !active) return;
     if (!videoSize.w || !videoSize.h) return;   // 宽高未到：按竖版处理，先不锁
@@ -1843,10 +1882,8 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
     if (orientationApplied.current === key) return;
     orientationApplied.current = key;
     logLine(`[orientation] 片源 ${videoSize.w}x${videoSize.h} → ${want}`);
-    requestOrientation(false, () => {
-      toast("系统未允许锁定屏幕方向：转动手机可能会横屏", "info", "playback-hint");
-    }, want);
-  }, [isDesktop, active, curId, videoSize.w, videoSize.h, toast]);
+    requestOrientation(false, undefined, want);
+  }, [isDesktop, active, curId, videoSize.w, videoSize.h]);
 
   /* 物理横置手机时自动进入全屏，竖回时自动退出全屏（对齐 LNPANDY 版）。
      只同步 fs 这**一个**状态：要不要转屏由 fs 单方面决定，不看设备上报。 */
