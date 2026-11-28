@@ -30,11 +30,14 @@ const errors: string[] = [];
 const at = () => Math.round(performance.now());
 const stackOf = () => {
   const raw = new Error().stack || "";
-  return raw
+  const frames = raw
     .split("\n")
-    .slice(2, 7)
+    .slice(1)
     .map((line) => line.trim().replace(/^at\s+/, ""))
-    .join(" ← ");
+    /* 只留业务帧：夹具、src/、@tauri-apps/api —— react-dom 的 commit 帧对定位没意义 */
+    .filter((frame) => /firstscreen-dup|src\/|@tauri-apps\/api/.test(frame))
+    .map((frame) => frame.split("?")[0].replace(/^.*\/HGuoX\//, ""));
+  return frames.slice(0, 6).join(" ← ");
 };
 const push = (cmd: string, args: Args) => {
   const row: Call = { cmd, args, at: at(), stack: stackOf() };
