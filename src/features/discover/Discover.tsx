@@ -2,7 +2,7 @@ import { Button, SegmentedControl } from "../../shared/ui/ios/controls";
 import { Loader } from "../../shared/ui/ios/effects";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api, fmt } from "../../shared/api/api";
-import type { Post, TopicCard, TopicDetail, VideoCard } from "../../shared/api/types";
+import type { Post, TagGroup, TopicCard, TopicDetail, VideoCard } from "../../shared/api/types";
 import { ACTION_TOAST_SLOT, useStore } from "../../shared/model/store";
 import { MAX_BLOCKED_TAGS, MAX_PINNED_TAGS, MAX_TAG_LENGTH, useContentPreferences } from "../../shared/model/contentPreferences";
 import {
@@ -489,21 +489,57 @@ function TagPinChip({ name, hotScore, isHot, pinned, board = false, onOpen, onTo
   );
 }
 
+const TAG_DIR_CACHE = new Map<number, TagGroup[]>();
+
+function filterNonEmptyTagGroups(raw: TagGroup[]): TagGroup[] {
+  return raw
+    .map((g) => ({
+      ...g,
+      tags: (g.tags ?? []).filter((t) => !(typeof t.video_count === "number" && Number.isFinite(t.video_count) && t.video_count <= 0)),
+    }))
+    .filter((g) => g.tags.length > 0);
+}
+
 export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }) {
   const { push, lineEpoch, toast } = useStore();
   const { preferences, isTagPinned, togglePinnedTag } = useContentPreferences();
   const [searching, setSearching] = useState(false);
-  const { data, loading, err, load } = useDiscoveryData(`tags:${lineEpoch}`, api.tags);
-  const rawGroups = data?.categories ?? [];
-  const groups = useMemo(
-    () => rawGroups
-      .map((g) => ({
-        ...g,
-        tags: (g.tags ?? []).filter((t) => !(typeof t.video_count === "number" && Number.isFinite(t.video_count) && t.video_count <= 0)),
-      }))
-      .filter((g) => g.tags.length > 0),
-    [rawGroups],
-  );
+  const cached = TAG_DIR_CACHE.get(lineEpoch);
+  const [groups, setGroups] = useState(() => cached ?? []);
+  const [loading, setLoading] = useState(() => !cached);
+  const [err, setErr] = useState("");
+  const seqRef = useRef(0);
+
+  const load = useCallback(async (force = false) => {
+    const token = ++seqRef.current;
+    const hit = !force ? TAG_DIR_CACHE.get(lineEpoch) : undefined;
+    if (hit) {
+      setGroups(hit);
+      setLoading(false);
+      setErr("");
+      return;
+    }
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await api.tags(force);
+      if (token !== seqRef.current) return;
+      const next = filterNonEmptyTagGroups(res?.categories ?? []);
+      TAG_DIR_CACHE.set(lineEpoch, next);
+      setGroups(next);
+    } catch (error) {
+      if (token !== seqRef.current) return;
+      setErr(error instanceof Error ? error.message : "标签加载失败，请重试");
+    } finally {
+      if (token === seqRef.current) setLoading(false);
+    }
+  }, [lineEpoch]);
+
+  useEffect(() => {
+    void load(false);
+    return () => { seqRef.current++; };
+  }, [load]);
+
   const pinnedTags = preferences.pinnedTags;
 
   const togglePin = useCallback((name: string) => {
@@ -526,13 +562,13 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
           <p className="hg-sub-meta">按题材与话题检索内容</p>
         </div>
         <Button card onClick={() => setSearching(true)} aria-label="搜索短剧" className="hg-sub-btn"><ISearch size={17} /></Button>
-        <Button card aria-label="刷新" disabled={loading} aria-busy={loading} onClick={() => void load()} className="hg-sub-btn">
+        <Button card aria-label="刷新" disabled={loading} aria-busy={loading} onClick={() => void load(true)} className="hg-sub-btn">
           {loading ? <Loader className="w-4 h-4" /> : <IRefresh size={16} />}
         </Button>
       </header>
 
       <div className="flex-1 scroll-y hg-page-x pt-3 pb-8 relative" aria-busy={loading}>
-        {groups.length > 0 && <RefreshStatus loading={loading} error={err} onRetry={() => void load()} />}
+        {groups.length > 0 && <RefreshStatus loading={loading} error={err} onRetry={() => void load(true)} />}
         {groups.length > 0 && (
           <section data-pin-board className="mb-4 rounded-[16px] p-3.5 a-rise" aria-label="置顶标签"
             style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}>
@@ -553,7 +589,7 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
         {loading && !groups.length ? (
           <div className="flex justify-center py-12"><Loader className="w-8 h-8 spinner" /></div>
         ) : err && !groups.length ? (
-          <Empty icon={<TagIcon size={26} />} title="标签加载失败" sub={err} action="重试" onAction={load} />
+          <Empty icon={<TagIcon size={26} />} title="标签加载失败" sub={err} action="重试" onAction={() => void load(true)} />
         ) : groups.length ? (
           <div className={wide ? "grid grid-cols-2 gap-x-6 items-start" : ""}>{groups.map((g) => (
             <section key={g.name} className="mb-5 a-rise">

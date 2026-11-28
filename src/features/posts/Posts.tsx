@@ -746,7 +746,10 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
             <Button card className="hg-post-detail-btn" aria-label="查看评论"
               onClick={() => setCommentOpen(true)}>
               <IComment size={16} />
-              <span>评论{currentPost.counts?.comment ? ` ${fmt(currentPost.counts.comment)}` : ""}</span>
+              <span>评论{(() => {
+                const n = Number(currentPost.counts?.comment) || Number(currentPost.comment_count) || 0;
+                return n > 0 ? ` ${fmt(n)}` : "";
+              })()}</span>
             </Button>
           </div>
         );
@@ -754,7 +757,9 @@ export function PostDetail({ id, onBack, active = true }: { id: number; onBack: 
 
       <Sheet open={active && commentOpen} onClose={() => setCommentOpen(false)}>
         <div className="flex flex-col" style={{ height: "72dvh" }}>
-          <CommentsPanel videoId={id} ep={0} total={currentPost?.counts?.comment ?? 0} kind="post" onClose={() => setCommentOpen(false)} />
+          <CommentsPanel videoId={id} ep={0}
+            total={Number(currentPost?.counts?.comment) || Number(currentPost?.comment_count) || 0}
+            kind="post" onClose={() => setCommentOpen(false)} />
         </div>
       </Sheet>
       <TagBlockMenu open={tagMenu && active} tags={currentPost?.tags || []} onClose={() => setTagMenu(false)} />

@@ -78,11 +78,12 @@ export function EpisodesPanel({ videoId, episodes, current, onPick, onClose, bar
 }
 
 /* ================= 评论 ================= */
-export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
-  videoId: number; ep: number; total: number; kind?: "video" | "post"; onClose: () => void;
+export function CommentsPanel({ videoId, ep, total, kind = "video", onTotalChange, onClose }: {
+  videoId: number; ep: number; total: number; kind?: "video" | "post"; onTotalChange?: (total: number) => void; onClose: () => void;
 }) {
   const { user, setLoginOpen, toast } = useStore();
   const [items, setItems] = useState<Comment[]>([]);
+  const itemsRef = useRef<Comment[]>([]);
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
   const [loadedTotal, setLoadedTotal] = useState<number | null>(null);
@@ -100,6 +101,10 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
   const scope = `${kind}:${videoId}:${ep}`;
   const currentScope = useRef(scope);
   currentScope.current = scope;
+  const totalRef = useRef(total);
+  totalRef.current = total;
+  const onTotalChangeRef = useRef(onTotalChange);
+  onTotalChangeRef.current = onTotalChange;
   const alive = useRef(true);
 
   const load = useCallback(async (p: number) => {
@@ -113,15 +118,24 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
         : await api.comments(videoId, ep, p, 20);
       if (!alive.current || token !== loadSequence.current || currentScope.current !== scope) return;
       const incoming = (res?.items || []).map((x) => ({ ...x, text: commentText(x.text) }));
-      setItems((prev) => {
-        const base = p === 1 ? [] : prev;
-        const seen = new Set(base.map((x) => x.id));
-        return [...base, ...incoming.filter((x) => !seen.has(x.id))];
-      });
+      const base = p === 1 ? [] : itemsRef.current;
+      const seen = new Set(base.map((x) => x.id));
+      const merged = [...base, ...incoming.filter((x) => !seen.has(x.id))];
+      itemsRef.current = merged;
+      setItems(merged);
       setPage(p);
-      setPages(res?.pagination?.pages || 1);
-      const count = res?.pagination?.total;
-      if (typeof count === "number" && Number.isFinite(count) && count >= 0) setLoadedTotal(count);
+      setPages(Number(res?.pagination?.pages) || 1);
+      const rawTotal = res?.pagination?.total;
+      const parsedTotal = rawTotal === null || rawTotal === undefined || String(rawTotal).trim() === "" ? Number.NaN : Number(rawTotal);
+      const effectiveTotal = Number.isFinite(parsedTotal) && parsedTotal > 0
+        ? Math.max(parsedTotal, merged.length)
+        : merged.length > 0
+          ? Math.max(totalRef.current, merged.length)
+          : (Number.isFinite(parsedTotal) && parsedTotal === 0 ? 0 : null);
+      if (effectiveTotal !== null) {
+        setLoadedTotal(effectiveTotal);
+        onTotalChangeRef.current?.(effectiveTotal);
+      }
     } catch (e) {
       if (alive.current && token === loadSequence.current && currentScope.current === scope) {
         setError((e as Error).message || "加载失败，请重试"); setRetryPage(p);
@@ -135,6 +149,7 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
 
   useEffect(() => {
     alive.current = true;
+    itemsRef.current = [];
     setItems([]); setPage(0); setPages(1); setLoadedTotal(null); setText(""); setSending(false); sendBusy.current = false;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     void load(1);
@@ -165,7 +180,7 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
     <div className="flex flex-col h-full">
       <div className="shrink-0 flex items-center gap-2 px-4 h-12">
         <span className="text-[14px] font-bold text-on">评论</span>
-        <span className="text-[12px] text-mut">{fmt(loadedTotal ?? total)}{kind === "video" ? ` · 第 ${ep} 集` : " 条"}</span>
+        <span className="text-[12px] text-mut">{fmt(Math.max(loadedTotal ?? total, items.length))}{kind === "video" ? ` · 第 ${ep} 集` : " 条"}</span>
         <Button onClick={onClose} aria-label="关闭" className="ml-auto w-7 h-7 rounded-full bg-s3 flex items-center justify-center text-mut pressable">
           <IClose size={13} />
         </Button>
