@@ -659,6 +659,12 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
   const videoSentinel = useRef<HTMLDivElement>(null);
   const postSentinel = useRef<HTMLDivElement>(null);
   const scrollContainer = useRef<HTMLDivElement>(null);
+  /* 3.0.21 B：换「短剧 / 吃瓜」tab（同级内容视图）回顶部，与榜单、分类、收藏统一。
+     筛选 chip 不走这里 —— 频道页的筛选也是回顶部，但那是另一套（Category 自己的）。 */
+  const pickTabChoice = (next: "auto" | "video" | "post") => {
+    setTabChoice(next);
+    if (scrollContainer.current) scrollContainer.current.scrollTop = 0;
+  };
   const currentVideos = loadedVideoTag === tag;
   const currentPosts = loadedPostTag === tag;
   const visibleVideos = currentVideos ? videos : [];
@@ -784,9 +790,9 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
 
         <SegmentedControl className="hg-seg-track mb-3.5" role="tablist" aria-label="标签内容分类" activeIndex={activeTab === "video" ? 0 : 1}>
           <Button role="tab" aria-selected={activeTab === "video"} className="ios-segmented-item"
-            onClick={() => setTabChoice("video")}>短剧 ({currentVideos ? videoTotal : 0})</Button>
+            onClick={() => pickTabChoice("video")}>短剧 ({currentVideos ? videoTotal : 0})</Button>
           <Button role="tab" aria-selected={activeTab === "post"} className="ios-segmented-item"
-            onClick={() => setTabChoice("post")}>吃瓜 ({currentPosts ? postTotal : 0})</Button>
+            onClick={() => pickTabChoice("post")}>吃瓜 ({currentPosts ? postTotal : 0})</Button>
         </SegmentedControl>
 
         {activeTab === "video" ? (
@@ -833,7 +839,7 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
               <Empty icon={<TagIcon size={26} />} title="该标签下暂无短剧"
                 sub={visiblePosts.length > 0 ? `该标签下有 ${postTotal} 篇吃瓜帖子` : undefined}
                 action={visiblePosts.length > 0 ? "查看吃瓜帖" : undefined}
-                onAction={visiblePosts.length > 0 ? () => setTabChoice("post") : undefined} />
+                onAction={visiblePosts.length > 0 ? () => pickTabChoice("post") : undefined} />
             )}
           </>
         ) : (
@@ -853,7 +859,7 @@ export function TagPage({ tag, name, onBack, wide }: { tag: string; name: string
               <Empty icon={<TagIcon size={26} />} title="该标签下暂无吃瓜帖子"
                 sub={visibleVideos.length > 0 ? `该标签下有 ${videoTotal} 部短剧` : undefined}
                 action={visibleVideos.length > 0 ? "查看短剧" : undefined}
-                onAction={visibleVideos.length > 0 ? () => setTabChoice("video") : undefined} />
+                onAction={visibleVideos.length > 0 ? () => pickTabChoice("video") : undefined} />
             )}
           </>
         )}

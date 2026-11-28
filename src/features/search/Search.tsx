@@ -99,6 +99,8 @@ export default function Search({
   const changeTab = (next: "video" | "post") => {
     if (next === tab) return;
     setTab(next);
+    /* 3.0.21 B：换同级 tab 回顶部（榜单/分类/收藏同一套语义） */
+    scrollRef.current?.scrollTo({ top: 0 });
     if (submitted) results.search(submitted, next, true);
   };
 
@@ -377,6 +379,24 @@ export function RankView({ wide, active = true, refreshSignal = 0, onRefreshed }
     tabCount: RANK_TABS.length,
     onTabChange: index => { const next = RANK_TABS[index]; if (next) setTab(next.k); },
   });
+  /* 3.0.21 B：换榜单 tab（同级内容视图）回到顶部 —— 与官网、主流短剧 App 一致。
+     以前切 tab 会带着上一个榜的滚动位，用户以为卡片没换。
+     RankView 不知道外面谁在滚（首页「热榜」分栏和排行榜页各有一个滚动容器），
+     所以沿父节点找第一个「真能纵向滚动」的祖先。**首次挂载不重置**：
+     从详情页返回时页面栈会把滚动位还回来（App.tsx 的 scrollOffsets），这里不许抢。 */
+  const firstTabPaint = useRef(true);
+  useEffect(() => {
+    if (firstTabPaint.current) { firstTabPaint.current = false; return; }
+    let node: HTMLElement | null = rankSwipe.rootRef.current?.parentElement ?? null;
+    while (node) {
+      const style = window.getComputedStyle(node);
+      if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight) {
+        node.scrollTop = 0;
+        return;
+      }
+      node = node.parentElement;
+    }
+  }, [tab, rankSwipe.rootRef]);
 
   return (
     <div ref={rankSwipe.rootRef} {...rankSwipe.handlers} style={{ touchAction: "pan-y" }}>
