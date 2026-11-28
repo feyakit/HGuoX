@@ -74,7 +74,8 @@ async function openApp(context, { mode }) {
           case "line_state": return Promise.resolve({ base: window.v3014.switched ? "https://thu.dvygahpw.cc" : "https://huangguoai.com", default: "https://huangguoai.com", custom: false, manual: false, fixed: [{ name: "固定线路 1", url: "https://huangguoai.com" }] });
           case "line_auto": return Promise.resolve({ base: "https://huangguoai.com", previous: "https://huangguoai.com", switched: false, pick: { base: "https://huangguoai.com", tier: "main", ms: 1, reason: "fixture", candidates: [] } });
           case "line_health": return Promise.resolve({ base: "https://huangguoai.com", ok: true, ms: 1, status: 200 });
-          case "line_failover": {
+          case "line_failover":
+          case "line_failover_next": {
             /* manual：模拟用户手动选了线路，后端拒绝自动换（硬约束） */
             if (mode === "manual-down") return Promise.resolve({ previous: "https://thu.dvygahpw.cc", base: "https://thu.dvygahpw.cc", switched: false, reason: "manual", ms: 0, pick: null });
             const canSwitch = mode === "failover" || mode === "two-hop";
@@ -294,7 +295,7 @@ try {
     twoHopOk = await twoHopPage.evaluate(() => !document.querySelector('[role="alert"]') && (document.querySelectorAll(".hg-spotlight").length + document.querySelectorAll(".hg-poster-name").length) > 0);
   }
   const twoHopState = await twoHopPage.evaluate(() => ({
-    failovers: window.v3014.calls.filter(c => c.cmd === "line_failover").length,
+    failovers: window.v3014.calls.filter(c => c.cmd === "line_failover" || c.cmd === "line_failover_next").length,
     feedAttempts: window.v3014.calls.filter(c => c.cmd === "api_feed").length,
     alert: !!document.querySelector('[role="alert"]'),
   }));

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, logLine } from "../../shared/api/api";
 import { useContentPreferences } from "../../shared/model/contentPreferences";
-import { readDislikedIds } from "./feedPrefs";
 import { pickLine } from "../../shared/network/autoLine";
 import EpisodePlayer from "../playback/EpisodePlayer";
 import { Button } from "../../shared/ui/ios/controls";
@@ -186,11 +185,9 @@ export default function EndlessFeed({ title = "", bottomInset = 0, active, onBac
   /** 洗牌后的候选里取没播过的；超过 300 个就丢掉最旧的（允许很久以后重刷到） */
   const takeFresh = useCallback((items: Card[]): number[] => {
     const fresh: number[] = [];
-    /* 「不感兴趣」的剧不再进池子（本地记忆，30 天 / 200 条，见 feedPrefs.ts） */
-    const disliked = readDislikedIds();
     for (const item of items) {
       const id = Number(item?.id);
-      if (!Number.isFinite(id) || id <= 0 || seen.current.has(id) || disliked.has(id)) continue;
+      if (!Number.isFinite(id) || id <= 0 || seen.current.has(id)) continue;
       if (seenOrder.current.length >= SEEN_MEMORY) {
         const oldest = seenOrder.current.shift();
         if (oldest !== undefined) seen.current.delete(oldest);

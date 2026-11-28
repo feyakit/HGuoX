@@ -525,6 +525,10 @@ export function TagsPage({ onBack, wide }: { onBack: () => void; wide: boolean }
       const res = await api.tags(force);
       if (token !== seqRef.current) return;
       const next = filterNonEmptyTagGroups(res?.categories ?? []);
+      if (!TAG_DIR_CACHE.has(lineEpoch) && TAG_DIR_CACHE.size >= 3) {
+        const oldest = TAG_DIR_CACHE.keys().next().value;
+        if (oldest !== undefined) TAG_DIR_CACHE.delete(oldest);
+      }
       TAG_DIR_CACHE.set(lineEpoch, next);
       setGroups(next);
     } catch (error) {

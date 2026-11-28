@@ -91,8 +91,6 @@ export type EpisodePlayerProps = {
   bottomInset: number;
   onBack?: () => void;
   onNearEnd?: () => void;
-  /** 刷剧流里点「不感兴趣」：先本地记账并跳下一条，再通知外壳（可选） */
-  onDislike?: (id: number) => void;
   /** 当前条目变化时回调（「抖音模式」外壳用它判断是否已在尾部） */
   onActiveIndex?: (index: number) => void;
   /** 无限流：允许 onNearEnd 在 context 模式下也触发，并在右上角显示 ⚡ 序位 */
@@ -2336,7 +2334,6 @@ export default function EpisodePlayer({ videoIds, startIndex = 0, title = "", mo
               {/* 右侧操作栏（移动端）：点赞 / 收藏 / 评论 / 更多（3.0.13）
                   颜色写死不跟主题走：浅色主题下这些字必须仍是白色。
                   · 3.0.13 删掉「全屏」—— 入口统一到视频下方「全屏观看」那行，右上不再有第二颗；
-                  · 「更多」（video-preference-trigger，原来贴在底栏右端）并进这一列，当最后一项；
                   · 整组垂直锚定在画面 58% 处（居中偏下，拇指好够），距右边缘 = 右安全区 + 12；
                   · 间距 14（横屏 10），热区统一 44×44，图标 24（点赞 26）。
                   位置一律走 top/transform，不再用 bottom 反推 —— 少一项不会让整组往下滑。 */}

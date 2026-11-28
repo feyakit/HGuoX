@@ -359,7 +359,7 @@ function UserContent({ id, name, onBack, wide }: { id: number; name?: string; on
       {state.loading && !state.items.length ? <div className="flex justify-center py-12"><Loader /></div>
         : state.err && !state.items.length ? <Empty icon={<IGrid size={26} />} title="作品加载失败" sub={state.err} action="重试" onAction={() => void state.loadMore()} />
         : displayItems.length ? <Masonry videos={displayItems} scopeKey={`${id}:${sortMetric}:${sortDir}:${statusFilter}`} wide={wide} onOpen={v => push({ kind: "series", id: v.id })} />
-        : state.items.length > 0 && statusFilter !== "all" ? <Empty icon={<IGrid size={26} />} title="当前筛选下暂无作品" sub="切换其他状态或查看全部作品" action="查看全部" onAction={() => setStatusFilter("all")} />
+        : state.items.length > 0 && statusFilter !== "all" ? <Empty icon={<IGrid size={26} />} title="当前筛选下暂无作品" sub={state.hasMore ? `已加载的 ${state.items.length} 部作品中暂无匹配，可继续加载或查看全部` : "切换其他状态或查看全部作品"} action="查看全部" onAction={() => setStatusFilter("all")} />
         : <Empty icon={<IGrid size={26} />} title="暂无作品" />}
       <PaginationFeedback state={state} />
     </div>

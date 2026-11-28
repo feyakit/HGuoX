@@ -818,7 +818,7 @@ function FavoritesContent({ onBack, wide, initialTab, active }: { onBack: () => 
               ["finished", "已完结"],
             ] as const).map(([key, label]) => (
               <Button key={key} card aria-pressed={favFilter === key}
-                className={`hg-tag-pill ${favFilter === key ? "is-active" : ""}`}
+                className={`hg-tag-pill ${favFilter === key ? "is-on" : ""}`}
                 onClick={() => { setFavFilter(key); clearSelection(); }}>
                 {label}
               </Button>
