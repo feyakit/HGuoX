@@ -421,9 +421,11 @@ export const api = {
   /** `sort="new"` = 站点「最新上架」（/api/videos?sort=new，实测有效）。
    *  最后一个参数 `force=true` 表示刷新语义（绕过读缓存），下拉刷新/回前台/切 tab 用。
    *
-   *  `opts.budgetMs`（3.0.22）：给**这一次**请求一个自己的预算上限。首屏第一个请求传
-   *  `FIRST_SCREEN_BUDGET_MS`（1.5s）—— 被墙的线路一秒半就露馅，立刻换候选；
-   *  后续页 / 详情照常吃 12 秒总预算。它不受 `net_boot_budget` 全局开关是否已放开影响。 */
+   *  `opts.budgetMs`（3.0.22 / 3.0.22-b）：给**这一次**请求一个自己的预算上限。
+   *  3.0.22-b 起首屏**不再传**它：首屏预算归后端 `net::first_connect_ms()`
+   *  （按实测 RTT 自适应，下限 3s / 上限 6s，日志 `[net] first budget=… rtt=…`）。
+   *  以前这里传死 1.5s，真机上会把「单请求 1.3–3.0s 的可用线路」误杀。
+   *  传了也只会在后端值上再取 `min`，所以**不要**再从早期版本抄 1500 回来。 */
   feed: (page = 1, size = 20, sort?: "new", force = false, opts?: { budgetMs?: number }) =>
     call<Paged<VideoCard>>("api_feed", { page, size, sort: sort ?? null, budgetMs: opts?.budgetMs ?? null }, force),
   /** 官网首页横幅（3.0.14 C 节）：顺序即官网顺序，几条算几条。

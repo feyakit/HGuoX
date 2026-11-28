@@ -34,19 +34,30 @@ const AUTO_PROBE_PATH: &str = "/api/videos?page=1&size=1";
 /// 一次成功要 1.5–3s，所以预算放宽到 8 秒（内含最多 3 次尝试）。
 const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const AUTO_MIRROR_MAX: usize = 10;
+/// 探测总预算里**每个域名族**最多占几条（3.0.22-b）。
+///
+/// 真机事故（小米九 / 2026-11-28 / W115，b1/b2 轮到）：发布页推的新族
+/// `*.qxeylvrkf.cc` 有 8 个随机子域、**整族不可用**（92–156ms 就 refused），
+/// 8 条预算被它一次吃光，真正能用的 `*.wsaditmwl.cc` 一条都没被探到 ——
+/// 不清数据的常规启动从 1.577s 退化到 8.03 / 17.41s，第三轮直接没内容。
+/// 所以候选按族封顶：一族只花 2 条，剩下的留给别的族。
+const PROBE_PER_FAMILY: usize = 2;
 /// 3.0.21：一次选线/换线的**探测总预算**（按「探测请求条数」算，不是按 origin 算）。
 ///
 /// 真机证据（小米九，被墙网络）：一次冷启动里有 **47–108 条 `cmd=probe`** ——
 /// 10 条候选 × 最多 3 次重试 + 9 条种子 + 主域，全都在白撞。目标是 ≤ 8 条：
 /// 主域 2 + 镜像 4 + 兜底种子 2 就够判断「这一轮谁能用」了，因为 SETTLE_GRACE
 /// 拿到第一个成功就收工。
-const PROBE_BUDGET: usize = 8;
+///
+/// 3.0.22-b 提到 10：加了「每族 ≤2 条」之后，单靠 8 条遇到「一族 2 条 + 种子 2 条
+/// 全灭」时仍然探不到第 3 个族；10 条仍是个位数、仍远低于曾经的 22–39 条。
+const PROBE_BUDGET: usize = 10;
 /// 3.0.22：**整个进程**（一次冷启动）允许多少条自动探活。
 ///
 /// 3.0.21 把 8 条当成「一次选线的预算」，但一次冷启动里会自动选线好几次
 /// （boot 的 `line_auto` + 每次硬错误的 `line_failover` + 首屏 1s/3s/7s 重试），
 /// 每建一次 gate 就又拿满 8 条 —— 真机 5 秒内发出 24 条 probe（17 个 origin）。
-/// 现在这条预算挂在全进程上，用尽即停，并且打一行 `[net] probe budget exhausted n=8`。
+/// 现在这条预算挂在全进程上，用尽即停，并且打一行 `[net] probe budget exhausted n=10/10`。
 const PROCESS_PROBE_BUDGET: usize = PROBE_BUDGET;
 /// 探测并发上限（个位数）。被墙网络里 4 条并发足够在 2–4 秒内出结果，
 /// 又不会像以前那样一次把 40+ 条请求塞进连接池排队。
@@ -971,17 +982,24 @@ fn try_take(counter: &std::sync::atomic::AtomicUsize) -> bool {
     counter.fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1)).is_ok()
 }
 
-/// 预算用尽时打一行（全进程只打一次）：`[net] probe budget exhausted n=8`。
+/// 预算用尽时打一行（全进程只打一次）：`[net] probe budget exhausted n=10/10`。
 fn note_probe_exhausted(shared: bool) {
     if !shared {
         return;
     }
     if !PROBE_EXHAUSTED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let used = PROCESS_PROBE_BUDGET.saturating_sub(
-            PROCESS_PROBES_LEFT.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        crate::netlog::probe_budget_exhausted(used);
+        let left = PROCESS_PROBES_LEFT.load(std::sync::atomic::Ordering::Relaxed);
+        crate::netlog::probe_budget_exhausted(PROCESS_PROBE_BUDGET.saturating_sub(left), PROCESS_PROBE_BUDGET);
     }
+}
+
+/// 这一轮自动探活真正发出去几条（`[net] probe used=6/10`）。
+///
+/// 与 `probe budget exhausted` 的区别：即使没用尽也打一行，真机复测能直接
+/// 看出「这一轮到底花了多少条」，不用数日志。
+fn note_probe_used() {
+    let left = PROCESS_PROBES_LEFT.load(std::sync::atomic::Ordering::Relaxed);
+    crate::netlog::probe_used(PROCESS_PROBE_BUDGET.saturating_sub(left), PROCESS_PROBE_BUDGET);
 }
 
 /// 单测用：把全进程预算恢复成满额（`cargo test` 同进程跑多个用例）。
@@ -1152,11 +1170,58 @@ fn probe_list(candidates: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// 域名族 = 主机名最后两段：`thu.aqkmowihz.cc` / `pku.aqkmowihz.cc` 同族 `aqkmowihz.cc`，
+/// `huangguoai.com` 自己一族。上游按族换域名（一次换一整族随机子域），
+/// 所以「族」才是可用的判死单位。
+fn family_of(origin: &str) -> String {
+    let host = crate::netlog::host_of_str(origin);
+    let parts: Vec<&str> = host.split('.').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= 2 {
+        return host;
+    }
+    parts[parts.len() - 2..].join(".")
+}
+
+/// 候选按「每族 ≤ [`PROBE_PER_FAMILY`] 条」封顶，超出的丢掉（保序，先到先得）。
+///
+/// 3.0.22-b：单一死族曾把 8 条预算一次吃光，可用族一条都没探到（见 `PROBE_PER_FAMILY`）。
+/// 被砍掉的族打一行 `[net] probe family=… keep=2 drop=6`，真机上能直接看出是哪一族在吃预算。
+fn cap_per_family(candidates: Vec<String>) -> Vec<String> {
+    cap_per_family_pairs(candidates.into_iter().map(|origin| (origin, ())).collect())
+        .into_iter()
+        .map(|(origin, ())| origin)
+        .collect()
+}
+
+/// 带 tier 的版本（换线那条路径的候选是 `(origin, tier)`）。
+fn cap_per_family_pairs<T>(items: Vec<(String, T)>) -> Vec<(String, T)> {
+    let mut kept: Vec<(String, T)> = Vec::with_capacity(items.len());
+    let mut per_family: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dropped: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (origin, tier) in items {
+        let family = family_of(&origin);
+        let used = per_family.entry(family.clone()).or_insert(0);
+        if *used >= PROBE_PER_FAMILY {
+            *dropped.entry(family).or_insert(0) += 1;
+            continue;
+        }
+        *used += 1;
+        kept.push((origin, tier));
+    }
+    for (family, count) in dropped {
+        crate::netlog::probe_family_capped(&family, PROBE_PER_FAMILY, count);
+    }
+    kept
+}
+
 /// A display recommendation is not proof of publication. Candidates are built
 /// exclusively from the published items; the .ai landing page is never automatic.
 fn auto_candidates(items: &[Value], current: &str, trusted: impl Fn(&str) -> bool) -> Vec<String> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
+    /* 3.0.22-b：这里就要按「族」节流 —— 只在最后截到 `AUTO_MIRROR_MAX` 条的话，
+       一个死族的 10 个随机子域会把名额占满，别的族连候选都进不来。 */
+    let mut per_family: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let current = crate::net::normalize_base(current);
     let published: Vec<_> = items
         .iter()
@@ -1174,9 +1239,15 @@ fn auto_candidates(items: &[Value], current: &str, trusted: impl Fn(&str) -> boo
         if candidates.len() >= AUTO_MIRROR_MAX {
             break;
         }
-        if seen.insert(origin.clone()) {
-            candidates.push(origin);
+        if !seen.insert(origin.clone()) {
+            continue;
         }
+        let used = per_family.entry(family_of(&origin)).or_insert(0);
+        if *used >= PROBE_PER_FAMILY {
+            continue;
+        }
+        *used += 1;
+        candidates.push(origin);
     }
     candidates
 }
@@ -1332,8 +1403,9 @@ async fn auto_pick_full(
         let candidates = auto_candidates(items, &crate::net::base(), |origin| {
             is_trusted_mirror(origin) || cached.contains(origin)
         });
-        /* 3.0.21：拒绝表里的镜像不再先撞（全都命中时退回原列表，见 probe_list）。 */
-        let candidates = probe_list(candidates);
+        /* 3.0.21：拒绝表里的镜像不再先撞（全都命中时退回原列表，见 probe_list）。
+           3.0.22-b：再按「每族 ≤2 条」封顶 —— 单一死族的 8 个随机子域不能把预算吃光。 */
+        let candidates = cap_per_family(probe_list(candidates));
         published = candidates.len();
         for origin in candidates {
             let gate = gate.clone();
@@ -1345,7 +1417,7 @@ async fn auto_pick_full(
     /* 发布页拿不到（`listing` 是 Err）或候选太少时，用内置种子兜底。
        种子同样逐条真探活，不通就不会被选中；也绝不进信任集合。 */
     if published < SEED_MIN {
-        let seeds = probe_list(SEED_MIRRORS.iter().map(|origin| origin.to_string()).collect());
+        let seeds = cap_per_family(probe_list(SEED_MIRRORS.iter().map(|origin| origin.to_string()).collect()));
         for origin in seeds {
             let gate = gate.clone();
             set.spawn(async move {
@@ -1392,6 +1464,8 @@ async fn auto_pick_full(
         }
     }
     set.abort_all();
+    /* 真机取证：这一轮自动选线实际发了几条探活（`[net] probe used=6/10`）。 */
+    note_probe_used();
 
     let mut result = pick_from_hits(&hits);
     if let Err(error) = listing {
@@ -1496,16 +1570,21 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
     }
     if let Some(listing) = load_mirrors_cache() {
         for item in listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
-            if candidates.len() >= FAILOVER_MAX { break; }
+            /* 3.0.22-b：这里**不能**按条数提前截断 —— 同族的随机子域会先把 8 个名额占满，
+               真正能用的别的族连候选都进不来（b3 那轮就是这样卡死的）。
+               先收齐、再按族封顶、最后才截到 FAILOVER_MAX。 */
             if let Some(url) = item.get("url").and_then(Value::as_str) {
                 push(url.to_string(), "mirror", &mut candidates, &mut seen);
             }
         }
     }
     for origin in SEED_MIRRORS {
-        if candidates.len() >= FAILOVER_MAX { break; }
         push(origin.to_string(), "seed", &mut candidates, &mut seen);
     }
+    let candidates: Vec<(String, &'static str)> = cap_per_family_pairs(candidates)
+        .into_iter()
+        .take(FAILOVER_MAX)
+        .collect();
 
     let (winner, raced) = race_candidates(candidates, FAILOVER_PROBE, &gate).await;
     hits.extend(raced);
@@ -1527,11 +1606,15 @@ pub async fn failover_excluding(excludes: &[String]) -> Value {
         let items = listing.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         let mut fresh: Vec<(String, &'static str)> = Vec::new();
         for item in items {
-            if fresh.len() >= FAILOVER_MAX { break; }
             if let Some(url) = item.get("url").and_then(Value::as_str) {
                 push(url.to_string(), "published", &mut fresh, &mut seen);
             }
         }
+        /* 同样：先收齐再按族封顶（同一族 8 个随机子域不许占满名额）。 */
+        let fresh: Vec<(String, &'static str)> = cap_per_family_pairs(fresh)
+            .into_iter()
+            .take(FAILOVER_MAX)
+            .collect();
         let (winner, more) = race_candidates(fresh, FAILOVER_PROBE, &gate).await;
         hits.extend(more);
         if let Some(hit) = winner {
@@ -1567,6 +1650,57 @@ pub async fn health() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /* 3.0.22-b：域名族 = 主机名最后两段（上游按族换域名，族才是判死单位）。 */
+    #[test]
+    fn family_is_the_last_two_labels() {
+        assert_eq!(family_of("https://thu.aqkmowihz.cc"), "aqkmowihz.cc");
+        assert_eq!(family_of("https://zju.wsaditmwl.cc/api/videos"), "wsaditmwl.cc");
+        assert_eq!(family_of("https://huangguoai.com"), "huangguoai.com");
+    }
+
+    /* 3.0.22-b 真机事故：发布页推的 `*.qxeylvrkf.cc` 有 8 个随机子域且整族不可用，
+       8 条探测预算被它一次吃光，能用的 `*.wsaditmwl.cc` 一条都没被探到
+       （不清数据的冷启从 1.577s 退化到 8.03 / 17.41s，第三轮直接没内容）。 */
+    #[test]
+    fn family_cap_leaves_room_for_a_working_family() {
+        let mut candidates: Vec<String> = [
+            "thu", "pku", "zju", "nju", "fdu", "sysu", "sjtu", "xmu",
+        ]
+        .iter()
+        .map(|host| format!("https://{host}.qxeylvrkf.cc"))
+        .collect();
+        candidates.push("https://thu.wsaditmwl.cc".into());
+        candidates.push("https://pku.wsaditmwl.cc".into());
+        candidates.push("https://zju.wsaditmwl.cc".into());
+
+        let kept = cap_per_family(candidates);
+
+        assert_eq!(
+            kept.iter().filter(|origin| origin.ends_with("qxeylvrkf.cc")).count(),
+            PROBE_PER_FAMILY,
+            "死族最多只花 PROBE_PER_FAMILY 条"
+        );
+        assert!(
+            kept.iter().any(|origin| origin.ends_with("thu.wsaditmwl.cc")),
+            "可用族必须留在候选里（这正是旧实现丢掉的那条）"
+        );
+        assert_eq!(kept.len(), PROBE_PER_FAMILY * 2, "两族各留 2 条");
+    }
+
+    /* 每族上限同样作用在 `(origin, tier)` 候选上（换线路径走的是带 tier 的版本）。 */
+    #[test]
+    fn family_cap_keeps_tiers() {
+        let items: Vec<(String, &'static str)> = vec![
+            ("https://thu.qxeylvrkf.cc".into(), "mirror"),
+            ("https://pku.qxeylvrkf.cc".into(), "mirror"),
+            ("https://zju.qxeylvrkf.cc".into(), "mirror"),
+            ("https://thu.wsaditmwl.cc".into(), "seed"),
+        ];
+        let kept = cap_per_family_pairs(items);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.last().map(|(_, tier)| *tier), Some("seed"));
+    }
 
     fn origins(items: &[Value]) -> Vec<&str> {
         items
