@@ -13,7 +13,9 @@ import { createRoot } from "react-dom/client";
 import Home from "../src/features/feed/Home";
 import { AppProvider } from "../src/shared/model/store";
 import {
+  FIRST_SCREEN_BUDGET_MS,
   FIRST_SCREEN_RETRY_DELAYS,
+  firstScreenBudget,
   faultKindOf,
   withLineRetries,
   type RetryDeps,
@@ -129,6 +131,8 @@ const fixture = {
   retryPolicy: {
     withLineRetries,
     FIRST_SCREEN_RETRY_DELAYS,
+    FIRST_SCREEN_BUDGET_MS,
+    firstScreenBudget,
     faultKindOf,
     /* 假时钟：只记录被要求的等待时长，不真的等 */
     run<T>(run: () => Promise<T>, deps: RetryDeps & { sleeps?: number[] }) {
