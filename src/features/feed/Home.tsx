@@ -333,7 +333,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
     if (recRanks) setRecommendRanks(recRanks);
     if (hotRanks) setTopRanks(hotRanks);
     if (origs) setOriginals(origs);
-    shelvesAt.current = Date.now();
+    if (recRanks || hotRanks || origs) shelvesAt.current = Date.now();
   }, []);
 
   /* 官网首页 banners（C 节）：和货架同一档 30s，force 由下拉刷新传入。
@@ -1003,12 +1003,11 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
                                 {h.is_finished ? `全 ${h.episode_count || h.total_episodes || "?"} 集` : `更新至 ${h.episode_count ?? "?"} 集`}
                               </span>
                             </span>
-                            <span className="hg-spotlight-cta" role="button" tabIndex={i === safeHeroIdx ? 0 : -1}
-                              onClick={e => { e.stopPropagation(); play(h.id); }}
-                              onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); play(h.id); } }}>
-                              <IPlayF size={12} />播放
-                            </span>
                           </span>
+                        </Button>
+                        <Button card className="hg-spotlight-cta" tabIndex={i === safeHeroIdx ? 0 : -1}
+                          onClick={() => play(h.id)}>
+                          <IPlayF size={12} />播放
                         </Button>
                       </div>
                       );

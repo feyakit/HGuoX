@@ -362,7 +362,6 @@ body { background:var(--motion-paper); }
 .ios-poster:active { scale:.975; }
 .ios-poster-title { letter-spacing:0; }
 
-.ios-mobile-nav { padding:12px 30px calc(12px + env(safe-area-inset-bottom,0px)); }
 .ios-mobile-nav .hg-glass { height:66px; }
 .ios-mobile-nav .hg-drop { top:6px; bottom:6px; transition:transform .34s var(--motion-spring); }
 .ios-mobile-nav .hg-drop>.ios-liquid-fill { margin-inline:4px; width:calc(100% - 8px); background:var(--motion-ink); box-shadow:0 4px 0 rgb(25 25 25 / .12); }

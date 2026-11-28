@@ -44,22 +44,22 @@ object SafeArea {
     private var appliedCss = -1f
     private var tries = 0
     private var webRef: WeakReference<WebView>? = null
+    private var decorRef: WeakReference<View>? = null
     private var hooked = false
-    private var installed = false
 
     /**
      * 幂等：`Plugin.load(webView)` 和插件构造都会调它。
-     * 第一次挂监听/重试；后续调用只更新 WebView 引用。
+     * 第一次挂监听/重试；后续调用只更新 WebView 引用，若 Activity 重建换了 decorView 则重新挂监听。
      */
     fun install(activity: Activity, webView: WebView?) {
         if (webView != null) webRef = WeakReference(webView)
-        if (installed) {
+        val decor = activity.window?.decorView ?: return
+        if (decorRef?.get() === decor) {
             tries = 0
-            handle(activity, activity.window?.decorView?.rootWindowInsets, force = true)
+            handle(activity, decor.rootWindowInsets, force = true)
             return
         }
-        installed = true
-        val decor = activity.window?.decorView ?: return
+        decorRef = WeakReference(decor)
         Log.i(TAG, "[safearea] install on " + activity.javaClass.simpleName + " webView=" + (webView != null))
         decor.setOnApplyWindowInsetsListener { view, insets ->
             handle(activity, insets, force = false)
