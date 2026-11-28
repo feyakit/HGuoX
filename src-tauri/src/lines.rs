@@ -962,6 +962,10 @@ impl ProbeGate {
 }
 
 /// 原子地扣一个名额（用光返回 false）。
+///
+/// `fetch_update` 在新版 rustc 上标了 deprecated（指 `try_update`），但 `try_update`
+/// 在旧 stable 上还不存在，CI 用哪版不确定 —— 这里显式关掉这条告警，保持与基线同一写法。
+#[allow(deprecated)]
 fn try_take(counter: &std::sync::atomic::AtomicUsize) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     counter.fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1)).is_ok()
