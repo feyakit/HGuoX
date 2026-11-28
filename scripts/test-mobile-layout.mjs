@@ -39,6 +39,12 @@ try {
         if (["debug_log", "set_text_interaction"].includes(cmd)) return Promise.resolve();
         if (cmd === "line_auto") return Promise.resolve({ base: "https://fixture.invalid", previous: "https://fixture.invalid", switched: false, pick: { tier: "main", ms: 1, reason: "fixture", candidates: [] } });
         if (["api_feed", "api_category", "api_posts", "api_blog_posts", "api_original_videos", "api_post_category", "api_post_categories", "api_search_hot", "api_rank", "api_topics"].includes(cmd)) return Promise.resolve(emptyPage);
+        /* 首屏先拉 api_home（banners）再拉 feed：夹具必须认识它，否则首页直接进错误页，导航几何就无从考察。
+           另外 3.0.20 之后首屏还会调 line_state / net_boot_budget / net_log（都不是网络请求），给固定空值。 */
+        if (cmd === "api_home") return Promise.resolve({ banners: [], source: "fixture" });
+        if (cmd === "api_home_details") return Promise.resolve({ items: [] });
+        if (cmd === "line_state") return Promise.resolve({ base: "https://fixture.invalid", default: "https://fixture.invalid", custom: false, manual: false, fixed: [] });
+        if (cmd === "net_boot_budget" || cmd === "net_log") return Promise.resolve();
         // App's development-only playback self-test must not fetch media upstream.
         if (cmd === "api_play") return Promise.reject("Layout fixture has no playback media");
         fixture.unexpected.push(cmd);

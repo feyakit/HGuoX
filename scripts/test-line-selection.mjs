@@ -106,17 +106,21 @@ try {
     return { context, page };
   }
 
-  /* 设置页已改成分组手风琴（components/SettingsSection.tsx，默认全部收起，
-     触发器 aria-label 是「<组名>设置」，面板 id 是 settings-panel-<组名>）。
-     「播放源」「代理访问」都在「网络」组里，不展开就点不到。
-     旧用例按平铺列表写，选择器本身没坏、是页面结构变了——断言一条没改。 */
+  /* 设置页现在按分组平铺（settings/SettingsGroup.tsx），没有手风琴了：
+     「播放源」「代理访问」进页面就可见。这里只等入口行出现，断言一条没改。 */
   const openNetworkSection = async page => {
-    const trigger = page.getByRole("button", { name: "网络设置" });
-    if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-    await page.locator("#settings-panel-网络").waitFor({ state: "visible" });
+    await page.getByRole("button").filter({ has: page.getByText("播放源", { exact: true }) }).first().waitFor({ state: "visible" });
   };
   const calls = (page, command) => page.evaluate(command => window.lineSelectionFixture.calls.filter(call => call.command === command), command);
   const sourceButton = page => page.getByRole("button").filter({ has: page.getByText("播放源", { exact: true }) });
+  /* 当前线路不再写在「播放源」行里（那一行右值改成了纯 ›），而是设置页头部的状态行
+     `hg-set-status`（Settings.tsx:131）：可见文本会 middleEllipsis(host, 22) 截断，
+     完整 host 在 title 上。所以要断言「设置页反映当前线路」就查 title。 */
+  const expectCurrentLine = async (page, host) => {
+    await page.waitForFunction(expected => document.querySelector(".hg-set-status")?.getAttribute("title") === expected, host);
+    assert.match(await page.locator(".hg-set-status").first().innerText(), /当前线路/,
+      "设置页状态行要写明当前线路");
+  };
 
   {
     /* 旧版本：手动选线 → auto_line=off。升级后这个 off 不算用户意图，要被迁移成 on。 */
@@ -176,7 +180,7 @@ try {
     assert.equal(await page.evaluate(key => localStorage.getItem(key), PREF_KEY), MIRROR);
     assert.equal(await page.evaluate(key => localStorage.getItem(key), NEW_KEY), "off");
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await sourceButton(page).getByText("mirror-one.fixture.invalid", { exact: true }).waitFor();
+    await expectCurrentLine(page, "mirror-one.fixture.invalid");
     await sourceButton(page).click();
     await dialog.waitFor();
     assert.equal((await calls(page, "line_mirrors")).length, 1);
@@ -209,7 +213,7 @@ try {
     await page.waitForFunction(() => window.lineSelectionFixture.base === "https://mirror-one.fixture.invalid");
     assert.equal(await toggle.getAttribute("aria-checked"), "true");
     assert.equal(await page.evaluate(key => localStorage.getItem(key), NEW_KEY), "on");
-    await sourceButton(page).getByText("mirror-one.fixture.invalid", { exact: true }).waitFor();
+    await expectCurrentLine(page, "mirror-one.fixture.invalid");
     await toggle.click();
     assert.equal(await toggle.getAttribute("aria-checked"), "false");
     assert.equal(await page.evaluate(key => localStorage.getItem(key), NEW_KEY), "off");
@@ -280,7 +284,7 @@ try {
     assert(sequence.indexOf("line_cancel") > sequence.indexOf("line_auto"));
     assert(sequence.indexOf("line_set") > sequence.indexOf("line_cancel"));
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await sourceButton(page).getByText("secondary.fixture.invalid", { exact: true }).waitFor();
+    await expectCurrentLine(page, "secondary.fixture.invalid");
     assert.equal(await toggle.getAttribute("aria-checked"), "true");
     report.passed.push("Manual selection cancels the pending automatic request before line_set and records a preference while automatic selection stays on (generation-aware IPC fixture)");
     await context.close();

@@ -13,10 +13,12 @@ await mkdir(output, { recursive: true });
 const report = { environment: "Actual Settings/LinePicker/ProxySettings/store, Chromium, mocked IPC", passed: [], errors: [], external: [] };
 let vite, browser;
 try {
-  vite = await createServer({ root, server: { host: "127.0.0.1", port: 0 } });
+  /* vite.config 的 strictPort:true 是给 Tauri dev 定 1420 用的；用例自己占随机端口，
+     不能继承 strictPort，否则和同时跑的其他用例抢 5173 直接报错。 */
+vite = await createServer({ root, server: { host: "127.0.0.1", port: 0, strictPort: false } });
   await vite.listen();
   const origin = vite.resolvedUrls.local[0];
-  browser = await chromium.launch({ headless: true, executablePath: process.env.BROWSER_EXECUTABLE || "/usr/bin/google-chrome" });
+  browser = await chromium.launch({ headless: true, executablePath: process.env.BROWSER_EXECUTABLE || undefined });
   async function open({ mobile = false, theme = "dark", width = 375, height = 812 } = {}) {
     const context = await browser.newContext({ viewport: mobile ? { width, height } : { width: 1280, height: 900 }, reducedMotion: "reduce",
       ...(mobile ? { userAgent: "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36" } : {}) });
@@ -70,14 +72,11 @@ try {
     return { page, context };
   }
   const calls = (page, command) => page.evaluate(command => window.networkSettingsFixture.calls.filter(row => row.command === command), command);
-  /* 设置页已改成分组手风琴（components/SettingsSection.tsx，默认全部收起，
-     触发器 aria-label 是「<组名>设置」，面板 id 是 settings-panel-<组名>）。
-     「播放源」「代理访问」都在「网络」组里，不展开就点不到。
-     旧用例按平铺列表写，选择器本身没坏、是页面结构变了——断言一条没改。 */
+  /* 设置页现在按分组平铺（settings/SettingsGroup.tsx：组标题 + 一张卡），没有手风琴、
+     没有「<组名>设置」触发器，也没有 settings-panel-<组名> 面板。「播放源」「代理访问」
+     进页面就可见，所以这里只等入口行出现。断言一条没改，改的只是「怎么让这一行可交互」。 */
   const openNetworkSection = async page => {
-    const trigger = page.getByRole("button", { name: "网络设置" });
-    if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click();
-    await page.locator("#settings-panel-网络").waitFor({ state: "visible" });
+    await page.getByRole("button").filter({ has: page.getByText("播放源", { exact: true }) }).first().waitFor({ state: "visible" });
   };
   const row = (page, name) => page.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
 
