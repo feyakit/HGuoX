@@ -183,8 +183,8 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
   const loadedKey = useRef("");
   /* 上一次加载的 feed tab：用来区分「换 tab」（必须重拉）与「只换了线路」（首屏不重跑） */
   const loadedTab = useRef<FeedTab | "">("");
-  /* 首屏（第 1 页、非静默）已经出过内容：换线不再重跑首屏，否则 api_feed 会变成两条 */
-  const firstScreenDone = useRef(false);
+  /* 当前 tab 的首屏（第 1 页、非静默）已经出过内容：换线不再重跑首屏，否则 api_feed 会变成两条 */
+  const firstScreenDone = useRef<FeedTab | "">("");
   /* 骨架 → 真实内容的时间点（3.0.20 取证：一行 `[net] first content ms=…` 进 logcat） */
   const firstContentAt = useRef(0);
   /* hero 文字补全只跑一次（阶段二） */
@@ -282,7 +282,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
         netLog(`[net] first content ms=${firstContentAt.current}`);
         releaseBootBudget();
       }
-      if (firstScreen) firstScreenDone.current = true;
+      if (firstScreen) firstScreenDone.current = key;
       /* hero 的剧名先用首屏 feed 里已有的同名 id 顶上，不等补全（少一次首屏空窗） */
       mergeBannerText(rows);
       /* 首屏预取详情（并发 2、失败静默）：点进去时详情页能直接出内容，不用等镜像 RTT */
@@ -454,7 +454,7 @@ export default function Home({ active }: { active: boolean; bottomInset?: number
        - 已经出内容的那一屏也不清空重拉：数据就在屏幕上，下拉刷新 / 回前台照旧 force 重拉。
        首屏没成功过（没内容、也不在飞）时才允许在这里重来一次 —— 换线后重试是必须的。 */
     const lineOnly = loadedTab.current === tab;
-    if (!same && lineOnly && (loadingRef.current || firstScreenDone.current)) return;
+    if (!same && lineOnly && (loadingRef.current || firstScreenDone.current === tab)) return;
     loadedKey.current = key;
     seq.current++;
     loadingRef.current = false;
